@@ -1,0 +1,704 @@
+diff --git a/evaluation/robotwin/eval_polict_client_openpi.py b/evaluation/robotwin/eval_polict_client_openpi.py
+index 7ed5265..fec01ff 100644
+--- a/evaluation/robotwin/eval_polict_client_openpi.py
++++ b/evaluation/robotwin/eval_polict_client_openpi.py
+@@ -1,12 +1,14 @@
+ import sys
+ import os
+ import subprocess
++import shutil
++import time
+ import matplotlib.pyplot as plt
+ from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
+ import cv2
+ from pathlib import Path
+ 
+-robowin_root = Path("/path/to/your/robowin")
++robowin_root = Path(os.environ.get("ROBOTWIN_ROOT", "/path/to/your/robowin"))
+ if str(robowin_root) not in sys.path:
+     sys.path.insert(0, str(robowin_root))
+ 
+@@ -38,6 +40,7 @@ import numpy as np
+ from pathlib import Path
+ from scipy.spatial.transform import Rotation as R
+ import json
++import h5py
+ from pathlib import Path
+ 
+ from evaluation.robotwin.websocket_client_policy import WebsocketClientPolicy
+@@ -260,6 +263,142 @@ def save_comparison_video(real_obs_list, imagined_video, action_history, save_pa
+     print(f"Combined video saved to: {save_path}")
+ 
+ 
++CAM_KEYS = ("observation.images.cam_high", "observation.images.cam_left_wrist", "observation.images.cam_right_wrist")
++LINGBOT_ROOT = Path(__file__).resolve().parents[2]
++
++
++def write_mp4(path, frames, fps=10):
++    with imageio.get_writer(path, fps=fps, codec='libx264', macro_block_size=1,
++                            ffmpeg_params=['-crf', '15', '-pix_fmt', 'yuv420p']) as writer:
++        for frame in frames:
++            writer.append_data(np.ascontiguousarray(frame))
++
++
++def git_state(repo):
++    try:
++        commit = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
++        dirty = bool(subprocess.check_output(["git", "-C", str(repo), "status", "--porcelain", "--untracked-files=no"],
++                                             text=True).strip())
++        return commit + ("-dirty" if dirty else "")
++    except Exception:
++        return "unknown"
++
++
++class SimStateRecorder:
++    """Simulation ground truth per env step: end-effector poses, gripper values, object poses and contact impulses
++    (object vs. left gripper, right gripper, table). Used offline to label failures (missed grasp, drop, misplace)."""
++
++    def __init__(self, task_env):
++        self.env = task_env
++        robot = task_env.robot
++        self.gripper_links = {
++            arm: set(getattr(robot, f"{arm}_fix_gripper_name")) |
++                 {g[0].child_link.get_name() for g in getattr(robot, f"{arm}_gripper")}
++            for arm in ("left", "right")
++        }
++        self.objects = [e for e in task_env.scene.get_all_actors()
++                        if e.get_name() not in ("", "table", "wall", "ground")]
++        self.object_names = [e.get_name() for e in self.objects]
++        self.object_index = {name: i for i, name in reversed(list(enumerate(self.object_names)))}
++        self.rows = []
++
++    def record(self, env_step):
++        n = len(self.objects)
++        contact = {k: np.zeros(n) for k in ("left_gripper", "right_gripper", "table")}
++        for c in self.env.scene.get_contacts():
++            names = (c.bodies[0].entity.name, c.bodies[1].entity.name)
++            impulse = float(sum(np.linalg.norm(p.impulse) for p in c.points))
++            if impulse <= 0:
++                continue
++            for obj, other in (names, names[::-1]):
++                i = self.object_index.get(obj)
++                if i is None:
++                    continue
++                if other in self.gripper_links["left"]:
++                    contact["left_gripper"][i] += impulse
++                elif other in self.gripper_links["right"]:
++                    contact["right_gripper"][i] += impulse
++                elif other == "table":
++                    contact["table"][i] += impulse
++        poses = [e.get_pose() for e in self.objects]
++        self.rows.append(dict(
++            env_step=env_step,
++            wall_time=time.time(),
++            left_ee_pose=np.asarray(self.env.get_arm_pose("left"), dtype=np.float64),
++            right_ee_pose=np.asarray(self.env.get_arm_pose("right"), dtype=np.float64),
++            left_gripper=self.env.robot.get_left_gripper_val(),
++            right_gripper=self.env.robot.get_right_gripper_val(),
++            object_pose=np.array([np.concatenate([p.p, p.q]) for p in poses]).reshape(n, 7),
++            **{f"contact_{k}": v for k, v in contact.items()},
++        ))
++
++    def save(self, h5):
++        g = h5.create_group("sim")
++        g.attrs["object_names"] = self.object_names
++        g.attrs["gripper_convention"] = "normalized gripper command: 1 = open, 0 = closed (open > 0.8, closed < 0.2)"
++        g.attrs["pose_convention"] = "x, y, z, qw, qx, qy, qz (sapien) for objects; RoboTwin endpose for arms"
++        for key in self.rows[0]:
++            g.create_dataset(key, data=np.stack([np.asarray(r[key]) for r in self.rows]), compression="gzip")
++
++
++class EpisodeRecorder:
++    """Collects raw frames, planned and executed actions of one episode, with env steps and wall-clock times.
++
++    Latent index convention (shared with the server's pred/obs latents): frame 0 is the initial observation
++    (latent 0); afterwards every 4 frames form one latent frame, i.e. frame f >= 1 belongs to latent (f - 1) // 4 + 1.
++    """
++
++    def __init__(self):
++        self.frames = {k: [] for k in CAM_KEYS}
++        self.frame_state, self.frame_env_step, self.frame_wall_time = [], [], []
++        self.plans, self.plan_frame_st_id, self.plan_env_step, self.plan_wall_time = [], [], [], []
++        self.executed = []
++
++    def add_frame(self, obs, env_step):
++        for k in CAM_KEYS:
++            self.frames[k].append(obs[k])
++        self.frame_state.append(np.asarray(obs["observation.state"], dtype=np.float64))
++        self.frame_env_step.append(env_step)
++        self.frame_wall_time.append(time.time())
++
++    def add_plan(self, action, frame_st_id, env_step):
++        self.plans.append(np.asarray(action, dtype=np.float32))
++        self.plan_frame_st_id.append(-1 if frame_st_id is None else int(frame_st_id))
++        self.plan_env_step.append(env_step)
++        self.plan_wall_time.append(time.time())
++        return len(self.plans) - 1
++
++    def add_executed(self, raw_action, ee_action, chunk_id, latent_index, action_in_frame, step_before, step_after):
++        self.executed.append(dict(raw_action=np.asarray(raw_action, dtype=np.float64),
++                                  ee_action=np.asarray(ee_action, dtype=np.float64),
++                                  chunk_id=chunk_id, latent_index=latent_index, action_in_frame=action_in_frame,
++                                  env_step=step_after, executed=step_after > step_before, wall_time=time.time()))
++
++    def save(self, episode_dir, h5):
++        """Raw frames as real_<camera>.mp4; timing, state and actions into the open episode.h5."""
++        for k, frames in self.frames.items():
++            write_mp4(episode_dir / f"real_{k.split('.')[-1]}.mp4", frames)
++        n = len(self.frame_env_step)
++        g = h5.create_group("frames")
++        g["env_step"] = np.array(self.frame_env_step)
++        g["wall_time"] = np.array(self.frame_wall_time)
++        g["latent_index"] = np.array([0] + [(f - 1) // 4 + 1 for f in range(1, n)])
++        g["state"] = np.stack(self.frame_state)
++
++        ex = self.executed
++        g = h5.create_group("actions")
++        g.attrs["planned_layout"] = "one entry per model call: (action_dim, frames_per_chunk, actions_per_frame)"
++        g["planned"] = np.stack(self.plans)
++        g["planned_frame_st_id"] = np.array(self.plan_frame_st_id)
++        g["planned_env_step"] = np.array(self.plan_env_step)
++        g["planned_wall_time"] = np.array(self.plan_wall_time)
++        # one entry per take_action call, in order; executed=False if the env ignored it (success or step limit)
++        g["executed_raw_action"] = np.stack([e["raw_action"] for e in ex])
++        g["executed_ee_action"] = np.stack([e["ee_action"] for e in ex])
++        for key in ("chunk_id", "latent_index", "action_in_frame", "env_step", "executed", "wall_time"):
++            g[f"executed_{key}"] = np.array([e[key] for e in ex])
++
++
+ def class_decorator(task_name):
+     envs_module = importlib.import_module(f"envs.{task_name}")
+     try:
+@@ -539,8 +678,19 @@ def eval_policy(task_name,
+         succ = False
+ 
+         prompt = TASK_ENV.get_instruction()
+-        ret = model.infer(dict(reset = True, prompt=prompt, save_visualization=save_visualization))
+-        
++        ret = model.infer(dict(reset = True, prompt=prompt, seed=int(now_seed), save_visualization=save_visualization))
++
++        # Absolute path: the server writes into the same directory from its own working directory
++        episode_name = f"ep{TASK_ENV.test_num:04d}_seed{now_seed}"
++        running_dir = (Path(args['save_root']) / 'episodes' / '_running' / task_name / episode_name).resolve()
++        if running_dir.exists():
++            shutil.rmtree(running_dir)
++        running_dir.mkdir(parents=True)
++        recorder = EpisodeRecorder()
++        sim_recorder = SimStateRecorder(TASK_ENV)
++        sim_recorder.record(TASK_ENV.take_action_cnt)
++        episode_start_time = time.time()
++
+         first = True
+         full_obs_list = []
+         gen_video_list = []
+@@ -554,6 +704,7 @@ def eval_policy(task_name,
+         inint_eef_pose = np.array(inint_eef_pose, dtype=np.float64)
+         initial_formatted_obs = format_obs(initial_obs, prompt)
+         full_obs_list.append(initial_formatted_obs)
++        recorder.add_frame(initial_formatted_obs, TASK_ENV.take_action_cnt)
+         first_obs = None
+         while TASK_ENV.take_action_cnt<TASK_ENV.step_lim:
+             if first:
+@@ -562,6 +713,8 @@ def eval_policy(task_name,
+ 
+             ret = model.infer(dict(obs=first_obs, prompt=prompt, save_visualization=save_visualization, video_guidance_scale=video_guidance_scale, action_guidance_scale=action_guidance_scale)) #(TASK_ENV, model, observation)
+             action = ret['action']
++            frame_st_id = ret.get('frame_st_id')
++            chunk_id = recorder.add_plan(action, frame_st_id, TASK_ENV.take_action_cnt)
+             if 'video' in ret:
+                 imagined_video = ret['video']
+                 gen_video_list.append(imagined_video)
+@@ -596,12 +749,19 @@ def eval_policy(task_name,
+                         ])
+                     else:
+                         raise NotImplementedError
++                    step_before = TASK_ENV.take_action_cnt
+                     TASK_ENV.take_action(ee_action, action_type='ee')
+-                   
++                    recorder.add_executed(raw_action_step, ee_action, chunk_id,
++                                          -1 if frame_st_id is None else frame_st_id + i, j,
++                                          step_before, TASK_ENV.take_action_cnt)
++                    if TASK_ENV.take_action_cnt > step_before:
++                        sim_recorder.record(TASK_ENV.take_action_cnt)
++
+                     if (j+1) % action_per_frame == 0:
+                         obs = format_obs(TASK_ENV.get_obs(), prompt)
+                         full_obs_list.append(obs)
+                         key_frame_list.append(obs)
++                        recorder.add_frame(obs, TASK_ENV.take_action_cnt)
+                     
+             first = False
+ 
+@@ -612,17 +772,48 @@ def eval_policy(task_name,
+                 break
+       
+ 
+-        vis_dir = Path(args['save_root']) / f'stseed-{st_seed}' / 'visualization' / task_name
+-        vis_dir.mkdir(parents=True, exist_ok=True)
+-        video_name = f"{TASK_ENV.test_num}_{prompt.replace(' ', '_')}_{succ}.mp4"
+-        out_img_file = vis_dir / video_name
+-        save_comparison_video(
+-            real_obs_list=full_obs_list,
+-            imagined_video=None, #gen_video_list,
+-            action_history=full_action_history,
+-            save_path=str(out_img_file),
+-            fps=15 # Suggest adjusting fps based on simulation step
+-        )
++        # Server writes /model into episode.h5 and pred_<camera>.mp4; the client adds frames, actions, sim, meta
++        try:
++            finalize_error = (model.infer(dict(finalize=True, episode_dir=str(running_dir))) or {}).get('error')
++        except RuntimeError as e:  # keep the episode and the run going; model data may be missing for this one
++            finalize_error = str(e)[-500:]
++            print(f"\033[91mServer finalize failed: {finalize_error}\033[0m")
++        meta = {
++            "task_name": task_name,
++            "task_config": args['task_config'],
++            "setting": {"demo_clean": "easy", "demo_randomized": "hard"}.get(args['task_config'], args['task_config']),
++            "seed": int(now_seed),
++            "episode": int(TASK_ENV.test_num),
++            "instruction": str(prompt),
++            "success": bool(succ),
++            "env_steps": int(TASK_ENV.take_action_cnt),
++            "step_limit": int(TASK_ENV.step_lim),
++            "num_chunks": len(recorder.plans),
++            "num_frames": len(recorder.frame_env_step),
++            "start_wall_time": episode_start_time,
++            "end_wall_time": time.time(),
++            "video_guidance_scale": video_guidance_scale,
++            "action_guidance_scale": action_guidance_scale,
++            "git_lingbot_va": git_state(LINGBOT_ROOT),
++            "git_robotwin": git_state(robowin_root),
++            "embodiment": args.get("embodiment"),
++            "finalize_error": finalize_error,
++        }
++        with h5py.File(running_dir / 'episode.h5', 'a') as h5:
++            recorder.save(running_dir, h5)
++            sim_recorder.save(h5)
++            # str(): numpy strings (e.g. from np.random.choice) cannot be stored as HDF5 attributes
++            h5.attrs.update({k: str(v) if isinstance(v, str) else v if isinstance(v, (int, float)) else json.dumps(v)
++                             for k, v in meta.items()})
++            h5.attrs["task_args"] = json.dumps({k: v for k, v in args.items()
++                                                if isinstance(v, (int, float, str, bool, list, dict))}, default=str)
++        write_json(meta, running_dir / 'meta.json')
++        final_dir = running_dir.parents[2] / ('success' if succ else 'fail') / task_name / episode_name
++        if final_dir.exists():
++            shutil.rmtree(final_dir)
++        final_dir.parent.mkdir(parents=True, exist_ok=True)
++        shutil.move(str(running_dir), str(final_dir))
++        print(f"Episode data saved to: {final_dir}")
+         if TASK_ENV.eval_video_path is not None:
+             TASK_ENV._del_eval_video_ffmpeg()
+ 
+diff --git a/wan_va/modules/model.py b/wan_va/modules/model.py
+index 25b45e5..c1f7193 100644
+--- a/wan_va/modules/model.py
++++ b/wan_va/modules/model.py
+@@ -29,7 +29,10 @@ from functools import partial
+ try:
+     from flash_attn_interface import flash_attn_func
+ except:
+-    from flash_attn import flash_attn_func
++    try:
++        from flash_attn import flash_attn_func
++    except ImportError:  # only needed for attn_mode='flashattn'; inference uses 'torch'
++        flash_attn_func = None
+ 
+ __all__ = ['WanTransformer3DModel']
+ 
+diff --git a/wan_va/wan_va_server.py b/wan_va/wan_va_server.py
+index 4c95ace..30f7e87 100644
+--- a/wan_va/wan_va_server.py
++++ b/wan_va/wan_va_server.py
+@@ -1,5 +1,6 @@
+ # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
+ import argparse
++import json
+ import os
+ import sys
+ import time
+@@ -7,7 +8,10 @@ from functools import partial
+ from PIL import Image
+ from diffusers.video_processor import VideoProcessor
+ from diffusers.utils import export_to_video
++from diffusers.models.autoencoders.autoencoder_kl_wan import unpatchify
+ 
++import h5py
++import imageio
+ import numpy as np
+ import torch
+ import torch.nn.functional as F
+@@ -34,7 +38,6 @@ from utils import (
+     init_logger,
+     logger,
+     run_async_server_mode,
+-    save_async,
+ )
+ 
+ 
+@@ -103,6 +106,52 @@ class VA_Server:
+             )
+             self.streaming_vae_half = WanVAEStreamingWrapper(vae_half)
+ 
++        # Episode recording: intermediate denoising states (step indices into the video schedule) and
++        # spatially pooled hidden states of a few transformer blocks, captured at t=0 for predicted and real latents
++        self.record_denoise_steps = list(getattr(job_config, 'record_denoise_steps', [6, 12, 18]))
++        self.record_hidden_layers = list(getattr(job_config, 'record_hidden_layers', [9, 19, 29]))
++        self._hidden_capture = None
++        for layer in self.record_hidden_layers:
++            self.transformer.blocks[layer].register_forward_hook(partial(self._hidden_hook, layer))
++
++    # Camera regions of the robotwin_tshape latent canvas (C, T, 24, 20): wrists (half resolution) side by side
++    # on top, head camera below. Hidden-state tokens use the same layout on the 2x2-patched grid (12 x 10).
++    LATENT_CAM_SLICES = {
++        'cam_high': (slice(8, None), slice(None)),
++        'cam_left_wrist': (slice(0, 8), slice(0, 10)),
++        'cam_right_wrist': (slice(0, 8), slice(10, None)),
++    }
++    TOKEN_CAM_SLICES = {
++        'cam_high': (slice(4, None), slice(None)),
++        'cam_left_wrist': (slice(0, 4), slice(0, 5)),
++        'cam_right_wrist': (slice(0, 4), slice(5, None)),
++    }
++
++    @classmethod
++    def _split_cams(cls, latents):
++        """(..., H, W) latent canvas -> {camera: (..., h, w)}."""
++        return {cam: latents[..., hs, ws] for cam, (hs, ws) in cls.LATENT_CAM_SLICES.items()}
++
++    def _hidden_hook(self, layer, module, inputs, output):
++        if self._hidden_capture is None:
++            return
++        num_frames = self._hidden_capture['num_frames']
++        tokens = output[0].detach().float()  # conditional branch when CFG doubles the batch; (F*12*10, D)
++        grid = tokens.reshape(num_frames, self.latent_height // 2, self.latent_width // 2, -1)
++        pooled = torch.stack([grid[:, hs, ws].mean(dim=(1, 2)) for hs, ws in self.TOKEN_CAM_SLICES.values()],
++                             dim=1)  # F, num_cams, D
++        self._hidden_capture['layers'][layer] = pooled.half().cpu()
++
++    def _run_with_hidden_capture(self, num_frames, fn):
++        self._hidden_capture = dict(num_frames=num_frames, layers={})
++        try:
++            out = fn()
++            captured = self._hidden_capture['layers']
++        finally:
++            self._hidden_capture = None
++        # F, num_layers, num_cams, D
++        return out, torch.stack([captured[layer] for layer in self.record_hidden_layers], dim=1)
++
+     def _get_t5_prompt_embeds(
+         self,
+         prompt=None,
+@@ -374,7 +423,7 @@ class VA_Server:
+         video_latent = torch.cat(mu_norm.split(1, dim=0), dim=-1)
+         return video_latent.to(self.device)
+ 
+-    def _reset(self, prompt=None):
++    def _reset(self, prompt=None, seed=None):
+         logger.info('Reset.')
+         self.use_cfg = (self.job_config.guidance_scale > 1) or (self.job_config.action_guidance_scale > 1)
+         #### Reset all parameters
+@@ -438,6 +487,8 @@ class VA_Server:
+         self.exp_name = f"{prompt}_{time.strftime('%Y%m%d_%H%M%S')}" if prompt else "default"
+         self.exp_save_root = os.path.join(self.save_root, 'real', self.exp_name)
+         os.makedirs(self.exp_save_root, exist_ok=True)
++        # Per-episode record of predicted and observed latents, written by _finalize_episode
++        self.episode_log = dict(prompt=prompt, seed=0 if seed is None else int(seed), pred=[], obs=[])
+         torch.cuda.empty_cache()
+ 
+     def _infer(self, obs, frame_st_id=0):
+@@ -446,11 +497,15 @@ class VA_Server:
+             init_latent = self._encode_obs(obs)
+             self.init_latent = init_latent
+ 
++        # Per-chunk noise seed (episode seed, chunk index) so single chunks can be reproduced exactly
++        noise_seed = (self.episode_log['seed'] * 10007 + len(self.episode_log['pred'])) % 2**31
++        generator = torch.Generator(device=self.device).manual_seed(noise_seed)
+         latents = torch.randn(1,
+                               48,
+                               frame_chunk_size,
+                               self.latent_height,
+                               self.latent_width,
++                              generator=generator,
+                               device=self.device,
+                               dtype=self.dtype)
+         actions = torch.randn(1,
+@@ -458,8 +513,11 @@ class VA_Server:
+                               frame_chunk_size,
+                               self.action_per_frame,
+                               1,
++                              generator=generator,
+                               device=self.device,
+                               dtype=self.dtype)
++        denoise_records = []
++        hidden = None
+ 
+         video_inference_step = self.job_config.num_inference_steps
+         action_inference_step = self.job_config.action_num_inference_steps
+@@ -499,11 +557,15 @@ class VA_Server:
+                     None,
+                     frame_st_id=frame_st_id)
+ 
+-                video_noise_pred = self.transformer(
+-                    self._repeat_input_for_cfg(input_dict['latent_res_lst']),
+-                    update_cache=1 if last_step else 0,
+-                    cache_name=self.cache_name,
+-                    action_mode=False)
++                run_transformer = partial(self.transformer,
++                                          self._repeat_input_for_cfg(input_dict['latent_res_lst']),
++                                          update_cache=1 if last_step else 0,
++                                          cache_name=self.cache_name,
++                                          action_mode=False)
++                if last_step:  # input is the final predicted latents at t=0
++                    video_noise_pred, hidden = self._run_with_hidden_capture(frame_chunk_size, run_transformer)
++                else:
++                    video_noise_pred = run_transformer()
+ 
+                 if not last_step or video_step != -1:
+                     video_noise_pred = data_seq_to_patch(
+@@ -514,6 +576,12 @@ class VA_Server:
+                         video_noise_pred = video_noise_pred[1:] + self.job_config.guidance_scale * (video_noise_pred[:1] - video_noise_pred[1:])
+                     else:
+                         video_noise_pred = video_noise_pred[:1]
++                    if i in self.record_denoise_steps:
++                        # Flow matching x_t = (1 - sigma) x_0 + sigma * eps, v = eps - x_0  =>  x0_hat = x_t - sigma v
++                        sigma = float(t) / self.scheduler.num_train_timesteps
++                        x0_hat = latents.float() - sigma * video_noise_pred.float()
++                        denoise_records.append(dict(step=i, timestep=float(t), sigma=sigma,
++                                                    x_t=latents[0].half().cpu(), x0_hat=x0_hat[0].half().cpu()))
+                     latents = self.scheduler.step(video_noise_pred,
+                                                   t,
+                                                   latents,
+@@ -562,8 +630,13 @@ class VA_Server:
+ 
+         actions[:, ~self.action_mask] *= 0
+ 
+-        save_async(latents, os.path.join(self.exp_save_root, f'latents_{frame_st_id}.pt'))
+-        save_async(actions, os.path.join(self.exp_save_root, f'actions_{frame_st_id}.pt'))
++        self.episode_log['pred'].append(
++            dict(frame_st_id=frame_st_id,
++                 wall_time=time.time(),
++                 noise_seed=noise_seed,
++                 latents=latents[0].detach().cpu(),  # C, F, H, W (normalized latent space)
++                 denoise=denoise_records,
++                 hidden=hidden))  # F, num_layers, num_cams, D
+ 
+         actions = self.postprocess_action(actions)
+         torch.cuda.empty_cache()
+@@ -572,12 +645,15 @@ class VA_Server:
+     def _compute_kv_cache(self, obs):
+         ### optional async save obs for debug
+         self.transformer.clear_pred_cache(self.cache_name)
+-        save_async(obs['obs'], os.path.join(self.exp_save_root, f'obs_data_{self.frame_st_id}.pt'))
+         latent_model_input = self._encode_obs(obs)
+         if self.frame_st_id == 0:
+             latent_model_input = torch.cat(
+                 [self.init_latent, latent_model_input],
+                 dim=2) if latent_model_input is not None else self.init_latent
++        obs_record = dict(frame_st_id=self.frame_st_id,
++                          wall_time=time.time(),
++                          latents=latent_model_input[0].detach().cpu())  # C, F, H, W
++        self.episode_log['obs'].append(obs_record)
+ 
+         action_model_input = self.preprocess_action(obs['state'])
+         action_model_input = action_model_input.to(latent_model_input)
+@@ -591,10 +667,13 @@ class VA_Server:
+         with (
+                 torch.no_grad(),
+         ):
+-            self.transformer(self._repeat_input_for_cfg(input_dict['latent_res_lst']),
+-                             update_cache=2,
+-                             cache_name=self.cache_name,
+-                             action_mode=False)
++            _, obs_record['hidden'] = self._run_with_hidden_capture(
++                latent_model_input.shape[2],
++                partial(self.transformer,
++                        self._repeat_input_for_cfg(input_dict['latent_res_lst']),
++                        update_cache=2,
++                        cache_name=self.cache_name,
++                        action_mode=False))
+ 
+             self.transformer(self._repeat_input_for_cfg(input_dict['action_res_lst']),
+                              update_cache=2,
+@@ -609,9 +688,17 @@ class VA_Server:
+         prompt = obs.get('prompt', None)
+         compute_kv_cache = obs.get('compute_kv_cache', False)
+ 
++        if obs.get('finalize', False):
++            logger.info(f"################# Finalize episode #################")
++            try:
++                return self._finalize_episode(obs['episode_dir'])
++            except Exception as e:  # never drop the client connection over a failed save
++                logger.exception("finalize failed")
++                torch.cuda.empty_cache()
++                return dict(saved=False, error=f"{type(e).__name__}: {e}"[-500:])
+         if reset:
+             logger.info(f"******************* Reset server ******************")
+-            self._reset(prompt=prompt)
++            self._reset(prompt=prompt, seed=obs.get('seed'))
+             return dict()
+         elif compute_kv_cache:
+             logger.info(
+@@ -620,9 +707,131 @@ class VA_Server:
+             return dict()
+         else:
+             logger.info(f"################# Infer One Chunk #################")
+-            action, _ = self._infer(obs, frame_st_id=self.frame_st_id)
+-            return dict(action=action)
+-    
++            frame_st_id = self.frame_st_id
++            action, _ = self._infer(obs, frame_st_id=frame_st_id)
++            return dict(action=action, frame_st_id=frame_st_id)
++
++    @staticmethod
++    def _latent_frame_meta(records):
++        """Per-latent-frame index, chunk id and wall time for records concatenated along time."""
++        latent_index, chunk_id, wall_time = [], [], []
++        for c, r in enumerate(records):
++            n = r['latents'].shape[1]
++            latent_index += range(r['frame_st_id'], r['frame_st_id'] + n)
++            chunk_id += [c] * n
++            wall_time += [r['wall_time']] * n
++        return dict(latent_index=np.array(latent_index), chunk_id=np.array(chunk_id),
++                    wall_time=np.array(wall_time, dtype=np.float64))
++
++    @torch.no_grad()
++    def _decode_latents_uint8(self, latents):
++        """Decode normalized latents (C, T, h, w) to uint8 frames (T', H, W, 3) with the policy's VAE.
++        Falls back to the CPU if the GPU is out of memory (the simulator shares the GPU)."""
++        try:
++            return self._decode_latents_uint8_on(latents, self.device)
++        except torch.OutOfMemoryError:
++            logger.warning("VAE decode out of GPU memory, decoding on CPU")
++            torch.cuda.empty_cache()
++            return self._decode_latents_uint8_on(latents, torch.device('cpu'))
++
++    @torch.no_grad()
++    def _decode_latents_uint8_on(self, latents, device):
++        vae_device = next(self.vae.parameters()).device
++        self.vae.to(device)
++        try:
++            vae = self.vae
++            latents = latents[None].to(device, vae.dtype)
++            mean = torch.tensor(vae.config.latents_mean).view(1, -1, 1, 1, 1).to(latents)
++            std = torch.tensor(vae.config.latents_std).view(1, -1, 1, 1, 1).to(latents)
++            # Same causal frame-by-frame loop as AutoencoderKLWan._decode, but each decoded chunk goes to the CPU
++            # right away: decoding a whole long episode on the GPU runs out of memory next to the simulator.
++            vae.clear_cache()
++            x = vae.post_quant_conv(latents * std + mean)
++            chunks = []
++            for i in range(x.shape[2]):
++                vae._conv_idx = [0]
++                out = vae.decoder(x[:, :, i:i + 1], feat_cache=vae._feat_map, feat_idx=vae._conv_idx,
++                                  first_chunk=(i == 0))
++                if vae.config.patch_size is not None:
++                    out = unpatchify(out, patch_size=vae.config.patch_size)
++                out = ((out[0].float().clamp(-1, 1) + 1) * 127.5).round().to(torch.uint8)  # 3, t, H, W
++                chunks.append(out.permute(1, 2, 3, 0).cpu())
++            vae.clear_cache()
++            return torch.cat(chunks).numpy()
++        finally:
++            self.vae.to(vae_device)
++            torch.cuda.empty_cache()
++
++    @staticmethod
++    def _write_mp4(path, frames, fps=10):
++        with imageio.get_writer(path, fps=fps, codec='libx264', macro_block_size=1,
++                                ffmpeg_params=['-crf', '15', '-pix_fmt', 'yuv420p']) as writer:
++            for frame in frames:
++                writer.append_data(frame)
++
++    def _finalize_episode(self, episode_dir):
++        """Write the model side of the finished episode to <episode_dir>/episode.h5 (group /model) and decode
++        the predicted latents per camera to pred_<camera>.mp4."""
++        pred_records, obs_records = self.episode_log['pred'], self.episode_log['obs']
++        if self.job_config.rank != 0 or not pred_records:
++            return dict(saved=False)
++        os.makedirs(episode_dir, exist_ok=True)
++        cams = list(self.LATENT_CAM_SLICES)
++        fp16 = lambda t: t.to(torch.float16).numpy()
++
++        pred_latents = torch.cat([r['latents'] for r in pred_records], dim=1)  # C, T, H, W
++        with h5py.File(os.path.join(episode_dir, 'episode.h5'), 'w') as f:
++            g = f.create_group('model')
++            g.attrs['checkpoint'] = os.path.abspath(self.job_config.wan22_pretrained_model_name_or_path)
++            g.attrs['config'] = json.dumps({k: v for k, v in self.job_config.items()
++                                            if isinstance(v, (int, float, str, bool, list))}, default=str)
++            g.attrs['camera_names'] = cams
++            g.attrs['hidden_layers'] = self.record_hidden_layers
++            g.attrs['latent_index_convention'] = 'latent 0 = initial frame; latent k>=1 = raw frames 4k-3..4k'
++
++            chunks = g.create_group('chunks')
++            chunks['frame_st_id'] = np.array([r['frame_st_id'] for r in pred_records])
++            chunks['wall_time'] = np.array([r['wall_time'] for r in pred_records], dtype=np.float64)
++            chunks['noise_seed'] = np.array([r['noise_seed'] for r in pred_records])
++
++            # Final predictions and real latents per camera, aligned by latent_index
++            for name, records in (('pred', pred_records), ('obs', obs_records)):
++                if not records:
++                    continue
++                grp = g.create_group(name)
++                for k, v in self._latent_frame_meta(records).items():
++                    grp[k] = v
++                latents = torch.cat([r['latents'] for r in records], dim=1)
++                for cam, lat in self._split_cams(latents).items():
++                    grp.create_dataset(f'latents/{cam}', data=fp16(lat.transpose(0, 1)), compression='gzip')  # T,C,h,w
++                hidden = [r['hidden'] for r in records if r.get('hidden') is not None]
++                if len(hidden) == len(records):
++                    grp.create_dataset('hidden', data=fp16(torch.cat(hidden, dim=0)), compression='gzip')  # T,L,cams,D
++
++            # Intermediate denoising states per chunk: (chunk, step, C, F, h, w)
++            if pred_records[0]['denoise']:
++                den = g.create_group('denoise')
++                den['step'] = np.array([d['step'] for d in pred_records[0]['denoise']])
++                den['timestep'] = np.array([[d['timestep'] for d in r['denoise']] for r in pred_records])
++                den['sigma'] = np.array([[d['sigma'] for d in r['denoise']] for r in pred_records])
++                for key in ('x_t', 'x0_hat'):
++                    stacked = torch.stack([torch.stack([d[key] for d in r['denoise']]) for r in pred_records])
++                    for cam, lat in self._split_cams(stacked).items():
++                        den.create_dataset(f'{key}/{cam}', data=fp16(lat), compression='gzip')
++
++        # The episode is over: free its KV cache before decoding (recreated on the next reset)
++        self.transformer.clear_cache(self.cache_name)
++        torch.cuda.empty_cache()
++
++        # Causal VAE: latent 0 decodes to 1 frame, every later latent to 4, so the decoded streams line up with the
++        # client's raw frames. Cameras are decoded separately, as they were encoded.
++        num_frames = {}
++        for cam, lat in self._split_cams(pred_latents).items():
++            frames = self._decode_latents_uint8(lat)
++            self._write_mp4(os.path.join(episode_dir, f'pred_{cam}.mp4'), frames)
++            num_frames[cam] = len(frames)
++        return dict(saved=True, n_decoded_frames=num_frames)
++
+     def decode_one_video(self, latents, output_type):
+         latents = latents.to(self.vae.dtype)
+         latents_mean = (
+@@ -680,6 +889,10 @@ def run(args):
+     port = config.port if args.port is None else args.port
+     if args.save_root is not None:
+         config.save_root = args.save_root
++    if args.model_path is not None:
++        config.wan22_pretrained_model_name_or_path = args.model_path
++    if args.enable_offload:
++        config.enable_offload = True
+     rank = int(os.getenv("RANK", 0))
+     local_rank = int(os.environ.get('LOCAL_RANK', 0))
+     world_size = int(os.environ.get("WORLD_SIZE", 1))
+@@ -715,6 +928,17 @@ def main():
+         default=None,
+         help='(start) port'
+     )
++    parser.add_argument(
++        "--model_path",
++        type=str,
++        default=None,
++        help='checkpoint dir with vae/, tokenizer/, text_encoder/, transformer/ (overrides the config)'
++    )
++    parser.add_argument(
++        "--enable_offload",
++        action="store_true",
++        help='keep VAE and text encoder on the CPU to save VRAM'
++    )
+     parser.add_argument(
+         "--save_root",
+         type=str,

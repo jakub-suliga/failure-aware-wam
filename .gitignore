@@ -1,0 +1,12 @@
+# Upstream repos (cloned by setup.sh, local changes live in patches/)
+/lingbot-va/
+/RoboTwin/
+# Large / generated data
+/results/
+/logs/
+/.cache/
+*.log
+*.h5
+*.mp4
+__pycache__/
+*.pyc
