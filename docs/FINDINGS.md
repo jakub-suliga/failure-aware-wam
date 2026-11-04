@@ -1,7 +1,8 @@
 # Fehleranalyse LingBot-VA auf RoboTwin 2.0 – Befunde
 
-Stand: 2026-11-03. Datengrundlage: alle bisher aufgezeichneten Läufe in `results/`. Neu gegenüber dem Projekt-Hub
-ist Abschnitt 5 (vorgestellte vs. reale Zukunft). Er ändert, welche Methoden sinnvoll sind (Abschnitt 7).
+Stand: 2026-11-04. Datengrundlage: alle bisher aufgezeichneten Läufe in `results/`. Neu gegenüber dem Projekt-Hub
+sind Abschnitt 5 (vorgestellte vs. reale Zukunft) und 5b (Aktionsbereich). Sie ändern, welche Methoden sinnvoll sind
+(Abschnitt 7 und [METHOD.md](METHOD.md)).
 
 ## Kurzfassung
 
@@ -12,18 +13,25 @@ ist Abschnitt 5 (vorgestellte vs. reale Zukunft). Er ändert, welche Methoden si
    3 Latents (≈ 48 Env-Steps) vor dem Fehler. Die Kopfkamera und die Hidden States taugen dafür kaum.
 3. **Bei einer geometrischen Verschiebung bricht das Modell zusammen.** Wird der Tisch um 5 cm gesenkt, fällt die
    Erfolgsrate von 24/24 auf 6/54, bei 10 cm auf 0/54. Die kommandierte Greifhöhe geht nur 2–4 cm mit.
-4. **Neu: Das Video-Modell stellt sich den Erfolg vor, die Aktionen setzen ihn nicht um.** Am Greifzeitpunkt zeigt die
-   *vorhergesagte* Handgelenkkamera das Objekt zwischen den Fingern. Real schließt der Greifer darüber. Die Distanz
-   zwischen Vorhersage und Realität am Greif-Latent wächst mit der Verschiebung: 0,21 bei 0 cm, 0,35 bei −5 cm,
-   0,39 bei −10 cm. Erfolgreiche Episoden liegen bei jeder Höhe um 0,21–0,24.
+4. **Vorhersage und Realität laufen am Greifzeitpunkt auseinander.** Die Distanz zwischen vorhergesagtem und echtem
+   Handgelenk-Latent am Greif-Latent wächst mit der Verschiebung: 0,21 bei 0 cm, 0,35 bei −5 cm, 0,39 bei −10 cm.
+   Erfolgreiche Episoden liegen bei jeder Höhe um 0,21–0,24. **Korrigiert am 2026-11-04 (Abschnitt 5, A0):** Die
+   Vorstellung zeigt den Greifer *nicht* tiefer als real (Pose-Probe, ±1 cm). Die Lücke kommt aus der vorgestellten
+   Szene bzw. dem Kontakt, nicht aus einem „vorgestellten richtigen Griff“.
 5. **Die Aktions-Tokens schauen zu 50–59 % auf vergangene Aktionen und nur zu 6–8 % auf jede Handgelenkkamera.**
-   Zusammen mit Punkt 4 heißt das: Die Fehler entstehen an der **Kopplung von Video und Aktion**. Der Aktionspfad folgt
-   seinem Prior aus der Aktionshistorie statt der vorgestellten Zukunft. Der Videopfad allein ist nicht die Ursache.
+   Der Aktionspfad folgt stark seinem Prior aus der Aktionshistorie.
 
-Daraus folgt der Kern des Experimentplans: Methoden, die die vorgestellte Zukunft stärker in die Aktion bringen,
-also Imagination Guidance, ein Adapter auf dem Aktionspfad und Best-of-N mit Konsistenzprüfung. Dazu kommen Methoden,
-die die Diskrepanz online erkennen und korrigieren: Kontext-Reset, Sprach- bzw. Negativ-Prompt und Re-Grasp.
-Methoden, die nur die Video-Vorhersage „genauer“ machen, sind für die Tischhöhe zweitrangig.
+6. **Neu: Die kommandierte Höhe stößt an den Rand des Trainings-Aktionsbereichs.** Der greifende linke Arm geht bei
+   −5 und −10 cm im Median bis −8,0 bzw. −8,1 cm unter die Startpose. Das 1-%-Quantil der Trainingsaktionen (q01) liegt
+   bei −8,8 cm. 41–46 % der Episoden kommen bis auf 5 mm an q01 heran, bei 0 cm nur 12 %. Das erklärt, warum −5 und
+   −10 cm denselben Boden haben (0,862 m). Bei −10 cm wären etwa −15 cm nötig, das ist außerhalb dessen, was das Modell
+   je gesehen hat. Trainingsfreie Methoden können das kaum beheben, eine Adaption mit Korrektur-Zielen schon.
+
+Daraus folgt (Stand 2026-11-04, siehe [METHOD.md](METHOD.md)): Der Vorhersagefehler sagt zuverlässig, **wann und wo**
+etwas schiefgeht. **Wie** man korrigieren muss, steckt in diesem Fehlermodus nicht in der eigenen Vorstellung, denn
+sie zeigt den Greifer nicht tiefer. Diese Information muss aus der Analyse kommen (VLM, Orakel) oder aus Exploration
+beim nächsten Versuch. Und die Korrektur verlangt Aktionen außerhalb des Trainingsbereichs, also ein Update der
+Gewichte (Adapter) und nicht nur Guidance.
 
 ---
 
@@ -124,7 +132,7 @@ Dekodierte Bilder zeigen, woher die Lücke kommt (links real, rechts vorhergesag
 - **0 cm (Referenz):** Vorhersage und Realität stimmen überein.
   ![z00](figures/imagined_vs_real_z00_mouse_pad.jpg)
 
-**Interpretation.** Der Videopfad sieht im ersten Bild, dass der Tisch tiefer steht, und „plant“ einen korrekten Griff.
+**Interpretation (ursprünglich, durch A0 unten widerlegt).** Der Videopfad sieht im ersten Bild, dass der Tisch tiefer steht, und „plant“ einen korrekten Griff.
 Der Aktionspfad erzeugt danach Aktionen, die diesen Plan nicht umsetzen. Das passt zur Attention-Analyse:
 Die 32 Aktions-Tokens eines Chunks legen im Mittel 50–59 % ihrer Attention auf vergangene Aktionen.
 Auf die Kopfkamera fallen 29–35 %, auf jede Handgelenkkamera nur 6–8 %.
@@ -144,9 +152,48 @@ Vorbehalte:
 - Ein Teil der Distanz kommt einfach daher, dass sich die Realität nach einer falschen Aktion vom Plan entfernt.
   Die Distanz misst also Lücke **und** Folgefehler. Erfolge bei −5 cm liegen aber auf dem Niveau von 0 cm. Das spricht
   dafür, dass die Distanz die Ausführungslücke anzeigt und nicht die Verschiebung an sich.
-- Ob der Videopfad bei −10 cm auch die *Tiefe* richtig vorstellt oder nur „irgendeinen Griff“, ist offen.
-  Das prüft Experiment A0: Greiferhöhe aus der vorhergesagten Handgelenkkamera schätzen, mit einem Probe auf
-  Latents mit Sim-Labels.
+- **A0 (2026-11-04): Wo stellt sich das Modell den Greifer vor?** Eine Ridge-Probe von den Hidden States (Layer 19)
+  auf die Endeffektor-Position trifft auf neuen Episoden die Greiferhöhe mit 1,1 cm mittlerem Fehler
+  (`fawam/pose_probe.py`, `artifacts/probe/pose_probe.npz`). Auf vorgestellte und echte Frames am ersten Greif-Latent
+  angewendet (vorgestellt − real):
+
+  | Offset | Ausgang | Greifer z (Hidden-Probe) | Greifer z (Latent-Probe, 2,1 cm Fehler) | Objekt z (Latent-Probe, 4,9 cm Fehler) |
+  |---|---|---|---|---|
+  | 0 cm | Erfolg | +1,0 cm | +1,1 cm | +0,1 cm |
+  | −5 cm | Fail | +1,0 cm | +1,3 cm | +0,5 cm |
+  | −10 cm | Fail | +0,6 cm | +1,0 cm | +2,6 cm |
+  | +5 cm | Fail | +0,2 cm | +0,8 cm | +0,4 cm |
+
+  Die Vorstellung legt den Greifer also dahin, wo die Aktion ihn hinbringt, und **nicht tiefer**. Der Eindruck „Objekt
+  zwischen den Fingern“ aus den zwei angesehenen Bildern kommt eher aus der vorgestellten Szene. Bei −10 cm wird das
+  Objekt ~2,6 cm höher vorgestellt, also näher an der Trainingshöhe. Wegen 4,9 cm Probe-Fehler ist das nur ein Hinweis.
+  Vorbehalt: Die Probe wurde zum Teil auf denselben Episoden gefittet (Split nach Episoden für die Fehlerangabe).
+
+## 5b. Neu: Sättigung am Rand des Aktionsbereichs
+
+LingBot-VA normiert jede Aktionsdimension mit den Quantilen q01/q99 der Trainingsdaten auf [−1, 1]. Für die relative
+z-Höhe des linken Arms sind das −8,8 cm / +14,8 cm (rechts −12,0 / +17,9 cm). Tiefste kommandierte relative Höhe pro
+Episode (alle Tischhöhen-Läufe):
+
+| Offset | Arm | Median tiefste rel. z | Anteil ≤ 5 mm über q01 | absolut (Start 0,942 m) |
+|---|---|---|---|---|
+| 0 cm | links | −5,0 cm | 0,12 | 0,892 m |
+| +5 cm | links | −5,5 cm | 0,33 | 0,887 m |
+| −5 cm | links | −8,0 cm | 0,41 | 0,862 m |
+| −10 cm | links | −8,1 cm | 0,46 | 0,861 m |
+| alle | rechts | −0,1 bis −0,4 cm | ≤ 0,11 | ~0,938 m (greift in diesen Aufgaben kaum) |
+
+Bei −5 cm braucht der Griff etwa −10 cm, bei −10 cm etwa −15 cm (Objekt 5 bzw. 10 cm tiefer als bei 0 cm,
+Greifhöhe 15,5 cm über Objektmitte). Beides liegt unter q01. Das Modell erzeugt solche Werte praktisch nie. Die
+Analyse dazu ist ein Ad-hoc-Skript vom 2026-11-04 (kommt nach `fawam/analysis_gap.py`).
+
+Folgen:
+- Zusammen mit Abschnitt 5 entsteht der Fehler so: Die Vorstellung zeigt den tiefen Griff, die Aktion geht bis an
+  ihren gewohnten Rand und nicht weiter.
+- Imagination Guidance, History-Dropout und Best-of-N verschieben die Aktion nur innerhalb des gelernten Bereichs.
+  Für −10 cm reicht das vermutlich nicht.
+- Eine Adaption braucht Ziele außerhalb des Trainingsbereichs. Upstream werden normierte Aktionen bei ±1,5
+  abgeschnitten, für relabelte Korrekturen ist das jetzt konfigurierbar (`--action_clip`, Learn-from-Failure: 3).
 
 ## 6. Attention
 
@@ -164,7 +211,7 @@ Vorbehalte:
 
 | Hypothese | Prüfbar mit | Erwartung, wenn sie stimmt |
 |---|---|---|
-| H1: Der Aktionspfad unterschätzt die vorgestellten Frames. | A1 Imagination Guidance (CFG über die Pred-Frames im KV-Cache) | Tiefere Greifhöhe bei −5/−10 cm, Erfolgsrate steigt ohne Training. |
+| H1 (durch A0 geschwächt: die Vorstellung zeigt keinen tieferen Griff): Der Aktionspfad unterschätzt die vorgestellten Frames. | A1 Imagination Guidance (CFG über die Pred-Frames im KV-Cache) | Tiefere Greifhöhe bei −5/−10 cm, Erfolgsrate steigt ohne Training. |
 | H2: Der Aktions-Prior aus der Historie dominiert. | A2 Attention-Reweighting bzw. History-Dropout bei der Inferenz | Wie H1. Bei 0 cm darf es nicht schlechter werden. |
 | H3: Wenige Demos unter der Verschiebung reichen, um den Aktionspfad zu kalibrieren. | D1/D2 Dual-Site-Adapter mit Expert-Replays | Mit 3–10 Demos deutlich besser als ohne. Beim Nominal-Setting leichter Verlust (wie im Paper: 85 → 54 %). |
 | H4: Die Lücke ist online erkennbar, bevor der Griff scheitert. | B1 Detektor auf pred-vs-obs pro Chunk | AUC > 0,8 einen Chunk vor dem Schließen. |

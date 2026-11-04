@@ -66,6 +66,14 @@ GRID["e3_icl_multishift"] = (dict(EPISODES=expert("table_h_m025", "table_h_m05",
                                   EXTRA="--max_frames 20 --context_pool " + expert("table_h_m025", "table_h_m05",
                                                                                    "table_h_m10")),
                              ["table_h_m05", "table_h_m075", "table_h_z00"])
+# FailFix meta-training (Learn-from-Failure, ICL mode): context = own failed attempt (imagined + observed), target =
+# the expert replay on the SAME seed (P0 and P2 share seeds), prompt = instruction (+ correction text with p 0.5).
+# Needs analysis.json next to the failures for the correction text: python -m fawam.failure_analysis <P0 fails>.
+GRID["failfix_meta"] = (dict(EPISODES=roll("table_h_m025", "table_h_m05", "table_h_m10", "demo_randomized"),
+                             SUCCESS="false", OUTSIDE="none",
+                             EXTRA="--include_pred --p_text 0.5 --max_frames 20 --steps 800 --fixes " +
+                                   expert("table_h_m025", "table_h_m05", "table_h_m10", "demo_randomized")),
+                        ["table_h_m05", "table_h_m10"])
 ICL_CONFIGS = ["table_h_m05", "table_h_m075", "table_h_m10", "table_h_z00", "demo_randomized"]
 
 
@@ -121,8 +129,8 @@ def methods(a):
             variants[f"{name}@inside"] = dict(adapter_path=f"{ADAPTERS}/{name}", adapter_use="inside")
             variants[f"{name}@outside"] = dict(adapter_path=f"{ADAPTERS}/{name}", adapter_use="outside")
         for vname, spec in variants.items():
-            if name.startswith("e3_"):
-                continue  # evaluated with prefill in p4
+            if name.startswith(("e3_", "failfix_")):
+                continue  # evaluated with prefill in p4 / through Method.learn.meta_adapter in p5
             f = mdir / f"{vname.replace('@', '__')}.json"
             f.write_text(json.dumps(dict(name=vname, **spec), indent=1))
             p3_methods.append(dict(name=vname, spec=str(f.relative_to(ROOT))))

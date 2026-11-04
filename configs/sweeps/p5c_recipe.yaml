@@ -1,0 +1,11 @@
+# P5c: Wie wird der Fehler ins Modell gegeben (Rezept-Ablationen + Integrationen aktueller Methoden), Signale O+P
+name: p5c_recipe
+out: results/sweeps/p5c_recipe
+episodes: 30
+per_job: 10
+n_par: 2
+time: "16:00:00"
+tasks: [move_playingcard_away, place_mouse_pad, pick_diverse_bottles, stack_blocks_two]
+configs: [table_h_m05, table_h_m10]
+methods: [lff_adapter, lff_adapter_noweight, lff_adapter_norelabel, lff_adapter_instr, lff_adapter_videoonly,
+          lff_adapter_actiononly, lff_ttt_filtered, lff_pref, lff_pref_PRI, lff_adapter_explore, lff_adapter_3att]

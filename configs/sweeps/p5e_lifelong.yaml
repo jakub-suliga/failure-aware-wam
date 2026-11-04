@@ -1,0 +1,10 @@
+# P5e: Über Seeds hinweg lernen (Erfolg im 1. Versuch über den Seed-Index = Lernkurve). 20 Seeds pro Client-Lauf.
+name: p5e_lifelong
+out: results/sweeps/p5e_lifelong
+episodes: 20
+per_job: 20
+n_par: 1
+time: "36:00:00"
+tasks: [move_playingcard_away, place_mouse_pad, pick_diverse_bottles, stack_blocks_two]
+configs: [table_h_m05, table_h_m10]
+methods: [base, lff_adapter_lifelong, lff_lifelong_PRI, lff_bank, lff_ttt_persist]

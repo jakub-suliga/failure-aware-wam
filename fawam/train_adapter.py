@@ -27,7 +27,7 @@ import torch
 import torch.nn.functional as F
 
 from fawam import adapters as fa
-from fawam.latent_data import ActionNorm, EpisodeDataset, build_pairs, find_episodes
+from fawam.latent_data import ActionNorm, EpisodeDataset, FailFixDataset, build_pairs, find_episodes
 from fawam.paths import LINGBOT, ROOT, add_lingbot_to_path
 from fawam.text_cache import TextCache
 
@@ -41,12 +41,12 @@ DEFAULT_MODEL = LINGBOT / "checkpoints" / "lingbot-va-posttrain-robotwin"
 # ------------------------------------------------------------------------------------------ upstream-equivalent bits
 
 def add_noise(latent, sched, device, patch, action_mask=None, action_mode=False, noisy_cond_prob=0.0,
-              clean_frames=0, frame_gap=0):
+              clean_frames=0, frame_gap=0, noise=None, tid=None):
     """wan_va/train.py Trainer._add_noise, plus: the first `clean_frames` frames (in-context demos) get clean
     conditioning, and frames from `clean_frames` on are shifted by `frame_gap` in RoPE time (as the server's prefill)."""
     B, C, Fr, H, W = latent.shape
-    tid = sample_timestep_id(batch_size=Fr, num_train_timesteps=sched.num_train_timesteps)
-    noise = torch.zeros_like(latent).normal_()
+    tid = sample_timestep_id(batch_size=Fr, num_train_timesteps=sched.num_train_timesteps) if tid is None else tid
+    noise = torch.zeros_like(latent).normal_() if noise is None else noise
     timesteps = sched.timesteps[tid].to(device)
     noisy = sched.add_noise(latent, noise, timesteps, t_dim=2)
     targets = sched.training_target(latent, noise, timesteps)
@@ -70,11 +70,12 @@ def add_noise(latent, sched, device, patch, action_mask=None, action_mode=False,
         m = action_mask.float()
         noisy, targets, cond = noisy * m, targets * m, cond * m
     return dict(timesteps=timesteps[None].repeat(B, 1), noisy_latents=noisy, targets=targets, latent=cond,
-                cond_timesteps=cond_t[None].repeat(B, 1), grid_id=grid)
+                cond_timesteps=cond_t[None].repeat(B, 1), grid_id=grid, _noise=noise, _tid=tid)
 
 
-def flow_losses(input_dict, pred, patch, sched_v, sched_a, frame_weight=None):
-    """wan_va/train.py Trainer.compute_loss (frame-wise weighted MSE), with an optional per-frame loss weight."""
+def flow_losses(input_dict, pred, patch, sched_v, sched_a, frame_weight=None, frame_weight_action=None):
+    """wan_va/train.py Trainer.compute_loss (frame-wise weighted MSE), with optional per-frame loss weights
+    (video, action; the action weight defaults to the video weight)."""
     latent_pred, action_pred = pred
     tv, ta = input_dict["latent_dict"]["targets"], input_dict["action_dict"]["targets"]
     action_pred = action_pred.reshape(action_pred.shape[0], tv.shape[2], -1, action_pred.shape[-1])
@@ -85,6 +86,7 @@ def flow_losses(input_dict, pred, patch, sched_v, sched_a, frame_weight=None):
     wv = sched_v.training_weight(input_dict["latent_dict"]["timesteps"].flatten()).reshape(B, Fr)
     wa = sched_a.training_weight(input_dict["action_dict"]["timesteps"].flatten()).reshape(B, Fr)
     fw = torch.ones(B, Fr, device=tv.device) if frame_weight is None else frame_weight[None].to(tv.device)
+    fwa = fw if frame_weight_action is None else frame_weight_action[None].to(tv.device)
 
     lv = F.mse_loss(latent_pred.float(), tv.float(), reduction="none") * wv[:, None, :, None, None]
     lv = lv.permute(0, 2, 3, 4, 1).flatten(2).mean(2)  # B, F
@@ -93,7 +95,7 @@ def flow_losses(input_dict, pred, patch, sched_v, sched_a, frame_weight=None):
     am = input_dict["action_dict"]["actions_mask"].float()
     la = F.mse_loss(action_pred.float(), ta.float(), reduction="none") * wa[:, None, :, None, None] * am
     la = la.permute(0, 2, 3, 4, 1).flatten(2).sum(2) / (am.permute(0, 2, 3, 4, 1).flatten(2).sum(2) + 1e-6)
-    la = (la * fw).sum() / fw.sum().clamp(min=1)
+    la = (la * fwa).sum() / fwa.sum().clamp(min=1)
     return lv, la
 
 
@@ -119,8 +121,20 @@ def train_inside(a):
         raise SystemExit("no episodes found")
     ctx_pool = find_episodes(a.context_pool, success=True, tasks=a.tasks) if a.context_pool else None
     print(f"{len(eps)} training episodes")
-    ds = EpisodeDataset(eps, ActionNorm(cfg), TextCache(a.text_cache), max_frames=a.max_frames,
-                        context_k=a.context_k, context_pool=ctx_pool, seed=a.seed, cfg_prob=a.cfg_prob)
+    load_kw = dict(relabel=a.relabel, gap_beta=a.gap_beta, video_in_window=a.video_in_window,
+                   gap_filter=a.gap_filter)
+    if a.fixes:  # meta-ICL from failures: eps are the failed attempts, fixes the successes on the same seeds
+        fixes = find_episodes(a.fixes, success=True, tasks=a.tasks)
+        ds = FailFixDataset(eps, fixes, ActionNorm(cfg, a.action_clip), TextCache(a.text_cache), include_pred=a.include_pred,
+                            p_text=a.p_text, max_frames=a.max_frames, seed=a.seed, cfg_prob=a.cfg_prob)
+        print(f"{len(ds.pairs)} (failure, fix) pairs")
+    else:
+        ds = EpisodeDataset(eps, ActionNorm(cfg, a.action_clip), TextCache(a.text_cache), max_frames=a.max_frames,
+                            context_k=a.context_k, context_pool=ctx_pool, seed=a.seed, cfg_prob=a.cfg_prob,
+                            load_kw=load_kw, text_mode=a.text_mode)
+        n_rel = sum(it["relabeled"] for it in ds.items)
+        if a.relabel:
+            print(f"{n_rel} of {len(ds.items)} episodes relabeled with their failure analysis")
     tf = load_frozen_transformer(a.model_path, device)
     if a.init:
         aset = fa.AdapterSet.load(a.init, device=device)
@@ -158,29 +172,80 @@ def train_inside(a):
         ad["actions_mask"] = am
         window = 128 if ctx else int(rng.integers(4, 65))
         input_dict = dict(latent_dict=ld, action_dict=ad, chunk_size=int(rng.integers(1, 5)), window_size=window)
-        fw = None
-        if ctx:
-            fw = torch.ones(lat.shape[2])
+        fw, fwa = s["weight_video"].clone().float(), s["weight_action"].clone().float()
+        if ctx:  # in-context frames are conditioning only
             fw[:ctx] = 0
+            fwa[:ctx] = 0
         pred = tf(input_dict, train_mode=True)
-        lv, la = flow_losses(input_dict, pred, patch, sched_v, sched_a, fw)
+        lv, la = flow_losses(input_dict, pred, patch, sched_v, sched_a, fw, fwa)
         loss = a.lambda_video * lv + a.lambda_action * la
+        lp = torch.zeros((), device=device)
+        if a.pref_beta and bool(s.get("relabeled", False)) and s["window_mask"].sum() > 0:
+            # FAR-style failure-contrastive preference (Diffusion-DPO form): relabeled actions preferred over the
+            # executed failed ones on the failure window, relative to the frozen base model.
+            wm = s["window_mask"].float()
+            neg = s["actions_neg"][None].to(device)
+            ad_neg = add_noise(neg, sched_a, device, patch, action_mask=am, action_mode=True, noise=ad["_noise"],
+                               tid=ad["_tid"])
+            ad_neg["text_emb"], ad_neg["actions_mask"] = ad["text_emb"], am
+            in_neg = dict(latent_dict=ld, action_dict=ad_neg, chunk_size=input_dict["chunk_size"], window_size=window)
+            pred_neg = tf(in_neg, train_mode=True)
+            with torch.no_grad():
+                tf._fawam.ctx.enabled = False
+                ref_pos = tf(input_dict, train_mode=True)
+                ref_neg = tf(in_neg, train_mode=True)
+                tf._fawam.ctx.enabled = True
+            e = lambda inp, pr: flow_losses(inp, pr, patch, sched_v, sched_a, wm, wm)[1]
+            margin = (e(input_dict, pred) - e(input_dict, ref_pos)) - (e(in_neg, pred_neg) - e(in_neg, ref_neg))
+            lp = -torch.nn.functional.logsigmoid(-a.pref_beta * margin)
+            loss = loss + a.lambda_pref * lp
         loss.backward()
         gn = torch.nn.utils.clip_grad_norm_(params, 1.0)
         opt.step()
         opt.zero_grad(set_to_none=True)
         if step % a.log_every == 0 or step == 1:
-            rec = dict(step=step, loss=float(loss), video=float(lv), action=float(la), grad_norm=float(gn),
+            rec = dict(step=step, loss=float(loss), video=float(lv), action=float(la), pref=float(lp), grad_norm=float(gn),
                        frames=int(lat.shape[2]), ctx=ctx, s=round(time.time() - t0, 1))
             print(json.dumps(rec), flush=True)
             log.write(json.dumps(rec) + "\n")
             log.flush()
         if a.save_every and step % a.save_every == 0:
             aset.save(out / f"step{step}")
+    if a.guard_episodes:
+        ratio = guard_ratio(tf, aset, a, cfg, sched_v, sched_a, patch, device)
+        ok = ratio <= a.guard_tau
+        (out / "guard.json").write_text(json.dumps(dict(loss_ratio=ratio, tau=a.guard_tau, accepted=ok)))
+        print(f"guard: anchor loss ratio {ratio:.3f} (tau {a.guard_tau}) -> {'accepted' if ok else 'REJECTED'}")
     aset.save(out)
     (out / "train_args_inside.json").write_text(json.dumps({**vars(a), "episodes_used": [str(e) for e in eps]},
                                                            indent=2, default=str))
     print(f"saved {out}")
+
+
+@torch.no_grad()
+def guard_ratio(tf, aset, a, cfg, sched_v, sched_a, patch, device, n=16):
+    """FailBank-style acceptance test: flow loss on held-out anchor episodes (own successes) with / without the
+    adapter, same noise. ratio > tau means the update broke behaviour that worked."""
+    eps = find_episodes(a.guard_episodes)
+    ds = EpisodeDataset(eps, ActionNorm(cfg, a.action_clip), TextCache(a.text_cache), max_frames=a.max_frames,
+                        seed=123, cfg_prob=0.0)
+    tot = {True: 0.0, False: 0.0}
+    for i in range(n):
+        torch.manual_seed(1000 + i)
+        smp = ds[i]
+        lat, act = smp["latents"][None].to(device), smp["actions"][None].to(device)
+        am = smp["actions_mask"][None].to(device)
+        ld = add_noise(lat, sched_v, device, patch)
+        ad = add_noise(act, sched_a, device, patch, action_mask=am, action_mode=True)
+        ld["text_emb"] = smp["text_emb"][None].to(device, torch.bfloat16)
+        ad["text_emb"], ad["actions_mask"] = ld["text_emb"], am
+        inp = dict(latent_dict=ld, action_dict=ad, chunk_size=2, window_size=32)
+        for enabled in (True, False):
+            tf._fawam.ctx.enabled = enabled
+            lv, la = flow_losses(inp, tf(inp, train_mode=True), patch, sched_v, sched_a)
+            tot[enabled] += float(lv + la)
+    tf._fawam.ctx.enabled = True
+    return tot[True] / max(tot[False], 1e-8)
 
 
 def train_outside(a):
@@ -258,6 +323,20 @@ def main():
     ap.add_argument("--context_k", type=int, default=0, help="E3: demos concatenated in front of each sample")
     ap.add_argument("--context_pool", nargs="*", help="E3: episode roots the context demos are drawn from")
     ap.add_argument("--icl_gap", type=int, default=1)
+    # Learn-from-Failure (docs/METHOD.md)
+    ap.add_argument("--relabel", action="store_true", help="apply analysis.json corrections to failed episodes")
+    ap.add_argument("--action_clip", type=float, default=1.5, help="normalized action clip (upstream 1.5)")
+    ap.add_argument("--gap_beta", type=float, default=0.0, help="up-weight frames with high prediction error")
+    ap.add_argument("--video_in_window", default="real", choices=["real", "skip"])
+    ap.add_argument("--text_mode", default="instruction", choices=["instruction", "correction"])
+    ap.add_argument("--gap_filter", type=float, default=0.0, help="T3VF: train only on frames above this gap quantile")
+    ap.add_argument("--pref_beta", type=float, default=0.0, help="FAR: failure-contrastive preference loss (0 = off)")
+    ap.add_argument("--lambda_pref", type=float, default=1.0)
+    ap.add_argument("--guard_episodes", nargs="*", help="FailBank guard: anchor episodes for the acceptance test")
+    ap.add_argument("--guard_tau", type=float, default=1.1)
+    ap.add_argument("--fixes", nargs="*", help="meta-ICL: successful episodes on the same seeds as --episodes")
+    ap.add_argument("--include_pred", action="store_true", help="meta-ICL: imagined segment in the context")
+    ap.add_argument("--p_text", type=float, default=0.5, help="meta-ICL: prob. of the correction text in the prompt")
     ap.add_argument("--steps_outside", type=int, default=300)
     ap.add_argument("--lr_outside", type=float, default=1.234e-3)
     ap.add_argument("--batch_outside", type=int, default=32)

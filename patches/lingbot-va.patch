@@ -1,5 +1,5 @@
 diff --git a/evaluation/robotwin/eval_polict_client_openpi.py b/evaluation/robotwin/eval_polict_client_openpi.py
-index 7ed5265..25ca2ce 100644
+index 7ed5265..524ba06 100644
 --- a/evaluation/robotwin/eval_polict_client_openpi.py
 +++ b/evaluation/robotwin/eval_polict_client_openpi.py
 @@ -1,12 +1,14 @@
@@ -32,7 +32,7 @@ index 7ed5265..25ca2ce 100644
 +if str(FAWAM_ROOT) not in sys.path:
 +    sys.path.insert(0, str(FAWAM_ROOT))
 +from fawam.methods import resolve as resolve_method
-+from fawam.robotwin_hooks import ExpertTrajectory, Orchestrator, expert_chunk, failure_text
++from fawam.robotwin_hooks import ExpertTrajectory, LearnFromFailure, Orchestrator, expert_chunk, failure_text
  from evaluation.robotwin.test_render import Sapien_TEST
  
  def write_json(data: dict, fpath: Path) -> None:
@@ -188,7 +188,7 @@ index 7ed5265..25ca2ce 100644
  
      embodiment_type = args.get("embodiment")
      embodiment_config_path = os.path.join(CONFIGS_PATH, "_embodiment_config.yml")
-@@ -455,28 +603,41 @@ def eval_policy(task_name,
+@@ -455,28 +603,42 @@ def eval_policy(task_name,
      print(f"\033[34mTask Name: {args['task_name']}\033[0m")
      print(f"\033[34mPolicy Name: {args['policy_name']}\033[0m")
  
@@ -196,6 +196,7 @@ index 7ed5265..25ca2ce 100644
 +    method = resolve_method(args.get("fawam_method"), root=FAWAM_ROOT)
 +    driver = args.get("driver", "policy")
 +    print(f"\033[34mfawam method: {method.short()} | driver: {driver}\033[0m")
++    lff = LearnFromFailure(method, args["save_root"], task_name) if method.learn else None
 +
      expert_check = True
      TASK_ENV.suc = 0
@@ -232,7 +233,7 @@ index 7ed5265..25ca2ce 100644
                  TASK_ENV.close_env()
              except UnStableError as e:
                  TASK_ENV.close_env()
-@@ -484,12 +645,17 @@ def eval_policy(task_name,
+@@ -484,12 +646,17 @@ def eval_policy(task_name,
                  args["render_freq"] = render_freq
                  continue
              except Exception as e:
@@ -251,7 +252,7 @@ index 7ed5265..25ca2ce 100644
  
          if (not expert_check) or (TASK_ENV.plan_success and TASK_ENV.check_success()):
              succ_seed += 1
-@@ -501,137 +667,31 @@ def eval_policy(task_name,
+@@ -501,137 +668,59 @@ def eval_policy(task_name,
  
          args["render_freq"] = render_freq
  
@@ -380,9 +381,14 @@ index 7ed5265..25ca2ce 100644
 -        if TASK_ENV.eval_video_path is not None:
 -            TASK_ENV._del_eval_video_ffmpeg()
  
++        if lff is not None:
++            lff.start_seed()
++        m1 = lff.first_method() if lff is not None else method
++        phase = lff.phase() if lff is not None else None
 +        succ, final_dir, end_info = run_episode(TASK_ENV, args, model, task_name, now_id, now_seed, instruction,
 +                                                video_size, save_visualization, video_guidance_scale,
-+                                                action_guidance_scale, method, driver, expert, attempt=1)
++                                                action_guidance_scale, m1, driver, expert, attempt=1,
++                                                lff_info=dict(phase=phase, adapter=m1.adapter_path) if lff else None)
          if succ:
              TASK_ENV.suc += 1
              print("\033[92mSuccess!\033[0m")
@@ -399,12 +405,35 @@ index 7ed5265..25ca2ce 100644
 +                                      driver, None, attempt=2, prompt_override=prompt2, prefill_paths=prefill)
 +            TASK_ENV.suc_retry += int(succ2)
 +            print(f"\033[93mRetry: {'Success' if succ2 else 'Fail'}\033[0m")
++        # Learn-from-Failure (docs/METHOD.md): analyse the failure, update the model, retry the same seed
++        if lff is not None and driver == "policy":
++            attempt, ok, ep_dir = 1, succ, final_dir
++            if ok:
++                lff.after_success(ep_dir)
++            while not ok and attempt < method.learn["max_attempts"]:
++                TASK_ENV.close_env()
++                m2, prompt2, prefill, info = lff.after_failure(ep_dir, instruction, now_seed, attempt)
++                print(f"\033[93mLfF after attempt {attempt}: {json.dumps(info, default=str)[:400]}\033[0m")
++                attempt += 1
++                ok, ep_dir, _ = run_episode(TASK_ENV, args, model, task_name, now_id, now_seed, instruction,
++                                            video_size, save_visualization, video_guidance_scale,
++                                            action_guidance_scale, m2, driver, None, attempt=attempt,
++                                            prompt_override=prompt2, prefill_paths=prefill,
++                                            prefill_include_pred=method.learn["include_pred"], lff_info=info)
++                print(f"\033[93mLfF attempt {attempt}: {'Success' if ok else 'Fail'}\033[0m")
++                if ok:
++                    lff.after_success(ep_dir)
++            TASK_ENV.suc_retry += int(ok and not succ)
++            if method.learn.get("every_episode"):
++                lff.update_only(final_dir, succ, now_seed)
++            elif method.learn.get("adapt_episodes") is not None and lff.phase() == "adapt":
++                lff.n_seen += 1  # retry-style adaptation: each seed counts as one adaptation episode
 +        TASK_ENV.suc_retry += int(succ)
 +
          now_id += 1
          TASK_ENV.close_env(clear_cache=((succ_seed + 1) % clear_cache_freq == 0))
  
-@@ -647,10 +707,13 @@ def eval_policy(task_name,
+@@ -647,10 +736,13 @@ def eval_policy(task_name,
            "succ_num": float(TASK_ENV.suc),
            "total_num": float(TASK_ENV.test_num),
            "succ_rate": float(TASK_ENV.suc / TASK_ENV.test_num),
@@ -420,13 +449,13 @@ index 7ed5265..25ca2ce 100644
              f"Success rate: \033[96m{TASK_ENV.suc}/{TASK_ENV.test_num}\033[0m => \033[95m{round(TASK_ENV.suc/TASK_ENV.test_num*100, 1)}%\033[0m, current seed: \033[90m{now_seed}\033[0m\n"
          )
          now_seed += 1
-@@ -658,6 +721,187 @@ def eval_policy(task_name,
+@@ -658,6 +750,189 @@ def eval_policy(task_name,
      return now_seed, TASK_ENV.suc
  
  
 +def run_episode(TASK_ENV, args, model, task_name, now_id, now_seed, instruction, video_size, save_visualization,
 +                video_guidance_scale, action_guidance_scale, method, driver, expert, attempt=1, prompt_override=None,
-+                prefill_paths=None):
++                prefill_paths=None, prefill_include_pred=False, lff_info=None):
 +    """One rollout (policy) or one recorded expert replay; saves the episode dir and returns (success, dir, info)."""
 +    TASK_ENV.setup_demo(now_ep_num=now_id, seed=now_seed, is_test=True, **args)
 +    TASK_ENV.set_instruction(instruction=instruction)  # set language instruction
@@ -446,6 +475,7 @@ index 7ed5265..25ca2ce 100644
 +                     method=method.to_dict(), task_name=task_name)
 +    if prefill_paths:
 +        reset_msg["prefill_paths"] = prefill_paths
++        reset_msg["prefill_include_pred"] = bool(prefill_include_pred)
 +    ret = model.infer(reset_msg)
 +    orchestrator = Orchestrator(method, model, instruction) if (method.intervention and driver == "policy") else None
 +
@@ -581,6 +611,7 @@ index 7ed5265..25ca2ce 100644
 +        "driver": driver,
 +        "interventions": orchestrator.log if orchestrator is not None else [],
 +        "prefill_paths": prefill_paths or [],
++        "lff": lff_info or {},
 +    }
 +    with h5py.File(running_dir / 'episode.h5', 'a') as h5:
 +        recorder.save(running_dir, h5)

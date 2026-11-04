@@ -121,7 +121,9 @@ VLM_PROMPT = """You watch a bimanual robot doing: "{instruction}".
 Image 1-3: the current camera views (head, left wrist, right wrist).{pred_note}
 Did the robot just fail? Answer with JSON only:
 {{"failed": true|false, "failure_type": "missed_grasp|dropped|misplaced|collision|none",
+  "arm": "left|right",
   "cause": "<one sentence, concrete, with directions/distances>",
+  "delta_cm": {{"x": <forward +>, "y": <left +>, "z": <up +>}}  (how far the gripper should have been moved),
   "correction": "<one imperative instruction for the robot to recover>",
   "negative_prompt": "<one sentence describing the failure to avoid>"}}"""
 
@@ -243,3 +245,152 @@ class Orchestrator:
         self.model.infer(dict(event=event))
         self.log.append(event)
         return result
+
+
+# ------------------------------------------------------------------------------------------ learn from failure
+
+class LearnFromFailure:
+    """State of the Learn-from-Failure loop of one eval run (docs/METHOD.md). Per seed: attempt 1; while it fails
+    and attempts remain: analyse the failed episode (prediction gap + oracle/VLM), update the model (adapter training
+    in the lingbot env, and/or the failed attempt as in-context memory), retry the seed. With persist the adapter and
+    the memory carry over to the next seeds."""
+
+    def __init__(self, method, save_root, task):
+        import copy
+        import os
+        from pathlib import Path
+        self.copy, self.os, self.Path = copy, os, Path
+        self.m, self.cfg = method, method.learn
+        self.dir = Path(save_root) / "lff" / task
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.adapter = None      # current adapter dir (persists across seeds if cfg.persist)
+        self.memory = []         # failed episode dirs
+        self.successes = []
+        self.version = 0
+        self.n_seen = 0          # episodes seen in every_episode mode (paper protocol: adapt_episodes, then frozen)
+        self.log = []
+
+    def phase(self):
+        n = self.cfg.get("adapt_episodes")
+        return "adapt" if (n is None or self.n_seen < n) else "eval"
+
+    def start_seed(self):
+        if not self.cfg["persist"]:
+            self.adapter, self.memory, self.successes = None, [], []
+
+    def first_method(self):
+        m = self.copy.deepcopy(self.m)
+        if self.adapter:
+            m.adapter_path = self.adapter
+        return m
+
+    def after_success(self, ep_dir):
+        if self.cfg["persist"] and self.cfg["keep_successes"]:
+            self.successes.append(str(ep_dir))
+
+    def _learner(self, out):
+        import subprocess
+        import sys
+        root = self.Path(__file__).resolve().parents[1]
+        py = self.os.environ.get("PY_LB") or str(self.Path.home() / "miniconda3/envs/lingbot/bin/python")
+        eps = self.memory if self.cfg["memory"] == "all" else self.memory[-1:]
+        succ = list(self.successes)
+        if not eps:  # every_episode mode before the first failure: learn from own successes (no relabel needed)
+            eps, succ = succ, []
+        c = self.cfg
+        sig = self.signals()
+        gap_beta = c["gap_beta"] if "gap" in sig else 0.0  # the prediction gap only weights if it is a used signal
+        cmd = [py, "-m", "fawam.learn", "--episodes", *eps, "--out", str(out), "--steps", str(c["steps"]),
+               "--gap_beta", str(gap_beta), "--video_in_window", c["video_in_window"],
+               "--lambda_video", str(c["lambda_video"]), "--lambda_action", str(c["lambda_action"]),
+               "--gap_filter", str(c["gap_filter"]), "--pref_beta", str(c["pref_beta"]),
+               "--outside", c.get("outside", "none"), "--outside_steps", str(c.get("outside_steps", 100))]
+        if c["guard"] and self.successes:
+            cmd += ["--guard_episodes", *self.successes]
+        if succ:
+            cmd += ["--success_episodes", *succ]
+        if not c["relabel"]:
+            cmd.append("--no_relabel")
+        init = (self.adapter if c["init"] == "prev" else None) or (c.get("meta_adapter") if c["mode"] == "both" else None)
+        if init:
+            cmd += ["--init", init]
+        env = {**self.os.environ, "PYTHONPATH": str(root)}
+        env.pop("PYTHONWARNINGS", None)
+        with open(self.dir / "learner.log", "a") as log:
+            log.write(f"\n$ {' '.join(cmd)}\n")
+            log.flush()
+            r = subprocess.run(cmd, cwd=str(root), env=env, stdout=log, stderr=subprocess.STDOUT)
+        if r.returncode != 0:
+            raise RuntimeError(f"learner failed (rc {r.returncode}), see {self.dir / 'learner.log'}")
+        meta = json.loads((self.Path(out) / "method.json").read_text())
+        return bool(meta.get("accepted", True))
+
+    def signals(self):
+        c = self.cfg
+        if c.get("signals"):
+            return list(c["signals"]) if not isinstance(c["signals"], str) else c["signals"].split("+")
+        return {"oracle": ["oracle", "gap"], "vlm": ["vlm", "gap"], "none": ["gap"]}[c["analyzer"]]
+
+    def after_failure(self, ep_dir, instruction, seed, attempt):
+        if self.cfg.get("adapt_episodes") is not None and self.phase() == "eval":
+            m = self.copy.deepcopy(self.m)  # frozen: plain retry with the frozen adapter
+            m.learn, m.adapter_path = None, self.adapter
+            return m, instruction, None, dict(attempt=attempt, phase="eval", frozen=True)
+        """-> (method for the next attempt, prompt override, prefill paths, info dict)."""
+        from fawam.failure_analysis import analyze_signals
+        c = self.cfg
+        t0 = time.time()
+        ana = analyze_signals(ep_dir, self.signals(), self.m.vlm)
+        (self.Path(ep_dir) / "analysis.json").write_text(json.dumps(ana, default=float))  # read by the learner
+        self.memory.append(str(ep_dir))
+        m = self.copy.deepcopy(self.m)
+        m.learn = None  # the next attempt itself does not learn; the loop does
+        info = dict(attempt=attempt, signals=ana.get("signals"),
+                    analysis={k: ana.get(k) for k in ("failure_type", "arm", "cause", "correction", "delta_m",
+                                                      "latent", "imagine_delta_m", "vlm_delta_m")})
+        if c["mode"] in ("adapter", "both"):
+            self.version += 1
+            out = self.dir / f"seed{seed}_a{attempt}_v{self.version}"
+            t1 = time.time()
+            accepted = self._learner(out)
+            if accepted:
+                self.adapter = str(out)
+            m.adapter_path = self.adapter  # rejected by the guard: keep the previous adapter (or the base)
+            info.update(learn_seconds=round(time.time() - t1, 1), accepted=accepted)
+        elif c["mode"] == "icl" and c.get("meta_adapter"):
+            m.adapter_path = c["meta_adapter"]
+        prefill = None
+        if c["mode"] in ("icl", "both"):
+            prefill = list(self.memory[-1:])
+        if c["retry_action_noise"]:
+            m.action_noise = c["retry_action_noise"]
+        if c["negative"] and ana.get("negative_prompt"):
+            m.negative_prompt = ana["negative_prompt"]
+        prompt = ana.get("correction") if (c["prompt"] == "correction" and ana.get("correction")) else instruction
+        if c["mode"] == "none":  # plain retry (+ exploration noise): no learning, no context, no text
+            prompt, prefill = instruction, None
+        info.update(adapter=m.adapter_path, prefill=prefill, prompt=prompt, seconds=round(time.time() - t0, 1))
+        self.log.append(info)
+        return m, prompt, prefill, info
+
+    def update_only(self, ep_dir, success, seed):
+        """every_episode mode (JEPA-TTT style): after each seed, add the episode to the memory and update the adapter
+        persistently, without a retry."""
+        from fawam.failure_analysis import analyze_signals
+        if self.phase() == "eval":
+            return self.adapter  # paper protocol: adapter frozen after the adaptation episodes
+        self.n_seen += 1
+        if success:
+            self.successes.append(str(ep_dir))
+            if not self.memory and self.cfg["relabel"]:
+                return None  # nothing to learn from yet
+        else:
+            ana = analyze_signals(ep_dir, self.signals(), self.m.vlm)
+            (self.Path(ep_dir) / "analysis.json").write_text(json.dumps(ana, default=float))
+            self.memory.append(str(ep_dir))
+        self.version += 1
+        out = self.dir / f"seed{seed}_every_v{self.version}"
+        if self._learner(out):
+            self.adapter = str(out)
+        self.log.append(dict(seed=seed, every_episode=True, adapter=self.adapter))
+        return self.adapter

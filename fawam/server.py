@@ -163,6 +163,8 @@ class FawamServer(VA_Server):
         if m.adapter_path:
             if m.adapter_path not in self.adapter_cache:
                 logger.info(f"loading adapter {m.adapter_path}")
+                while len(self.adapter_cache) >= 2:  # Learn-from-Failure writes a new adapter dir per update
+                    self.adapter_cache.pop(next(iter(self.adapter_cache)))
                 self.adapter_cache[m.adapter_path] = fa.AdapterSet.load(m.adapter_path, device=self.device).eval()
             aset = self.adapter_cache[m.adapter_path]
         fa.attach(self.transformer, aset)
@@ -215,7 +217,8 @@ class FawamServer(VA_Server):
             self._reset(prompt=obs.get("prompt"), seed=obs.get("seed"), method=obs.get("method"),
                         task=obs.get("task_name"))
             if obs.get("prefill_paths"):
-                self.pending_prefill = dict(paths=list(obs["prefill_paths"]), gap=int(obs.get("prefill_gap", 1)))
+                self.pending_prefill = dict(paths=list(obs["prefill_paths"]), gap=int(obs.get("prefill_gap", 1)),
+                                            include_pred=bool(obs.get("prefill_include_pred", False)))
             return dict(method=self.method.short())
         if obs.get("update_prompt", False):
             if obs.get("prompt"):
@@ -312,34 +315,40 @@ class FawamServer(VA_Server):
         return [str(bank / index[i]["path"]) for i in top]
 
     def _prefill(self, spec):
-        """Write whole recorded episodes (obs latents + the action chunks that produced them) into the KV cache before
-        the episode starts; the episode then begins at frame id = prefilled frames + gap."""
+        """Write whole recorded episodes (latents + the action chunks that produced them) into the KV cache before the
+        episode starts; the episode then begins at frame id = prefilled frames + gap. With include_pred, every
+        episode is preceded by its *imagined* version (the model's own predictions per chunk), so the context shows
+        what the model expected and what actually happened (Learn-from-Failure, docs/METHOD.md)."""
         paths = self._select_demos(spec)
         gap = int(spec.get("gap", 1))
+        groups = ["pred", "obs"] if spec.get("include_pred") else ["obs"]
         base = 0
         for p in paths:
             ep = Path(p)
             ep = ep / "episode.h5" if ep.is_dir() else ep
-            with h5py.File(ep, "r") as f:
-                lat = canvas_from_h5(f).to(self.device, self.dtype)
-                planned = f["actions/planned"][()]
-                obs_chunk = f["model/obs/chunk_id"][()]
-                obs_li = f["model/obs/latent_index"][()]
-            li0 = int(obs_li[0])
-            for c in range(len(planned)):
-                rows = np.where(obs_chunk == c)[0]
-                if len(rows) == 0:
-                    continue
-                lat_c = lat[:, :, rows]
-                act_c = self.preprocess_action(planned[c][:, :len(rows)]).to(lat_c)
-                fst = base + int(obs_li[rows[0]]) - li0
-                input_dict = self._prepare_latent_input(lat_c, act_c, frame_st_id=fst)
-                self._tf(self._repeat_input_for_cfg(input_dict['latent_res_lst']), 2, False, fst, len(rows))
-                self._tf(self._repeat_input_for_cfg(input_dict['action_res_lst']), 2, True, fst, len(rows))
-            base += int(obs_li[-1]) - li0 + 1 + gap
-            self.episode_log["prefill"].append(str(ep))
+            for group in groups:
+                with h5py.File(ep, "r") as f:
+                    if f"model/{group}" not in f:
+                        continue
+                    lat = canvas_from_h5(f, group).to(self.device, self.dtype)
+                    planned = f["actions/planned"][()]
+                    chunk_of = f[f"model/{group}/chunk_id"][()]
+                    li = f[f"model/{group}/latent_index"][()]
+                li0 = int(li[0])
+                for c in range(len(planned)):
+                    rows = np.where(chunk_of == c)[0]
+                    if len(rows) == 0:
+                        continue
+                    lat_c = lat[:, :, rows]
+                    act_c = self.preprocess_action(planned[c][:, :len(rows)]).to(lat_c)
+                    fst = base + int(li[rows[0]]) - li0
+                    input_dict = self._prepare_latent_input(lat_c, act_c, frame_st_id=fst)
+                    self._tf(self._repeat_input_for_cfg(input_dict['latent_res_lst']), 2, False, fst, len(rows))
+                    self._tf(self._repeat_input_for_cfg(input_dict['action_res_lst']), 2, True, fst, len(rows))
+                base += int(li[-1]) - li0 + 1 + gap
+                self.episode_log["prefill"].append(f"{ep}:{group}")
         self.ep_frame0 = self.frame_st_id = base
-        logger.info(f"prefilled {len(paths)} episode(s), episode starts at frame {base}")
+        logger.info(f"prefilled {len(paths)} episode(s) ({'+'.join(groups)}), episode starts at frame {base}")
 
     # ------------------------------------------------------------------------------------------ inference
 
@@ -476,6 +485,11 @@ class FawamServer(VA_Server):
                     actions = self.action_scheduler.step(pred, t, actions, return_dict=False)
                 actions[:, :, 0:1] = action_cond if first else actions[:, :, 0:1]
 
+        if m.action_noise:
+            g = torch.Generator(device=self.device).manual_seed((noise_seed + 31337) % 2**31)
+            first_ok = 1 if first else 0  # never perturb the conditioning frame
+            actions[:, :, first_ok:] += m.action_noise * torch.randn(actions[:, :, first_ok:].shape, generator=g,
+                                                                     device=self.device, dtype=actions.dtype)
         actions[:, ~self.action_mask] *= 0
         self.episode_log['pred'].append(dict(frame_st_id=frame_st_id, wall_time=time.time(), noise_seed=noise_seed,
                                              latents=latents[0].detach().cpu(), denoise=denoise_records,

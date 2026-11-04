@@ -1,0 +1,12 @@
+# P5a (Kern): Welche Signale braucht Learn-from-Failure? Gleiches Rezept (Adapter-Update + Retry auf demselben Seed),
+# nur die Analyse-Signale wechseln. P = Vorhersagefehler, R = Rollout (Propriozeption + Kontakt), I = Imaginations-
+# Probe, O = Orakel. Kontrollen: zweiter Versuch ohne Lernen (retry_plain) und mit Exploration (retry_explore).
+name: p5a_signals
+out: results/sweeps/p5a_signals
+episodes: 30
+per_job: 10
+n_par: 2
+time: "16:00:00"
+tasks: [move_playingcard_away, place_mouse_pad, pick_diverse_bottles, stack_blocks_two]
+configs: [table_h_m05, table_h_m10, demo_randomized]
+methods: [retry_plain, retry_explore, lff_sig_P, lff_sig_PR, lff_sig_PI, lff_sig_PRI, lff_sig_OP, lff_sig_O]

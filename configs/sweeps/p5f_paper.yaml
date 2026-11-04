@@ -1,0 +1,18 @@
+# P5f: Protokoll aus dem Dual-Site-Paper. Jeder Client-Lauf = eine Adaptions-Wiederholung: 3 Adaptions-Episoden
+# (nach jeder ein Adapter-Update: innen 25 Schritte, dann außen 25 Schritte auf neu berechneten Vorhersagen), danach
+# eingefroren 17 Eval-Episoden auf neuen Seeds. 2 Paare x 2 Jobs = 4 Wiederholungen pro Zelle (Paper: 3 Seeds x 50).
+# `base` läuft auf denselben Seeds; ausgewertet werden nur die Episoden nach der Adaptionsphase:
+#   python -m fawam.analysis_gap compare results/sweeps/p5f_paper --adapt_episodes 3
+name: p5f_paper
+out: results/sweeps/p5f_paper
+episodes: 80
+per_job: 40
+n_par: 2
+time: "30:00:00"
+tasks: [move_playingcard_away, place_mouse_pad, pick_diverse_bottles, stack_blocks_two]
+configs: [table_h_m05, table_h_m10, demo_randomized]
+methods: [base, paper_P_dual, paper_P_inside, paper_P_outside, paper_P_dual_150, paper_Pw_dual, paper_PR_dual,
+          paper_PRI_dual, paper_OP_dual, paper_OP_dual_retry]
+method_overrides:
+  paper_P_dual_150: {configs: [table_h_m05]}
+  paper_OP_dual_retry: {configs: [table_h_m05]}

@@ -78,6 +78,11 @@ def main():
             for k in ("instruction", "prompt"):
                 if k in f.attrs:
                     texts.add(str(f.attrs[k]))
+        for ana in e.glob("analysis*.json"):  # Learn-from-Failure: correction prompts
+            import json
+            c = json.loads(ana.read_text()).get("correction")
+            if c:
+                texts.add(c)
     todo = TextCache(a.cache_dir).missing(texts)
     print(f"{len(texts)} texts, {len(todo)} to encode")
     if todo:

@@ -1,5 +1,11 @@
 # Experimentplan: Fehler von LingBot-VA erkennen und beheben
 
+> **Stand 2026-11-04: Der Kern der Arbeit ist jetzt Learn-from-Failure, siehe [METHOD.md](METHOD.md).** Das Modell
+> lernt aus seinen eigenen Fehlversuchen: Vorhersagefehler plus VLM- bzw. Orakel-Analyse, gegeben über Adapter,
+> Kontext oder beides. A, B und C unten sind Baselines oder Bausteine: A5 Negativ-Prompt, B1 Lücken-Detektor,
+> C Analyse. D und E sind die Werkzeuge, auf denen LfF aufbaut. Für die Cluster-Planung haben die P5-Sweeps Vorrang,
+> P1 nur als kleine Baseline-Auswahl.
+
 Stand: 2026-11-03. Grundlage sind die Befunde in [FINDINGS.md](FINDINGS.md). Der Code liegt in `fawam/`
 (Server, Methoden, Adapter, Daten), die Cluster-Skripte in `cluster/`, die Sweeps in `configs/sweeps/`.
 

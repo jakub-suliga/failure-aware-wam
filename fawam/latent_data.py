@@ -35,7 +35,8 @@ def canvas(f, group="obs"):
 class ActionNorm:
     """Same mapping as VA_Server.preprocess_action (16 raw channels -> 30 normalized, unused channels masked)."""
 
-    def __init__(self, cfg):
+    def __init__(self, cfg, clip=1.5):
+        self.clip = clip  # upstream clips at 1.5; corrections beyond the training range need more (FINDINGS 5b)
         self.inv = np.array(cfg.inverse_used_action_channel_ids)
         self.q01 = np.array(cfg.norm_stat["q01"], dtype=np.float32)[:, None, None]
         self.q99 = np.array(cfg.norm_stat["q99"], dtype=np.float32)[:, None, None]
@@ -46,38 +47,105 @@ class ActionNorm:
         """raw (16, F, H) -> normalized (30, F, H), mask (30, F, H)."""
         padded = np.concatenate([raw, np.zeros_like(raw[:1])], axis=0)[self.inv]
         x = (padded - self.q01) / (self.q99 - self.q01 + 1e-6) * 2.0 - 1.0
-        x = np.clip(x, -1.5, 1.5)
+        x = np.clip(x, -self.clip, self.clip)
         m = np.broadcast_to(self.mask[:, None, None], x.shape)
         return (x * m).astype(np.float32), m.copy()
 
 
-def load_episode(path, norm: ActionNorm):
+ARM_XYZ = {"left": slice(0, 3), "right": slice(8, 11)}  # raw 16-d action: [l xyz quat grip, r xyz quat grip]
+
+
+def gap_weights(gap, li, beta):
+    """Per-frame loss weight from the prediction error: 1 + beta * (robust z of the gap, clipped to [0, 3]) / 3."""
+    g = np.array([gap.get(str(int(k)), np.nan) for k in li], dtype=np.float64)
+    ok = ~np.isnan(g)
+    w = np.ones(len(li), np.float32)
+    if beta and ok.sum() > 2:
+        med = np.median(g[ok])
+        mad = np.median(np.abs(g[ok] - med)) * 1.4826 + 1e-6
+        z = np.clip((g - med) / mad, 0, 3) / 3
+        w[ok] = 1 + beta * z[ok]
+    return w
+
+
+def load_episode(path, norm: ActionNorm, relabel=False, gap_beta=0.0, video_in_window="real",
+                 analysis_name="analysis.json", group="obs", gap_filter=0.0):
+    """One episode as training arrays. Learn-from-Failure options (docs/METHOD.md):
+    relabel      apply the analysis' correction delta_m to the failed arm's actions over the analysis window (linear
+                 ramp up to the full correction at the failure latent) and cut the episode at truncate_at
+    gap_beta     up-weight frames where the imagination diverged from reality (prediction error), see gap_weights
+    video_in_window  'real': video loss on the observed (failed) frames everywhere; 'skip': no video loss inside the
+                 corrected window (the observed video there shows the failure the relabeled actions avoid)
+    group        'obs' (observed latents) or 'pred' (the model's own imagination, for imagined-context segments)
+    gap_filter   T3VF-style sample selection: only frames whose prediction gap is in the top (1 - gap_filter) of the
+                 episode get a loss (0 = all frames)"""
     path = Path(path)
     h5 = path / "episode.h5" if path.is_dir() else path
     with h5py.File(h5, "r") as f:
-        lat = canvas(f)
-        li = f["model/obs/latent_index"][()]
-        chunk_of_obs = f["model/obs/chunk_id"][()]
+        lat = canvas(f, group)
+        li = f[f"model/{group}/latent_index"][()]
+        chunk_of_obs = f[f"model/{group}/chunk_id"][()]
         planned = f["actions/planned"][()]  # n_chunks, 16, 2, 16
         meta = {k: (v.decode() if isinstance(v, bytes) else v) for k, v in f.attrs.items() if k != "task_args"}
         events = json.loads(f["fawam"].attrs.get("events", "[]")) if "fawam" in f else []
+    ana_path = h5.parent / analysis_name
+    ana = json.loads(ana_path.read_text()) if ana_path.exists() else None
     # keep only the first context segment if the episode had a context reset (frame ids continue across it)
     resets = [e["frame"] for e in events if e.get("kind") == "context_reset"]
     stop = len(li)
     if resets:
         stop = int(np.searchsorted(li, min(resets)))  # frame ids are absolute (continue across resets)
+    if relabel and ana and ana.get("failed") and ana.get("truncate_at") is not None:
+        stop = min(stop, int(np.searchsorted(li, ana["truncate_at"], side="right")))
     raw = np.zeros((16, stop, planned.shape[-1]), np.float32)
     chunk_first = {}
     for r in range(stop):
         c = int(chunk_of_obs[r])
         chunk_first.setdefault(c, r)
         raw[:, r] = planned[c][:, r - chunk_first[c]]
+    in_window = np.zeros(stop, bool)
+    relabeled = False
+    if relabel and ana and ana.get("failed") and ana.get("window") and ana.get("arm") in ARM_XYZ:
+        delta = np.asarray(ana.get("delta_m", [0, 0, 0]), np.float32)
+        if np.abs(delta).max() > 0:
+            l0, l1 = ana["window"]
+            for r in range(stop):
+                k = int(li[r])
+                if k < l0:
+                    continue
+                frac = min(1.0, (k - l0 + 1) / (l1 - l0 + 1))
+                raw[ARM_XYZ[ana["arm"]], r] += frac * delta[:, None]
+                in_window[r] = True
+            relabeled = True
     acts, mask = norm(raw)
     acts[:, 0] = 0.0  # frame 0: conditioning frame, zero action as at inference
+    neg = None
+    if relabeled:  # the executed (failed) actions = negatives for the failure-contrastive loss
+        raw_neg = raw.copy()
+        for r in range(stop):
+            if in_window[r]:
+                k = int(li[r])
+                frac = min(1.0, (k - ana["window"][0] + 1) / (ana["window"][1] - ana["window"][0] + 1))
+                raw_neg[ARM_XYZ[ana["arm"]], r] -= frac * np.asarray(ana["delta_m"], np.float32)[:, None]
+        neg, _ = norm(raw_neg)
+        neg[:, 0] = 0.0
+    w = gap_weights(ana["gap"], li[:stop], gap_beta) if (ana and gap_beta) else np.ones(stop, np.float32)
+    if gap_filter and ana and ana.get("gap"):
+        g = np.array([ana["gap"].get(str(int(k)), np.nan) for k in li[:stop]])
+        if np.isfinite(g).sum() > 2:
+            thr = np.nanquantile(g, gap_filter)
+            w = np.where(np.isfinite(g) & (g >= thr), w, 0.0).astype(np.float32)
+    wv = w.copy()
+    if relabeled and video_in_window == "skip":
+        wv[in_window] = 0.0
+    text = str(meta.get("instruction", ""))
     return dict(latents=lat[:, :stop].astype(np.float32), actions=acts[..., None], actions_mask=mask[..., None],
-                text=str(meta.get("instruction", "")), prompt=str(meta.get("prompt", meta.get("instruction", ""))),
+                actions_neg=(neg if neg is not None else acts)[..., None], window_mask=in_window[None].astype(np.float32),
+                weight_video=wv[None], weight_action=w[None],
+                text=text, prompt=str(meta.get("prompt", text)), correction=(ana or {}).get("correction") or text,
                 task=str(meta.get("task_name", "")), success=bool(meta.get("success", False)),
-                setting=str(meta.get("task_config", "")), path=str(h5.parent))
+                setting=str(meta.get("task_config", "")), seed=int(meta.get("seed", -1)), path=str(h5.parent),
+                relabeled=relabeled)
 
 
 def find_episodes(roots, success=None, tasks=None, settings=None, limit=None, seed=0, drivers=None,
@@ -133,8 +201,10 @@ class EpisodeDataset(torch.utils.data.Dataset):
     (context frames get timestep 0 = clean, see train_adapter)."""
 
     def __init__(self, episodes, norm, text_cache, max_frames=24, p_start0=0.5, context_k=0, context_pool=None,
-                 seed=0, cfg_prob=0.1):
-        self.items = [load_episode(e, norm) for e in episodes]
+                 seed=0, cfg_prob=0.1, load_kw=None, text_mode="instruction"):
+        self.load_kw = load_kw or {}
+        self.text_mode = text_mode  # instruction | correction (failure analysis appended to the instruction)
+        self.items = [load_episode(e, norm, **self.load_kw) for e in episodes]
         self.text_cache = text_cache
         self.max_frames = max_frames
         self.p_start0 = p_start0
@@ -166,10 +236,56 @@ class EpisodeDataset(torch.utils.data.Dataset):
             ctx_frames = sum(c["latents"].shape[1] for c in ctx)
             tgt = {k: (np.concatenate([p[k] for p in parts], axis=1) if isinstance(tgt[k], np.ndarray) else tgt[k])
                    for k in tgt}
-        text = "" if self.rng.random() < self.cfg_prob else ep["text"]
+        text = ep["correction"] if self.text_mode == "correction" else ep["text"]
+        text = "" if self.rng.random() < self.cfg_prob else text
         return dict(latents=torch.from_numpy(tgt["latents"]), actions=torch.from_numpy(tgt["actions"]),
                     actions_mask=torch.from_numpy(tgt["actions_mask"]), text_emb=self.text_cache.get(text),
-                    context_frames=torch.tensor(ctx_frames))
+                    context_frames=torch.tensor(ctx_frames), weight_video=torch.from_numpy(tgt["weight_video"][0]),
+                    weight_action=torch.from_numpy(tgt["weight_action"][0]),
+                    actions_neg=torch.from_numpy(tgt["actions_neg"]), window_mask=torch.from_numpy(tgt["window_mask"][0]),
+                    relabeled=torch.tensor(bool(ep["relabeled"])))
+
+
+class FailFixDataset(EpisodeDataset):
+    """Meta-training for in-context learning from failures: sample = [failed attempt (imagined segment, optional)
+    | failed attempt (observed) | the successful episode on the SAME seed (expert replay or corrected retry)],
+    loss only on the success. The prompt is the instruction plus the failure analysis' correction with prob p_text.
+    Pairs are matched on (task, task_config, seed)."""
+
+    def __init__(self, fails, fixes, norm, text_cache, include_pred=True, p_text=0.5, max_frames=24, seed=0,
+                 cfg_prob=0.1):
+        self.text_cache, self.max_frames, self.p_start0 = text_cache, max_frames, 1.0
+        self.rng, self.cfg_prob, self.p_text = random.Random(seed), cfg_prob, p_text
+        fix_by_key = {}
+        for e in fixes:
+            d = load_episode(e, norm)
+            fix_by_key.setdefault((d["task"], d["setting"], d["seed"]), d)
+        self.pairs = []
+        for e in fails:
+            ctx = load_episode(e, norm)
+            key = (ctx["task"], ctx["setting"], ctx["seed"])
+            if key not in fix_by_key:
+                continue
+            parts = ([load_episode(e, norm, group="pred")] if include_pred else []) + [ctx]
+            self.pairs.append((parts, fix_by_key[key]))
+        self.items = [p[1] for p in self.pairs]
+        if not self.pairs:
+            raise ValueError("no (failure, fix) pairs with matching task/setting/seed")
+
+    def __getitem__(self, idx):
+        parts, fix = self.pairs[idx % len(self.pairs)]
+        tgt = self._window(fix, self.max_frames)
+        seq = parts + [tgt]
+        ctx_frames = sum(p["latents"].shape[1] for p in parts)
+        cat = {k: np.concatenate([p[k] for p in seq], axis=1) for k in ("latents", "actions", "actions_mask",
+                                                                         "weight_video", "weight_action")}
+        use_corr = self.rng.random() < self.p_text
+        text = parts[-1]["correction"] if use_corr else parts[-1]["text"]  # same seed: the failed attempt's instruction (cached)
+        text = "" if self.rng.random() < self.cfg_prob else text
+        return dict(latents=torch.from_numpy(cat["latents"]), actions=torch.from_numpy(cat["actions"]),
+                    actions_mask=torch.from_numpy(cat["actions_mask"]), text_emb=self.text_cache.get(text),
+                    context_frames=torch.tensor(ctx_frames), weight_video=torch.from_numpy(cat["weight_video"][0]),
+                    weight_action=torch.from_numpy(cat["weight_action"][0]))
 
 
 def build_pairs(episodes, group_pred="pred"):

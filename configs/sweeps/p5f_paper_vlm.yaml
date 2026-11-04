@@ -1,0 +1,12 @@
+# P5f mit VLM-Analyse in jeder Adaptions-Episode (vLLM im Job)
+name: p5f_paper_vlm
+out: results/sweeps/p5f_paper_vlm
+episodes: 80
+per_job: 40
+n_par: 2
+time: "30:00:00"
+vlm: true
+extra_env: {VLM_MODEL: Qwen/Qwen3-VL-8B-Instruct}
+tasks: [move_playingcard_away, place_mouse_pad, pick_diverse_bottles, stack_blocks_two]
+configs: [table_h_m05, demo_randomized]
+methods: [paper_VP_dual]

@@ -1,0 +1,12 @@
+# P5b: VLM allein vs. VLM + Vorhersagefehler vs. alles ohne Privilegien (vLLM mit Qwen3-VL-8B in jedem Job)
+name: p5b_vlm
+out: results/sweeps/p5b_vlm
+episodes: 30
+vlm: true
+extra_env: {VLM_MODEL: Qwen/Qwen3-VL-8B-Instruct}
+per_job: 10
+n_par: 2
+time: "16:00:00"
+tasks: [move_playingcard_away, place_mouse_pad, pick_diverse_bottles, stack_blocks_two]
+configs: [table_h_m05, demo_randomized]
+methods: [lff_sig_V, lff_sig_VP, lff_sig_PRIV]

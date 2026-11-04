@@ -87,12 +87,20 @@ def compare(a):
                              setting=str(at["task_config"]), success=bool(at["success"]),
                              attempt=int(at.get("attempt", 1)), seed=int(at["seed"]),
                              interventions=len(json.loads(at.get("interventions", "[]"))),
+                             phase=(json.loads(at.get("lff", "{}")) or {}).get("phase"),
+                             episode=int(at.get("episode", -1)),
                              env_steps=int(at["env_steps"])))
     df = pd.DataFrame(rows)
     if df.empty:
         print("no episodes")
         return
-    first = df[df.attempt == 1]
+    # paper protocol (adapt_episodes): only the episodes after the adaptation phase count; for methods without
+    # phases, the same episode indices are dropped so the comparison stays on identical seeds
+    n_adapt = int(a.adapt_episodes or 0)
+    if n_adapt and (df.phase == "adapt").any():
+        print(f"evaluation phase only: dropping the first {n_adapt} episodes of every client run (adaptation)")
+    first = df[(df.attempt == 1) & ((df.phase == "eval") | (df.phase.isna() & (df.episode >= n_adapt)) |
+                                    ((df.phase != "adapt") & (n_adapt == 0)))]
     g = first.groupby(["method", "task", "setting"]).success.agg(["sum", "count"]).reset_index()
     g["rate"] = g["sum"] / g["count"]
     g[["lo", "hi"]] = [wilson(k, n) for k, n in zip(g["sum"], g["count"])]
@@ -114,6 +122,8 @@ def main():
     g.add_argument("--out")
     c = sub.add_parser("compare")
     c.add_argument("sweep")
+    c.add_argument("--adapt_episodes", type=int, default=0,
+                   help="paper protocol: drop the first N episodes per client run (adaptation phase)")
     a = ap.parse_args()
     {"gap": gap, "compare": compare}[a.cmd](a)
 

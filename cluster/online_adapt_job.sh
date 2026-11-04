@@ -1,4 +1,6 @@
 #!/bin/bash
+# SUPERSEDED (2026-11-04) by the sweep configs/sweeps/p5f_paper.yaml (same protocol inside the client, with the
+# Learn-from-Failure signals and the outside residual). Kept as a fallback.
 # D3-online: the paper's protocol on the WAM. Three adaptation episodes on the shifted task; after each one the adapters
 # are updated from ALL episodes so far (self-supervised: the policy's own rollouts, video + hindsight action loss);
 # then the frozen adapter is evaluated on EVAL_NUM fresh seeds. Server, simulator and training share one GPU

@@ -31,6 +31,7 @@ class Method:
     negative_prompt: str = None        # A5: failure description used as the CFG negative
     num_inference_steps: int = None
     action_num_inference_steps: int = None
+    action_noise: float = 0.0          # Gaussian noise (normalized action units) on the executed actions (exploration)
 
     # --- steering (server, A6) ------------------------------------------------------------------------------------
     steer_path: str = None             # fawam.probe steering output (.npz)
@@ -48,6 +49,9 @@ class Method:
     retry_with_memory: bool = False    # E2: ... with the failed attempt prefilled into the KV cache
     text_memory: bool = False          # E4: ... with a description of the previous failure appended to the prompt
 
+    # --- Learn-from-Failure (client + learner, docs/METHOD.md) ----------------------------------------------------
+    learn: dict = None                 # see LEARN_DEFAULTS
+
     # --- online intervention (client, B/C) ---------------------------------------------------------------------
     intervention: dict = None          # see INTERVENTION_DEFAULTS
     analyzer: str = None               # None | oracle | vlm
@@ -55,7 +59,7 @@ class Method:
 
     @property
     def uses_client_logic(self):
-        return bool(self.intervention or self.retry or self.analyzer)
+        return bool(self.intervention or self.retry or self.analyzer or self.learn)
 
     def to_dict(self):
         return asdict(self)
@@ -75,6 +79,32 @@ INTERVENTION_DEFAULTS = dict(
     negative_template="The gripper closes in the air above the object without touching it.",
     max_interventions=2,
     cooldown_chunks=2,
+)
+
+LEARN_DEFAULTS = dict(
+    mode="adapter",          # adapter | icl | both  (how the failure is given to the model for the next attempt)
+    analyzer="oracle",       # legacy: oracle | vlm | none; superseded by `signals`
+    signals=None,            # subset of gap, rollout, imagine, vlm, oracle (fawam.failure_analysis.analyze_signals)
+    init="prev",             # prev: continue the last adapter | base: fresh adapter from the base each update (FailBank)
+    gap_filter=0.0,          # T3VF: train only on frames above this prediction-gap quantile
+    pref_beta=0.0,           # FAR: failure-contrastive preference loss (relabeled vs executed actions); ~500
+    guard=False,             # FailBank: accept an update only if it does not hurt own successful episodes
+    retry_action_noise=0.0,  # FAR: Gaussian exploration noise (normalized action units) in the retry
+    every_episode=False,     # JEPA-TTT: update after every episode (success or failure), persistently, no retry
+    adapt_episodes=None,     # paper protocol: with every_episode, update only after the first N episodes, then freeze
+                             # the adapter and evaluate the remaining episodes of the run (meta lff.phase adapt|eval)
+    outside="none",          # external residual on the imagined latent: none | parallel (recorded predictions) |
+                             # sequential (paper: predictions recomputed with the adapted model, fawam.replay)
+    outside_steps=100,
+    max_attempts=2,          # attempts per seed (attempt 1 + max_attempts-1 updates)
+    persist=False,           # keep the adapter / memory across seeds (lifelong: the next seed starts adapted)
+    memory="all",            # adapter training data: all | last failed episode(s) of the memory
+    steps=150, gap_beta=2.0, relabel=True, video_in_window="skip", lambda_video=1.0, lambda_action=1.0,
+    include_pred=True,       # icl: imagined + observed failed attempt in the context
+    prompt="correction",     # next attempt's prompt: correction (analysis) | instruction
+    negative=False,          # next attempt's CFG negative = analysis.negative_prompt
+    meta_adapter=None,       # icl/both: adapter meta-trained to use failures in context (FailFix training)
+    keep_successes=True,     # persist: successful attempts join the memory (trained without relabel)
 )
 
 # ---------------------------------------------------------------------------------------------- presets
@@ -128,6 +158,81 @@ PRESETS = {
     "retry_memory": dict(retry=True, retry_with_memory=True),
     "retry_text": dict(retry=True, text_memory=True),
     "retry_memory_text": dict(retry=True, retry_with_memory=True, text_memory=True),
+    # Learn-from-Failure (docs/METHOD.md): fail -> analyse -> adapt -> retry
+    "lff_adapter": dict(learn=dict(mode="adapter", signals=["oracle", "gap"])),
+    # signal ablation (what goes into the update): P = prediction gap, R = rollout (proprio + contact),
+    # I = imagination pose probe, V = VLM, O = oracle. Adapter mode, same recipe otherwise.
+    "lff_sig_O": dict(learn=dict(mode="adapter", signals=["oracle"])),
+    "lff_sig_OP": dict(learn=dict(mode="adapter", signals=["oracle", "gap"])),
+    "lff_sig_V": dict(learn=dict(mode="adapter", signals=["vlm"]), vlm=dict(endpoint="http://127.0.0.1:8001/v1",
+                      model="Qwen/Qwen3-VL-8B-Instruct", pred_frames=False)),
+    "lff_sig_VP": dict(learn=dict(mode="adapter", signals=["vlm", "gap"]), vlm=dict(endpoint="http://127.0.0.1:8001/v1",
+                       model="Qwen/Qwen3-VL-8B-Instruct", pred_frames=True)),
+    "lff_sig_P": dict(learn=dict(mode="adapter", signals=["gap"], relabel=False)),
+    "lff_sig_PR": dict(learn=dict(mode="adapter", signals=["gap", "rollout"])),
+    "lff_sig_PI": dict(learn=dict(mode="adapter", signals=["gap", "imagine"])),
+    "lff_sig_PRI": dict(learn=dict(mode="adapter", signals=["gap", "rollout", "imagine"])),
+    "lff_sig_PRIV": dict(learn=dict(mode="adapter", signals=["gap", "rollout", "imagine", "vlm"]),
+                         vlm=dict(endpoint="http://127.0.0.1:8001/v1", model="Qwen/Qwen3-VL-8B-Instruct",
+                                  pred_frames=True)),
+    # recipe ablations (oracle + gap signals)
+    "lff_adapter_noweight": dict(learn=dict(mode="adapter", signals=["oracle"], gap_beta=0.0)),
+    "lff_adapter_norelabel": dict(learn=dict(mode="adapter", signals=["oracle", "gap"], relabel=False)),
+    "lff_adapter_instr": dict(learn=dict(mode="adapter", signals=["oracle", "gap"], prompt="instruction")),
+    "lff_adapter_videoonly": dict(learn=dict(mode="adapter", signals=["oracle", "gap"], lambda_action=0.0)),  # WAM-TTT
+    "lff_adapter_actiononly": dict(learn=dict(mode="adapter", signals=["oracle", "gap"], lambda_video=0.0)),
+    "lff_adapter_3att": dict(learn=dict(mode="adapter", signals=["oracle", "gap"], max_attempts=3)),
+    # integrations of current methods (docs/METHOD.md, section 8)
+    "lff_ttt_filtered": dict(learn=dict(mode="adapter", signals=["gap"], relabel=False, gap_filter=0.7)),   # T3VF
+    "lff_ttt_persist": dict(learn=dict(mode="adapter", signals=["gap"], relabel=False, persist=True,
+                                       lambda_action=0.0, max_attempts=1, every_episode=True)),                                    # JEPA-TTT
+    "lff_pref": dict(learn=dict(mode="adapter", signals=["oracle", "gap"], pref_beta=500.0)),                # FAR
+    "lff_pref_PRI": dict(learn=dict(mode="adapter", signals=["gap", "rollout", "imagine"], pref_beta=500.0)),
+    "lff_bank": dict(learn=dict(mode="adapter", signals=["oracle", "gap"], persist=True, init="base",
+                                guard=True, keep_successes=True)),                                            # FailBank
+    "retry_explore": dict(learn=dict(mode="none", retry_action_noise=0.1)),                                   # FAR exploration
+    "lff_adapter_explore": dict(learn=dict(mode="adapter", signals=["oracle", "gap"], retry_action_noise=0.1)),
+    # in-context (RoboRetry: structural retry cue vs corrective content)
+    "lff_icl": dict(learn=dict(mode="icl", signals=["oracle", "gap"])),
+    "lff_icl_nocorr": dict(learn=dict(mode="icl", signals=["oracle", "gap"], prompt="instruction")),
+    "lff_icl_noimag": dict(learn=dict(mode="icl", signals=["oracle", "gap"], include_pred=False)),
+    "lff_icl_meta": dict(learn=dict(mode="icl", signals=["oracle", "gap"], meta_adapter="artifacts/adapters/failfix_meta")),
+    "lff_both": dict(learn=dict(mode="both", signals=["oracle", "gap"], meta_adapter="artifacts/adapters/failfix_meta")),
+    # Paper protocol (Few-Shot Residual Adaptation, Suliga et al.): 3 adaptation episodes, update after each, freeze,
+    # evaluate. Run with NUM = 3 + eval episodes per client (sweep p5f_paper). Inner/outer 25 steps as in the paper.
+    "paper_P_dual": dict(learn=dict(mode="adapter", signals=["gap"], relabel=False, every_episode=True, persist=True,
+                                    max_attempts=1, adapt_episodes=3, outside="sequential", steps=25, outside_steps=25,
+                                    gap_beta=0.0)),
+    "paper_P_inside": dict(learn=dict(mode="adapter", signals=["gap"], relabel=False, every_episode=True, persist=True,
+                                      max_attempts=1, adapt_episodes=3, outside="none", steps=25, gap_beta=0.0)),
+    "paper_P_outside": dict(learn=dict(mode="adapter", signals=["gap"], relabel=False, every_episode=True,
+                                       persist=True, max_attempts=1, adapt_episodes=3, outside="parallel",
+                                       outside_steps=25, steps=0, gap_beta=0.0)),
+    "paper_P_dual_150": dict(learn=dict(mode="adapter", signals=["gap"], relabel=False, every_episode=True,
+                                        persist=True, max_attempts=1, adapt_episodes=3, outside="sequential",
+                                        steps=150, outside_steps=100, gap_beta=0.0)),
+    "paper_Pw_dual": dict(learn=dict(mode="adapter", signals=["gap"], relabel=False, every_episode=True, persist=True,
+                                     max_attempts=1, adapt_episodes=3, outside="sequential", steps=25,
+                                     outside_steps=25)),                                  # + prediction-error weights
+    "paper_PR_dual": dict(learn=dict(mode="adapter", signals=["gap", "rollout"], every_episode=True, persist=True,
+                                     max_attempts=1, adapt_episodes=3, outside="sequential", steps=25,
+                                     outside_steps=25)),
+    "paper_PRI_dual": dict(learn=dict(mode="adapter", signals=["gap", "rollout", "imagine"], every_episode=True,
+                                      persist=True, max_attempts=1, adapt_episodes=3, outside="sequential", steps=25,
+                                      outside_steps=25)),
+    "paper_OP_dual": dict(learn=dict(mode="adapter", signals=["oracle", "gap"], every_episode=True, persist=True,
+                                     max_attempts=1, adapt_episodes=3, outside="sequential", steps=25,
+                                     outside_steps=25)),
+    "paper_VP_dual": dict(learn=dict(mode="adapter", signals=["vlm", "gap"], every_episode=True, persist=True,
+                                     max_attempts=1, adapt_episodes=3, outside="sequential", steps=25,
+                                     outside_steps=25),
+                          vlm=dict(endpoint="http://127.0.0.1:8001/v1", model="Qwen/Qwen3-VL-8B-Instruct",
+                                   pred_frames=True)),
+    "paper_OP_dual_retry": dict(learn=dict(mode="adapter", signals=["oracle", "gap"], every_episode=False,
+                                           persist=True, max_attempts=2, adapt_episodes=3, outside="sequential",
+                                           steps=25, outside_steps=25)),       # adaptation episodes also get a retry
+    "lff_adapter_lifelong": dict(learn=dict(mode="adapter", signals=["oracle", "gap"], persist=True)),
+    "lff_lifelong_PRI": dict(learn=dict(mode="adapter", signals=["gap", "rollout", "imagine"], persist=True)),
 }
 
 
@@ -179,6 +284,8 @@ def resolve(spec=None, root=None) -> Method:
         merged = _merge(merged, _load_part(part, root))
     if merged.get("intervention") is not None:
         merged["intervention"] = _merge(INTERVENTION_DEFAULTS, merged["intervention"])
+    if merged.get("learn") is not None:
+        merged["learn"] = _merge(LEARN_DEFAULTS, merged["learn"])
     merged.setdefault("name", name)
     unknown = set(merged) - {f.name for f in fields(Method)}
     if unknown:
@@ -190,6 +297,8 @@ def resolve(spec=None, root=None) -> Method:
             v = getattr(m, key)
             if v and not Path(v).is_absolute():
                 setattr(m, key, str(root / v))
+        if m.learn and m.learn.get("meta_adapter") and not Path(m.learn["meta_adapter"]).is_absolute():
+            m.learn = {**m.learn, "meta_adapter": str(root / m.learn["meta_adapter"])}
         if m.prefill and m.prefill.get("bank") and not Path(m.prefill["bank"]).is_absolute():
             m.prefill = {**m.prefill, "bank": str(root / m.prefill["bank"])}
     return m
