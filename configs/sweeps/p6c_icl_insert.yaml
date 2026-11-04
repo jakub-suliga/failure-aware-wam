@@ -1,0 +1,12 @@
+# P6c: WIE wird die Erinnerung eingefügt: zeitliche Position (sequentiell / phasengleich), Abstand, Attention-Gewicht
+# der Erinnerung, Zeitpunkt (vor dem Versuch / erst wenn die Vorhersage-Lücke steigt / beides)
+name: p6c_icl_insert
+out: results/sweeps/p6c_icl_insert
+episodes: 30
+per_job: 10
+n_par: 2
+time: "16:00:00"
+tasks: [move_playingcard_away, place_mouse_pad, pick_diverse_bottles, stack_blocks_two]
+configs: [table_h_m05, table_h_m10]
+methods: [icl_fail_predobs, icl_pos_aligned, icl_aligned_window, icl_gap8, icl_gap32, icl_attn0.5, icl_attn1.5,
+          icl_attn2, icl_trigger, icl_trigger_window, icl_pre_and_trigger]

@@ -233,6 +233,9 @@ class Orchestrator:
         elif action == "reset_context":
             self.model.infer(dict(context_op="reset"))
             result = {"first": True}
+        elif action == "reset_memory":  # ICL timing=trigger: fresh context that starts with the failure memory
+            self.model.infer(dict(context_op="reset", prefill=self.m.trigger_prefill))
+            result = {"first": True}
         elif action == "truncate":
             self.model.infer(dict(context_op="truncate", keep=int(self.cfg["truncate_keep"])))
         elif action == "reprompt":
@@ -249,18 +252,54 @@ class Orchestrator:
 
 # ------------------------------------------------------------------------------------------ learn from failure
 
+def make_context_spec(icl, ep_dir, seed, setting, seed_failures=(), successes=()):
+    """ICL config (methods.ICL_DEFAULTS) + the failed episode -> memory spec for fawam.server._prefill."""
+    from pathlib import Path
+    seg = "full" if icl["segment"] == "full" else dict(icl["window"])
+    fail_item = lambda p: dict(path=str(p), groups=list(icl["groups"]), segment=seg, actions=icl["actions"],
+                               role="failure")
+    bank = icl["demo_bank"].format(setting=setting or "")
+    bank = bank if Path(bank).is_absolute() else str(Path(__file__).resolve().parents[1] / bank)
+    items = []
+    for kind in icl["content"]:
+        if kind == "fail":
+            items.append(fail_item(ep_dir))
+        elif kind == "fails":
+            items += [fail_item(p) for p in list(seed_failures)[-icl["max_items"]:]]
+        elif kind.startswith("demo_"):
+            sel = {"demo_same_seed": "same_seed", "demo_nearest": "nearest", "demo_random": "random"}[kind]
+            items.append(dict(bank=bank, select=sel, seed=int(seed), k=1, groups=["obs"], role="demo"))
+        elif kind == "success_own":
+            items += [dict(path=p, groups=["obs"], role="success") for p in list(successes)[-icl["max_items"]:]]
+    return dict(items=items, gap=int(icl["gap"]), position=icl["position"], attn_scale=float(icl["attn_scale"]))
+
+
+def icl_prompt(icl, ana, instruction):
+    """(prompt, negative prompt or None) for the ICL text channel."""
+    t, prompt, neg = icl["text"], instruction, None
+    if "correction" in t and ana.get("correction"):
+        prompt = ana["correction"]
+    if t == "failure_note" and ana.get("cause"):
+        prompt = f"{instruction} In the previous attempt {ana['cause']}; avoid this."
+    if "negative" in t and ana.get("negative_prompt"):
+        neg = ana["negative_prompt"]
+    return prompt, neg
+
+
 class LearnFromFailure:
     """State of the Learn-from-Failure loop of one eval run (docs/METHOD.md). Per seed: attempt 1; while it fails
     and attempts remain: analyse the failed episode (prediction gap + oracle/VLM), update the model (adapter training
     in the lingbot env, and/or the failed attempt as in-context memory), retry the seed. With persist the adapter and
     the memory carry over to the next seeds."""
 
-    def __init__(self, method, save_root, task):
+    def __init__(self, method, save_root, task, setting=None):
         import copy
         import os
         from pathlib import Path
         self.copy, self.os, self.Path = copy, os, Path
         self.m, self.cfg = method, method.learn
+        self.setting = setting
+        self.seed_failures = []  # failures of the current seed (ICL content "fails")
         self.dir = Path(save_root) / "lff" / task
         self.dir.mkdir(parents=True, exist_ok=True)
         self.adapter = None      # current adapter dir (persists across seeds if cfg.persist)
@@ -275,8 +314,13 @@ class LearnFromFailure:
         return "adapt" if (n is None or self.n_seen < n) else "eval"
 
     def start_seed(self):
+        self.seed_failures = []
         if not self.cfg["persist"]:
             self.adapter, self.memory, self.successes = None, [], []
+
+    def build_context(self, ep_dir, ana, seed):
+        """Memory spec for fawam.server._prefill from the ICL config (docs/ICL.md)."""
+        return make_context_spec(self.cfg["icl"], ep_dir, seed, self.setting, self.seed_failures, self.successes)
 
     def first_method(self):
         m = self.copy.deepcopy(self.m)
@@ -359,14 +403,25 @@ class LearnFromFailure:
             info.update(learn_seconds=round(time.time() - t1, 1), accepted=accepted)
         elif c["mode"] == "icl" and c.get("meta_adapter"):
             m.adapter_path = c["meta_adapter"]
+        self.seed_failures.append(str(ep_dir))
         prefill = None
         if c["mode"] in ("icl", "both"):
-            prefill = list(self.memory[-1:])
+            prefill = self.build_context(ep_dir, ana, seed)
+            icl = c["icl"]
+            if icl["timing"] in ("trigger", "both"):
+                m.trigger_prefill = prefill
+                m.intervention = {**INTERVENTION_DEFAULTS, "action": "reset_memory", "max_interventions": 1}
+                if icl["timing"] == "trigger":
+                    prefill = None
         if c["retry_action_noise"]:
             m.action_noise = c["retry_action_noise"]
         if c["negative"] and ana.get("negative_prompt"):
             m.negative_prompt = ana["negative_prompt"]
         prompt = ana.get("correction") if (c["prompt"] == "correction" and ana.get("correction")) else instruction
+        if c["mode"] in ("icl", "both"):  # the ICL text channel overrides the generic prompt option
+            prompt, neg = icl_prompt(c["icl"], ana, instruction)
+            if neg:
+                m.negative_prompt = neg
         if c["mode"] == "none":  # plain retry (+ exploration noise): no learning, no context, no text
             prompt, prefill = instruction, None
         info.update(adapter=m.adapter_path, prefill=prefill, prompt=prompt, seconds=round(time.time() - t0, 1))

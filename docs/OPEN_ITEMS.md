@@ -17,6 +17,31 @@ Details zu den Methoden stehen in [EXPERIMENTS.md](EXPERIMENTS.md), die Befunde 
 - [ ] **Mehrere Paare pro GPU:** Prüfen, ob 3 Server/Sim-Paare (`N_PAR=3`) auf einer H100-94GB ohne OOM laufen und
       wie viel schneller das ist als 1 Paar. Davon hängen die GPU-h-Schätzungen ab.
 
+## 1a. In-Context-Learning (Schwerpunkt, [ICL.md](ICL.md))
+
+- [ ] **Erster Test:** `ANY_SEED=1 FAILS=results/table_height_n10 FIXES=results/table_height/z00 OUT=results/icl_screen/smoke.csv sbatch cluster/icl_screen_job.sh`.
+      Prüft alle Einfügewege (Fenster, korrigierte Aktionen, Fehlerkarte, phasengleich, Attention-Skalierung) einmal
+      mit echtem Modell. Lokal war die GPU belegt.
+- [ ] Phasengleiche Position: Erinnerung und Versuch haben dieselben Frame-IDs. Prüfen, dass RoPE und Cache-Verdrängung
+      sich wie erwartet verhalten (Cache 72 Frames: lange Erinnerung + lange Episode → älteste Erinnerung wird verdrängt).
+- [ ] Attention-Skalierung skaliert die gecachten Keys (nach RMSNorm/RoPE). Das wirkt auf alle Heads gleich.
+      Alternative: nur ausgewählte Layer.
+- [ ] Trigger-Zeitpunkt (`icl_trigger`) live: Kontext-Reset mitten im Versuch, danach erster Chunk mit Erinnerung.
+- [ ] Fehlerkarte (real − vorgestellt) hat eine andere Skala (|x| ≈ 0,3 statt 1,0). Ohne Meta-Training vermutlich
+      bedeutungslos für das Modell. Ggf. normieren.
+- [ ] Meta-Training pro Format braucht genug Paare (P0-Fails mit analysis.json + P2 auf denselben Seeds). Anzahl prüfen.
+- [ ] Demo-Banken (`adapter_grid.py banks`) enthalten jetzt den Seed (für `demo_same_seed`). Banken nach P2 neu bauen.
+- [ ] Screening-Metrik: Aktionsabstand zum Expert ist nur ein Proxy (Expert und Policy greifen unterschiedlich).
+      Zusätzlich die Greifhöhe vergleichen.
+
+- [ ] Driver `pair` einmal live laufen lassen: Nach einem Fail muss `..._attempt2` mit `driver=expert_replay` und
+      `lff.pair_role=fix` entstehen.
+- [ ] `table_h_rand`: prüfen, dass Policy-Lauf und Expert-Lauf eines Seeds dieselbe Tischhöhe haben (np.random wird
+      in `_init_task_env_` mit dem Seed gesetzt, sollte also stimmen).
+- [ ] Erinnerung über Seeds hinweg (Fehler von Seed A im Kontext beim ersten Versuch von Seed B) ist noch nicht
+      implementiert. Das Meta-Training enthält diesen Fall bereits (p_cross).
+- [ ] Meta-Training: 12 000 Schritte sind eine Schätzung. Nach der ersten Validierungskurve anpassen.
+
 ## 1b. Learn-from-Failure (Kern, [METHOD.md](METHOD.md))
 
 - [ ] **Lernt der Adapter die Korrektur?** `python -m fawam.tests.test_lff_effect <fail ep> <adapter>` vergleicht die

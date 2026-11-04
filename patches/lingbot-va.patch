@@ -1,5 +1,5 @@
 diff --git a/evaluation/robotwin/eval_polict_client_openpi.py b/evaluation/robotwin/eval_polict_client_openpi.py
-index 7ed5265..524ba06 100644
+index 7ed5265..bfc1618 100644
 --- a/evaluation/robotwin/eval_polict_client_openpi.py
 +++ b/evaluation/robotwin/eval_polict_client_openpi.py
 @@ -1,12 +1,14 @@
@@ -196,7 +196,7 @@ index 7ed5265..524ba06 100644
 +    method = resolve_method(args.get("fawam_method"), root=FAWAM_ROOT)
 +    driver = args.get("driver", "policy")
 +    print(f"\033[34mfawam method: {method.short()} | driver: {driver}\033[0m")
-+    lff = LearnFromFailure(method, args["save_root"], task_name) if method.learn else None
++    lff = LearnFromFailure(method, args["save_root"], task_name, args["task_config"]) if method.learn else None
 +
      expert_check = True
      TASK_ENV.suc = 0
@@ -225,7 +225,7 @@ index 7ed5265..524ba06 100644
              try:
                  TASK_ENV.setup_demo(now_ep_num=now_id, seed=now_seed, is_test=True, **args)
 -                episode_info = TASK_ENV.play_once()
-+                if driver == "expert_replay":
++                if driver in ("expert_replay", "pair"):
 +                    with ExpertTrajectory(TASK_ENV) as expert:
 +                        episode_info = TASK_ENV.play_once()
 +                else:
@@ -252,7 +252,7 @@ index 7ed5265..524ba06 100644
  
          if (not expert_check) or (TASK_ENV.plan_success and TASK_ENV.check_success()):
              succ_seed += 1
-@@ -501,137 +668,59 @@ def eval_policy(task_name,
+@@ -501,137 +668,69 @@ def eval_policy(task_name,
  
          args["render_freq"] = render_freq
  
@@ -385,10 +385,20 @@ index 7ed5265..524ba06 100644
 +            lff.start_seed()
 +        m1 = lff.first_method() if lff is not None else method
 +        phase = lff.phase() if lff is not None else None
++        run_driver = "policy" if driver == "pair" else driver
 +        succ, final_dir, end_info = run_episode(TASK_ENV, args, model, task_name, now_id, now_seed, instruction,
 +                                                video_size, save_visualization, video_guidance_scale,
-+                                                action_guidance_scale, m1, driver, expert, attempt=1,
++                                                action_guidance_scale, m1, run_driver,
++                                                None if driver == "pair" else expert, attempt=1,
 +                                                lff_info=dict(phase=phase, adapter=m1.adapter_path) if lff else None)
++        # driver "pair" (meta-training data, docs/ICL.md): a failed policy rollout is followed by the expert replay of
++        # the SAME seed (= the fix), recorded through the same pipeline; pairs match on (task, task_config, seed)
++        if driver == "pair" and not succ:
++            TASK_ENV.close_env()
++            fixed, _, _ = run_episode(TASK_ENV, args, model, task_name, now_id, now_seed, instruction, video_size,
++                                      save_visualization, video_guidance_scale, action_guidance_scale, method,
++                                      "expert_replay", expert, attempt=2, lff_info=dict(pair_role="fix"))
++            print(f"\033[93mpair: expert fix {'ok' if fixed else 'FAILED'}\033[0m")
          if succ:
              TASK_ENV.suc += 1
              print("\033[92mSuccess!\033[0m")
@@ -433,7 +443,7 @@ index 7ed5265..524ba06 100644
          now_id += 1
          TASK_ENV.close_env(clear_cache=((succ_seed + 1) % clear_cache_freq == 0))
  
-@@ -647,10 +736,13 @@ def eval_policy(task_name,
+@@ -647,10 +746,13 @@ def eval_policy(task_name,
            "succ_num": float(TASK_ENV.suc),
            "total_num": float(TASK_ENV.test_num),
            "succ_rate": float(TASK_ENV.suc / TASK_ENV.test_num),
@@ -449,7 +459,7 @@ index 7ed5265..524ba06 100644
              f"Success rate: \033[96m{TASK_ENV.suc}/{TASK_ENV.test_num}\033[0m => \033[95m{round(TASK_ENV.suc/TASK_ENV.test_num*100, 1)}%\033[0m, current seed: \033[90m{now_seed}\033[0m\n"
          )
          now_seed += 1
-@@ -658,6 +750,189 @@ def eval_policy(task_name,
+@@ -658,6 +760,192 @@ def eval_policy(task_name,
      return now_seed, TASK_ENV.suc
  
  
@@ -473,11 +483,14 @@ index 7ed5265..524ba06 100644
 +    prompt = prompt_override or TASK_ENV.get_instruction()
 +    reset_msg = dict(reset=True, prompt=prompt, seed=int(now_seed), save_visualization=save_visualization,
 +                     method=method.to_dict(), task_name=task_name)
-+    if prefill_paths:
++    if isinstance(prefill_paths, dict):  # full in-context memory spec (docs/ICL.md)
++        reset_msg["prefill"] = prefill_paths
++    elif prefill_paths:
 +        reset_msg["prefill_paths"] = prefill_paths
 +        reset_msg["prefill_include_pred"] = bool(prefill_include_pred)
 +    ret = model.infer(reset_msg)
 +    orchestrator = Orchestrator(method, model, instruction) if (method.intervention and driver == "policy") else None
++    # (for ICL timing=trigger the retry's method carries intervention=reset_memory + trigger_prefill)
 +
 +    # Absolute path: the server writes into the same directory from its own working directory
 +    episode_name = f"ep{TASK_ENV.test_num:04d}_seed{now_seed}" + ("" if attempt == 1 else f"_attempt{attempt}")
@@ -610,7 +623,7 @@ index 7ed5265..524ba06 100644
 +        "fawam_method_full": method.short(),
 +        "driver": driver,
 +        "interventions": orchestrator.log if orchestrator is not None else [],
-+        "prefill_paths": prefill_paths or [],
++        "prefill_paths": prefill_paths if isinstance(prefill_paths, dict) else (prefill_paths or []),
 +        "lff": lff_info or {},
 +    }
 +    with h5py.File(running_dir / 'episode.h5', 'a') as h5:

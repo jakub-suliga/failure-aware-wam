@@ -29,7 +29,7 @@ def build(a):
             if not link.exists():
                 os.symlink(e.resolve(), link)
             index.append(dict(path=f"episodes/{name}", task=str(at["task_name"]), setting=str(at["task_config"]),
-                              instruction=str(at["instruction"]), success=bool(at["success"]),
+                              instruction=str(at["instruction"]), success=bool(at["success"]), seed=int(at["seed"]),
                               driver=str(at.get("driver", "policy")), frames=int(lat.shape[1])))
             feats.append(lat[:, 0, 8:].reshape(-1).astype(np.float32))
     (out / "index.json").write_text(json.dumps(index, indent=1))

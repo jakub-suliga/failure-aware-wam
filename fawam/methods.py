@@ -52,6 +52,8 @@ class Method:
     # --- Learn-from-Failure (client + learner, docs/METHOD.md) ----------------------------------------------------
     learn: dict = None                 # see LEARN_DEFAULTS
 
+    trigger_prefill: dict = None       # memory spec inserted by the intervention action "reset_memory"
+
     # --- online intervention (client, B/C) ---------------------------------------------------------------------
     intervention: dict = None          # see INTERVENTION_DEFAULTS
     analyzer: str = None               # None | oracle | vlm
@@ -104,7 +106,26 @@ LEARN_DEFAULTS = dict(
     prompt="correction",     # next attempt's prompt: correction (analysis) | instruction
     negative=False,          # next attempt's CFG negative = analysis.negative_prompt
     meta_adapter=None,       # icl/both: adapter meta-trained to use failures in context (FailFix training)
+    icl=None,                # in-context memory for the next attempt, see ICL_DEFAULTS (docs/ICL.md)
     keep_successes=True,     # persist: successful attempts join the memory (trained without relabel)
+)
+
+ICL_DEFAULTS = dict(
+    content=["fail"],        # ordered memory items: fail (last own failure) | fails (all failures of the seed, up to
+                             # max_items) | demo_same_seed | demo_nearest | demo_random (expert replays from demo_bank)
+                             # | success_own (own earlier successes, persist mode)
+    groups=["pred", "obs"],  # for failure items: obs (what happened) | pred (what was imagined) | diff (obs - pred)
+    segment="full",          # full | window (latents around the analysed failure)
+    window=dict(before=4, after=2),
+    actions="executed",      # failure items: executed | corrected (analysis correction written as the actions)
+    position="sequential",   # sequential (memory before the episode in time) | aligned (same frame ids = phase-aligned)
+    gap=1,                   # RoPE frames between memory segments / before the episode
+    attn_scale=1.0,          # >1: scale the memory keys (more attention on the memory)
+    text="correction",       # correction | instruction | negative | correction+negative | failure_note
+    timing="pre",            # pre (memory before the retry) | trigger (insert at the prediction-gap trigger during
+                             # the retry: context reset + memory) | both
+    demo_bank="artifacts/demo_bank/{setting}",
+    max_items=3,
 )
 
 # ---------------------------------------------------------------------------------------------- presets
@@ -231,6 +252,89 @@ PRESETS = {
     "paper_OP_dual_retry": dict(learn=dict(mode="adapter", signals=["oracle", "gap"], every_episode=False,
                                            persist=True, max_attempts=2, adapt_episodes=3, outside="sequential",
                                            steps=25, outside_steps=25)),       # adaptation episodes also get a retry
+    # ===================== In-Context Learning from failures (docs/ICL.md) =====================
+    # all: attempt 1 fails -> analysis (oracle+gap unless noted) -> attempt 2 with the memory, no weight update.
+    # -- WHAT goes into the context (text = correction, timing = pre, sequential, gap 1)
+    "icl_text_only": dict(learn=dict(mode="icl", signals=["oracle", "gap"], icl=dict(content=[]))),
+    "icl_fail_obs": dict(learn=dict(mode="icl", signals=["oracle", "gap"], icl=dict(groups=["obs"]))),
+    "icl_fail_pred": dict(learn=dict(mode="icl", signals=["oracle", "gap"], icl=dict(groups=["pred"]))),
+    "icl_fail_predobs": dict(learn=dict(mode="icl", signals=["oracle", "gap"], icl=dict(groups=["pred", "obs"]))),
+    "icl_fail_diff": dict(learn=dict(mode="icl", signals=["oracle", "gap"], icl=dict(groups=["diff", "obs"]))),
+    "icl_fail_window": dict(learn=dict(mode="icl", signals=["oracle", "gap"],
+                                       icl=dict(groups=["pred", "obs"], segment="window"))),
+    "icl_fail_corrected": dict(learn=dict(mode="icl", signals=["oracle", "gap"],
+                                          icl=dict(groups=["obs"], actions="corrected"))),
+    "icl_demo_same": dict(learn=dict(mode="icl", signals=["oracle", "gap"], icl=dict(content=["demo_same_seed"]))),
+    "icl_demo_nearest": dict(learn=dict(mode="icl", signals=["oracle", "gap"], icl=dict(content=["demo_nearest"]))),
+    "icl_fail_demo": dict(learn=dict(mode="icl", signals=["oracle", "gap"],
+                                     icl=dict(content=["fail", "demo_same_seed"], groups=["obs"]))),
+    "icl_demo_fail": dict(learn=dict(mode="icl", signals=["oracle", "gap"],
+                                     icl=dict(content=["demo_same_seed", "fail"], groups=["obs"]))),
+    "icl_fails_3att": dict(learn=dict(mode="icl", signals=["oracle", "gap"], max_attempts=3,
+                                      icl=dict(content=["fails"], groups=["obs"]))),
+    # -- same, with non-privileged analysis (only matters for text / window / corrected)
+    "icl_fail_predobs_PR": dict(learn=dict(mode="icl", signals=["gap", "rollout"], icl=dict(groups=["pred", "obs"]))),
+    "icl_fail_window_PR": dict(learn=dict(mode="icl", signals=["gap", "rollout"],
+                                          icl=dict(groups=["pred", "obs"], segment="window"))),
+    "icl_fail_predobs_VP": dict(learn=dict(mode="icl", signals=["vlm", "gap"], icl=dict(groups=["pred", "obs"])),
+                                vlm=dict(endpoint="http://127.0.0.1:8001/v1", model="Qwen/Qwen3-VL-8B-Instruct",
+                                         pred_frames=True)),
+    "icl_fail_predobs_P": dict(learn=dict(mode="icl", signals=["gap"], icl=dict(groups=["pred", "obs"], text="instruction"))),
+    # -- WHICH TEXT accompanies the memory (memory = imagined + observed failure)
+    "icl_txt_instruction": dict(learn=dict(mode="icl", signals=["oracle", "gap"], icl=dict(text="instruction"))),
+    "icl_txt_negative": dict(learn=dict(mode="icl", signals=["oracle", "gap"], icl=dict(text="negative"))),
+    "icl_txt_corr_neg": dict(learn=dict(mode="icl", signals=["oracle", "gap"], icl=dict(text="correction+negative"))),
+    "icl_txt_note": dict(learn=dict(mode="icl", signals=["oracle", "gap"], icl=dict(text="failure_note"))),
+    # -- HOW it is inserted
+    "icl_pos_aligned": dict(learn=dict(mode="icl", signals=["oracle", "gap"], icl=dict(position="aligned"))),
+    "icl_gap8": dict(learn=dict(mode="icl", signals=["oracle", "gap"], icl=dict(gap=8))),
+    "icl_gap32": dict(learn=dict(mode="icl", signals=["oracle", "gap"], icl=dict(gap=32))),
+    "icl_attn0.5": dict(learn=dict(mode="icl", signals=["oracle", "gap"], icl=dict(attn_scale=0.5))),
+    "icl_attn1.5": dict(learn=dict(mode="icl", signals=["oracle", "gap"], icl=dict(attn_scale=1.5))),
+    "icl_attn2": dict(learn=dict(mode="icl", signals=["oracle", "gap"], icl=dict(attn_scale=2.0))),
+    "icl_trigger": dict(learn=dict(mode="icl", signals=["oracle", "gap"], icl=dict(timing="trigger"))),
+    "icl_trigger_window": dict(learn=dict(mode="icl", signals=["oracle", "gap"],
+                                          icl=dict(timing="trigger", segment="window"))),
+    "icl_pre_and_trigger": dict(learn=dict(mode="icl", signals=["oracle", "gap"], icl=dict(timing="both"))),
+    "icl_aligned_window": dict(learn=dict(mode="icl", signals=["oracle", "gap"],
+                                          icl=dict(position="aligned", segment="window"))),
+    # -- META-TRAINED: the model was taught to use this memory format (FailFix adapters, cluster/adapter_grid.py)
+    "icl_meta_obs": dict(learn=dict(mode="icl", signals=["oracle", "gap"], meta_adapter="artifacts/adapters/failfix_obs",
+                                    icl=dict(groups=["obs"]))),
+    "icl_meta_predobs": dict(learn=dict(mode="icl", signals=["oracle", "gap"],
+                                        meta_adapter="artifacts/adapters/failfix_predobs", icl=dict(groups=["pred", "obs"]))),
+    "icl_meta_diff": dict(learn=dict(mode="icl", signals=["oracle", "gap"], meta_adapter="artifacts/adapters/failfix_diff",
+                                     icl=dict(groups=["diff", "obs"]))),
+    "icl_meta_window": dict(learn=dict(mode="icl", signals=["oracle", "gap"],
+                                       meta_adapter="artifacts/adapters/failfix_window",
+                                       icl=dict(groups=["pred", "obs"], segment="window"))),
+    "icl_meta_predobs_notext": dict(learn=dict(mode="icl", signals=["oracle", "gap"],
+                                               meta_adapter="artifacts/adapters/failfix_predobs",
+                                               icl=dict(groups=["pred", "obs"], text="instruction"))),
+    "icl_meta_predobs_PR": dict(learn=dict(mode="icl", signals=["gap", "rollout"],
+                                           meta_adapter="artifacts/adapters/failfix_predobs",
+                                           icl=dict(groups=["pred", "obs"]))),
+    "icl_meta_mismatch": dict(learn=dict(mode="icl", signals=["oracle", "gap"],   # trained on obs, tested with pred+obs
+                                         meta_adapter="artifacts/adapters/failfix_obs", icl=dict(groups=["pred", "obs"]))),
+    "icl_meta_demo": dict(learn=dict(mode="icl", signals=["oracle", "gap"], meta_adapter="artifacts/adapters/democtx_meta",
+                                     icl=dict(content=["demo_same_seed"]))),
+    # meta-training ablations (same test format pred+obs): only own-failure samples / no text / fewer steps /
+    # an unseen task (stack_blocks_two was held out of meta-training)
+    "icl_meta_ownonly": dict(learn=dict(mode="icl", signals=["oracle", "gap"],
+                                        meta_adapter="artifacts/adapters/failfix_predobs_ownonly")),
+    "icl_meta_trained_notext": dict(learn=dict(mode="icl", signals=["oracle", "gap"],
+                                               meta_adapter="artifacts/adapters/failfix_predobs_notext",
+                                               icl=dict(text="instruction"))),
+    "icl_meta_small": dict(learn=dict(mode="icl", signals=["oracle", "gap"],
+                                      meta_adapter="artifacts/adapters/failfix_predobs_small")),
+    "icl_meta_holdtask": dict(learn=dict(mode="icl", signals=["oracle", "gap"],
+                                         meta_adapter="artifacts/adapters/failfix_predobs_holdtask")),
+    "icl_meta_noctx": dict(learn=dict(mode="icl", signals=["oracle", "gap"],   # meta adapter, but empty memory
+                                      meta_adapter="artifacts/adapters/failfix_predobs", icl=dict(content=[]))),
+    # -- for comparison: the same failure through the weights (adapters, unchanged) and through both
+    "icl_vs_adapter": dict(learn=dict(mode="adapter", signals=["oracle", "gap"])),
+    "icl_plus_adapter": dict(learn=dict(mode="both", signals=["oracle", "gap"],
+                                        meta_adapter="artifacts/adapters/failfix_predobs")),
     "lff_adapter_lifelong": dict(learn=dict(mode="adapter", signals=["oracle", "gap"], persist=True)),
     "lff_lifelong_PRI": dict(learn=dict(mode="adapter", signals=["gap", "rollout", "imagine"], persist=True)),
 }
@@ -286,6 +390,8 @@ def resolve(spec=None, root=None) -> Method:
         merged["intervention"] = _merge(INTERVENTION_DEFAULTS, merged["intervention"])
     if merged.get("learn") is not None:
         merged["learn"] = _merge(LEARN_DEFAULTS, merged["learn"])
+        if merged["learn"].get("mode") in ("icl", "both"):
+            merged["learn"]["icl"] = _merge(ICL_DEFAULTS, merged["learn"].get("icl") or {})
     merged.setdefault("name", name)
     unknown = set(merged) - {f.name for f in fields(Method)}
     if unknown:

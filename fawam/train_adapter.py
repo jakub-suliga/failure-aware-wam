@@ -126,9 +126,23 @@ def train_inside(a):
     if a.fixes:  # meta-ICL from failures: eps are the failed attempts, fixes the successes on the same seeds
         fixes = find_episodes(a.fixes, success=True, tasks=a.tasks)
         ds = FailFixDataset(eps, fixes, ActionNorm(cfg, a.action_clip), TextCache(a.text_cache), include_pred=a.include_pred,
-                            p_text=a.p_text, max_frames=a.max_frames, seed=a.seed, cfg_prob=a.cfg_prob)
-        print(f"{len(ds.pairs)} (failure, fix) pairs")
+                            p_text=a.p_text, max_frames=a.max_frames, seed=a.seed, cfg_prob=a.cfg_prob,
+                            context_groups=a.context_groups,
+                            window=dict(before=a.window_before, after=a.window_after) if a.context_window else None,
+                            p_cross=a.p_cross, p_success=a.p_success, p_noctx=a.p_noctx)
+        from fawam.latent_data import split_pairs_by_seed
+        tr, va = split_pairs_by_seed(ds, a.val_frac, a.seed) if a.val_frac > 0 else (ds.pairs, [])
+        val_ds = None
+        if va:
+            import copy
+            val_ds = copy.copy(ds)
+            val_ds.pairs, val_ds.items = va, va
+            val_ds.p_noctx = val_ds.p_success = val_ds.p_cross = 0.0  # validate on own-failure memory only
+            val_ds.rng = __import__("random").Random(999)
+        ds.pairs = ds.items = tr
+        print(f"{len(tr)} train / {len(va)} val (failure, fix) pairs on identical seeds")
     else:
+        val_ds = None
         ds = EpisodeDataset(eps, ActionNorm(cfg, a.action_clip), TextCache(a.text_cache), max_frames=a.max_frames,
                             context_k=a.context_k, context_pool=ctx_pool, seed=a.seed, cfg_prob=a.cfg_prob,
                             load_kw=load_kw, text_mode=a.text_mode)
@@ -199,10 +213,17 @@ def train_inside(a):
             margin = (e(input_dict, pred) - e(input_dict, ref_pos)) - (e(in_neg, pred_neg) - e(in_neg, ref_neg))
             lp = -torch.nn.functional.logsigmoid(-a.pref_beta * margin)
             loss = loss + a.lambda_pref * lp
-        loss.backward()
-        gn = torch.nn.utils.clip_grad_norm_(params, 1.0)
-        opt.step()
-        opt.zero_grad(set_to_none=True)
+        (loss / a.grad_accum).backward()
+        gn = torch.tensor(0.0)
+        if step % a.grad_accum == 0:
+            gn = torch.nn.utils.clip_grad_norm_(params, 1.0)
+            opt.step()
+            opt.zero_grad(set_to_none=True)
+        if val_ds is not None and a.val_every and step % a.val_every == 0:
+            vl = validate(tf, val_ds, a, sched_v, sched_a, patch, device)
+            print(json.dumps(dict(step=step, val_action=vl[1], val_video=vl[0], val_action_noctx=vl[2])), flush=True)
+            log.write(json.dumps(dict(step=step, val_action=vl[1], val_video=vl[0], val_action_noctx=vl[2])) + "\n")
+            log.flush()
         if step % a.log_every == 0 or step == 1:
             rec = dict(step=step, loss=float(loss), video=float(lv), action=float(la), pref=float(lp), grad_norm=float(gn),
                        frames=int(lat.shape[2]), ctx=ctx, s=round(time.time() - t0, 1))
@@ -220,6 +241,36 @@ def train_inside(a):
     (out / "train_args_inside.json").write_text(json.dumps({**vars(a), "episodes_used": [str(e) for e in eps]},
                                                            indent=2, default=str))
     print(f"saved {out}")
+
+
+@torch.no_grad()
+def validate(tf, ds, a, sched_v, sched_a, patch, device, n=24):
+    """Flow loss on held-out (failure, fix) seeds: with the failure memory, and the same targets without memory
+    (val_action_noctx). Meta-training works if the memory lowers the loss below the no-memory value."""
+    out = []
+    for use_ctx in (True, False):
+        tv = ta = 0.0
+        for i in range(n):
+            torch.manual_seed(5000 + i)
+            ds.rng.seed(5000 + i)
+            ds.p_noctx = 0.0 if use_ctx else 1.0
+            smp = ds[i]
+            lat, act = smp["latents"][None].to(device), smp["actions"][None].to(device)
+            am = smp["actions_mask"][None].to(device)
+            ctx = int(smp["context_frames"])
+            ld = add_noise(lat, sched_v, device, patch, clean_frames=ctx, frame_gap=a.icl_gap if ctx else 0)
+            ad = add_noise(act, sched_a, device, patch, action_mask=am, action_mode=True, clean_frames=ctx,
+                           frame_gap=a.icl_gap if ctx else 0)
+            ld["text_emb"] = smp["text_emb"][None].to(device, torch.bfloat16)
+            ad["text_emb"], ad["actions_mask"] = ld["text_emb"], am
+            inp = dict(latent_dict=ld, action_dict=ad, chunk_size=2, window_size=128)
+            fw = torch.ones(lat.shape[2])
+            fw[:ctx] = 0
+            lv, la = flow_losses(inp, tf(inp, train_mode=True), patch, sched_v, sched_a, fw, fw)
+            tv, ta = tv + float(lv), ta + float(la)
+        out.append((tv / n, ta / n))
+    ds.p_noctx = 0.0
+    return out[0][0], out[0][1], out[1][1]
 
 
 @torch.no_grad()
@@ -336,7 +387,17 @@ def main():
     ap.add_argument("--guard_tau", type=float, default=1.1)
     ap.add_argument("--fixes", nargs="*", help="meta-ICL: successful episodes on the same seeds as --episodes")
     ap.add_argument("--include_pred", action="store_true", help="meta-ICL: imagined segment in the context")
+    ap.add_argument("--context_groups", nargs="*", help="meta-ICL memory format: obs | pred | diff (overrides include_pred)")
+    ap.add_argument("--context_window", action="store_true", help="meta-ICL: only the latents around the failure")
+    ap.add_argument("--window_before", type=int, default=4)
+    ap.add_argument("--window_after", type=int, default=2)
     ap.add_argument("--p_text", type=float, default=0.5, help="meta-ICL: prob. of the correction text in the prompt")
+    ap.add_argument("--p_cross", type=float, default=0.2, help="meta-ICL: memory = failure of another seed")
+    ap.add_argument("--p_success", type=float, default=0.1, help="meta-ICL: memory = another success")
+    ap.add_argument("--p_noctx", type=float, default=0.15, help="meta-ICL: no memory")
+    ap.add_argument("--val_frac", type=float, default=0.1, help="meta-ICL: held-out seeds")
+    ap.add_argument("--val_every", type=int, default=250)
+    ap.add_argument("--grad_accum", type=int, default=1)
     ap.add_argument("--steps_outside", type=int, default=300)
     ap.add_argument("--lr_outside", type=float, default=1.234e-3)
     ap.add_argument("--batch_outside", type=int, default=32)

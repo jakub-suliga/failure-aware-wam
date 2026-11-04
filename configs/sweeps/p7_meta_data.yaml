@@ -1,0 +1,17 @@
+# P7: Datensatz für das ICL-Meta-Training (docs/ICL.md, Abschnitt 5). Driver "pair": pro Seed fährt die Policy;
+# scheitert sie, fährt danach der Experte DENSELBEN Seed durch dieselbe Pipeline (= die Korrektur). Paare
+# (Fehlversuch, Fix) entstehen so nur dort, wo gelernt werden kann. Seeds ab Index 1000: disjunkt zu allen Eval-Sweeps.
+# table_h_rand: zufällige Tischhöhe pro Seed in [-15, +5] cm (kontinuierlicher Shift statt einzelner Höhen).
+# Erwartung: ~60 % Fails bei table_h_rand -> ~1400 Paare, ~10-20 % im Hard-Setting -> ~300 Paare.
+name: p7_meta_data
+out: results/sweeps/p7_meta_data
+driver: pair
+episodes: 300
+per_job: 30
+n_par: 3
+time: "14:00:00"
+seed_offset: 1000
+tasks: [move_playingcard_away, place_mouse_pad, pick_diverse_bottles, stack_blocks_two, place_shoe, move_can_pot,
+        lift_pot, handover_block]
+configs: [table_h_rand, demo_randomized]
+methods: [base]

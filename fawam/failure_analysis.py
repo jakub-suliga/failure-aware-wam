@@ -386,6 +386,7 @@ def main():
     ap.add_argument("roots", nargs="+")
     ap.add_argument("--analyzer", default="oracle", choices=["oracle", "vlm"])
     ap.add_argument("--signals", help="composable analysis, e.g. gap+rollout+imagine (overrides --analyzer)")
+    ap.add_argument("--as_main", action="store_true", help="also write the result as analysis.json (read by training)")
     ap.add_argument("--endpoint", default="http://127.0.0.1:8001/v1")
     ap.add_argument("--model", default="Qwen/Qwen2.5-VL-7B-Instruct")
     ap.add_argument("--force", action="store_true")
@@ -398,6 +399,8 @@ def main():
         cfg = dict(endpoint=a.endpoint, model=a.model)
         r = analyze_signals(e, a.signals.split("+"), cfg, force=a.force) if a.signals else \
             analyze_episode(e, a.analyzer, cfg, force=a.force)
+        if a.as_main and a.signals:
+            (e / "analysis.json").write_text(json.dumps(r, indent=1, default=float))
         print(f"{e.parent.name}/{e.name}: {r.get('failure_type')} arm={r.get('arm')} latent={r.get('latent')} "
               f"delta_z={r.get('delta_m', [0, 0, 0])[2]:+.3f} gap_peak={r.get('gap_peak_latent')}")
 

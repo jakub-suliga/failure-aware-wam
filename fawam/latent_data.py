@@ -55,6 +55,28 @@ class ActionNorm:
 ARM_XYZ = {"left": slice(0, 3), "right": slice(8, 11)}  # raw 16-d action: [l xyz quat grip, r xyz quat grip]
 
 
+def relabel_planned(planned, chunk_of, li, ana):
+    """planned action chunks with the analysis correction applied (same ramp as load_episode(relabel=True)).
+    Used to write *corrected* actions next to the observed failure into the in-context memory."""
+    out = planned.copy()
+    if not (ana and ana.get("failed") and ana.get("window") and ana.get("arm") in ARM_XYZ):
+        return out
+    delta = np.asarray(ana.get("delta_m", [0, 0, 0]), np.float32)
+    if np.abs(delta).max() == 0:
+        return out
+    l0, l1 = ana["window"]
+    first = {}
+    for r in range(len(li)):
+        c = int(chunk_of[r])
+        first.setdefault(c, r)
+        k = int(li[r])
+        if k < l0:
+            continue
+        frac = min(1.0, (k - l0 + 1) / (l1 - l0 + 1))
+        out[c][ARM_XYZ[ana["arm"]], r - first[c]] += frac * delta[:, None]
+    return out
+
+
 def gap_weights(gap, li, beta):
     """Per-frame loss weight from the prediction error: 1 + beta * (robust z of the gap, clipped to [0, 3]) / 3."""
     g = np.array([gap.get(str(int(k)), np.nan) for k in li], dtype=np.float64)
@@ -82,9 +104,16 @@ def load_episode(path, norm: ActionNorm, relabel=False, gap_beta=0.0, video_in_w
     path = Path(path)
     h5 = path / "episode.h5" if path.is_dir() else path
     with h5py.File(h5, "r") as f:
-        lat = canvas(f, group)
-        li = f[f"model/{group}/latent_index"][()]
-        chunk_of_obs = f[f"model/{group}/chunk_id"][()]
+        src = "pred" if group == "pred" else "obs"
+        lat = canvas(f, src)
+        li = f[f"model/{src}/latent_index"][()]
+        chunk_of_obs = f[f"model/{src}/chunk_id"][()]
+        if group == "diff":  # where the imagination was wrong: observed - imagined latent
+            pidx = {int(k): i for i, k in enumerate(f["model/pred/latent_index"][()])}
+            keep = np.array([int(k) in pidx for k in li])
+            pred = canvas(f, "pred")
+            lat = lat[:, keep] - pred[:, [pidx[int(k)] for k in li[keep]]]
+            li, chunk_of_obs = li[keep], chunk_of_obs[keep]
         planned = f["actions/planned"][()]  # n_chunks, 16, 2, 16
         meta = {k: (v.decode() if isinstance(v, bytes) else v) for k, v in f.attrs.items() if k != "task_args"}
         events = json.loads(f["fawam"].attrs.get("events", "[]")) if "fawam" in f else []
@@ -141,7 +170,7 @@ def load_episode(path, norm: ActionNorm, relabel=False, gap_beta=0.0, video_in_w
     text = str(meta.get("instruction", ""))
     return dict(latents=lat[:, :stop].astype(np.float32), actions=acts[..., None], actions_mask=mask[..., None],
                 actions_neg=(neg if neg is not None else acts)[..., None], window_mask=in_window[None].astype(np.float32),
-                weight_video=wv[None], weight_action=w[None],
+                weight_video=wv[None], weight_action=w[None], latent_index=li[:stop][None].astype(np.int64),
                 text=text, prompt=str(meta.get("prompt", text)), correction=(ana or {}).get("correction") or text,
                 task=str(meta.get("task_name", "")), success=bool(meta.get("success", False)),
                 setting=str(meta.get("task_config", "")), seed=int(meta.get("seed", -1)), path=str(h5.parent),
@@ -247,45 +276,101 @@ class EpisodeDataset(torch.utils.data.Dataset):
 
 
 class FailFixDataset(EpisodeDataset):
-    """Meta-training for in-context learning from failures: sample = [failed attempt (imagined segment, optional)
-    | failed attempt (observed) | the successful episode on the SAME seed (expert replay or corrected retry)],
-    loss only on the success. The prompt is the instruction plus the failure analysis' correction with prob p_text.
-    Pairs are matched on (task, task_config, seed)."""
+    """Meta-training for in-context learning from failures (docs/ICL.md, section 5).
+
+    Pairs (failed attempt, fix on the SAME seed) are matched on (task, task_config, seed); the fix is an expert replay
+    (driver pair / P2) or a successful corrected retry. Each sample is [memory | target], loss only on the target.
+    Mixture (probabilities, the rest = own failure of the same seed):
+      p_cross    memory = a failure of ANOTHER seed of the same task/setting (generalise beyond the identical scene)
+      p_success  memory = another success of the task (context that is not a failure)
+      p_noctx    no memory at all (keeps the plain policy intact)
+    Memory format: context_groups (obs | pred | diff), optional window around the analysed failure.
+    Episodes are loaded lazily (LRU), so thousands of pairs fit in memory."""
 
     def __init__(self, fails, fixes, norm, text_cache, include_pred=True, p_text=0.5, max_frames=24, seed=0,
-                 cfg_prob=0.1):
-        self.text_cache, self.max_frames, self.p_start0 = text_cache, max_frames, 1.0
+                 cfg_prob=0.1, context_groups=None, window=None, p_cross=0.0, p_success=0.0, p_noctx=0.0,
+                 cache_size=256):
+        from functools import lru_cache
+        self.norm, self.text_cache, self.max_frames, self.p_start0 = norm, text_cache, max_frames, 1.0
         self.rng, self.cfg_prob, self.p_text = random.Random(seed), cfg_prob, p_text
+        self.groups = context_groups or (["pred", "obs"] if include_pred else ["obs"])
+        self.window, self.p_cross, self.p_success, self.p_noctx = window, p_cross, p_success, p_noctx
+        self._load = lru_cache(maxsize=cache_size)(lambda path, group: load_episode(path, norm, group=group))
+        key = lambda e: self._key(e)
         fix_by_key = {}
         for e in fixes:
-            d = load_episode(e, norm)
-            fix_by_key.setdefault((d["task"], d["setting"], d["seed"]), d)
-        self.pairs = []
-        for e in fails:
-            ctx = load_episode(e, norm)
-            key = (ctx["task"], ctx["setting"], ctx["seed"])
-            if key not in fix_by_key:
-                continue
-            parts = ([load_episode(e, norm, group="pred")] if include_pred else []) + [ctx]
-            self.pairs.append((parts, fix_by_key[key]))
-        self.items = [p[1] for p in self.pairs]
+            fix_by_key.setdefault(key(e), str(e))
+        self.pairs = [(str(e), fix_by_key[key(e)]) for e in fails if key(e) in fix_by_key]
         if not self.pairs:
             raise ValueError("no (failure, fix) pairs with matching task/setting/seed")
+        self.fails_by_ts, self.fixes_by_ts = {}, {}
+        for f_, x_ in self.pairs:
+            k = key(f_)[:2]
+            self.fails_by_ts.setdefault(k, []).append(f_)
+            self.fixes_by_ts.setdefault(k, []).append(x_)
+        self.items = self.pairs
+
+    _keys = {}
+
+    @classmethod
+    def _key(cls, e):
+        e = str(e)
+        if e not in cls._keys:
+            with h5py.File(Path(e) / "episode.h5", "r") as f:
+                cls._keys[e] = (str(f.attrs["task_name"]), str(f.attrs["task_config"]), int(f.attrs["seed"]))
+        return cls._keys[e]
+
+    def _memory(self, fail_path):
+        parts = [self._load(fail_path, g) for g in self.groups]
+        if self.window:
+            ana_p = Path(fail_path) / "analysis.json"
+            ana = json.loads(ana_p.read_text()) if ana_p.exists() else None
+            if ana and ana.get("latent") is not None:
+                L, b, a = int(ana["latent"]), self.window.get("before", 4), self.window.get("after", 2)
+                parts = [{k: (v[:, (p["latent_index"][0] >= L - b) & (p["latent_index"][0] <= L + a)]
+                              if isinstance(v, np.ndarray) else v) for k, v in p.items()} for p in parts]
+        return parts
 
     def __getitem__(self, idx):
-        parts, fix = self.pairs[idx % len(self.pairs)]
+        fail_path, fix_path = self.pairs[idx % len(self.pairs)]
+        fix = self._load(fix_path, "obs")
+        ts = self._key(fail_path)[:2]
+        r = self.rng.random()
+        if r < self.p_noctx:
+            parts, kind = [], "noctx"
+        elif r < self.p_noctx + self.p_success:
+            others = [x for x in self.fixes_by_ts[ts] if x != fix_path]
+            parts, kind = ([self._load(self.rng.choice(others), "obs")] if others else []), "success"
+        elif r < self.p_noctx + self.p_success + self.p_cross:
+            others = [f_ for f_ in self.fails_by_ts[ts] if f_ != fail_path]
+            parts, kind = (self._memory(self.rng.choice(others)) if others else self._memory(fail_path)), "cross"
+        else:
+            parts, kind = self._memory(fail_path), "own"
         tgt = self._window(fix, self.max_frames)
         seq = parts + [tgt]
         ctx_frames = sum(p["latents"].shape[1] for p in parts)
         cat = {k: np.concatenate([p[k] for p in seq], axis=1) for k in ("latents", "actions", "actions_mask",
                                                                          "weight_video", "weight_action")}
-        use_corr = self.rng.random() < self.p_text
-        text = parts[-1]["correction"] if use_corr else parts[-1]["text"]  # same seed: the failed attempt's instruction (cached)
+        fail_ep = self._load(fail_path, "obs")
+        use_corr = kind in ("own",) and self.rng.random() < self.p_text
+        text = fail_ep["correction"] if use_corr else fail_ep["text"]
         text = "" if self.rng.random() < self.cfg_prob else text
         return dict(latents=torch.from_numpy(cat["latents"]), actions=torch.from_numpy(cat["actions"]),
                     actions_mask=torch.from_numpy(cat["actions_mask"]), text_emb=self.text_cache.get(text),
                     context_frames=torch.tensor(ctx_frames), weight_video=torch.from_numpy(cat["weight_video"][0]),
-                    weight_action=torch.from_numpy(cat["weight_action"][0]))
+                    weight_action=torch.from_numpy(cat["weight_action"][0]),
+                    actions_neg=torch.from_numpy(cat["actions"]), window_mask=torch.zeros(cat["latents"].shape[1]),
+                    relabeled=torch.tensor(False), kind=kind)
+
+
+def split_pairs_by_seed(ds, val_frac=0.1, seed=0):
+    """Hold out whole seeds (both the failure and its fix) for validation."""
+    rng = random.Random(seed)
+    seeds = sorted({ds._key(f)[2] for f, _ in ds.pairs})
+    val = set(rng.sample(seeds, max(1, int(len(seeds) * val_frac)))) if len(seeds) > 1 else set()
+    tr = [p for p in ds.pairs if ds._key(p[0])[2] not in val]
+    va = [p for p in ds.pairs if ds._key(p[0])[2] in val]
+    return tr, va
 
 
 def build_pairs(episodes, group_pred="pred"):

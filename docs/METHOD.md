@@ -1,5 +1,8 @@
 # Learn-from-Failure (LfF): LingBot-VA lernt aus seinen eigenen Fehlern
 
+> **Schwerpunkt seit 2026-11-04: In-Context-Learning, siehe [ICL.md](ICL.md).** Die Adapter-Varianten in diesem
+> Dokument bleiben unverändert und dienen als Vergleich (dieselbe Fehlerinformation über Gewichte statt über Kontext).
+
 Stand: 2026-11-04 (aktualisiert). Das ist der Kern der Arbeit. Die Methoden A, B und C in [EXPERIMENTS.md](EXPERIMENTS.md) sind ab
 jetzt nur noch Baselines oder Bausteine (A5 Negativ-Prompt, B1 Lücken-Detektor). Befunde: [FINDINGS.md](FINDINGS.md).
 

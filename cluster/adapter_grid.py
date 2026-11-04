@@ -74,6 +74,37 @@ GRID["failfix_meta"] = (dict(EPISODES=roll("table_h_m025", "table_h_m05", "table
                              EXTRA="--include_pred --p_text 0.5 --max_frames 20 --steps 800 --fixes " +
                                    expert("table_h_m025", "table_h_m05", "table_h_m10", "demo_randomized")),
                         ["table_h_m05", "table_h_m10"])
+# Meta-training per in-context memory format (docs/ICL.md): the test-time format of icl_meta_<fmt> must match.
+# Data: P7 (driver pair: failure + expert fix on the same seed; random table height + hard setting, 8 tasks).
+_P7 = " ".join(f"results/sweeps/p7_meta_data/base/{c}" for c in ("table_h_rand", "demo_randomized"))
+_FF_EP, _FF_FIX = _P7, _P7
+_META = ("--p_text 0.5 --p_cross 0.2 --p_success 0.1 --p_noctx 0.15 --val_frac 0.1 --val_every 1000 "
+         "--save_every 2000 --max_frames 20 --steps 12000 --grad_accum 4")
+TABLE8 = ["move_playingcard_away", "place_mouse_pad", "pick_diverse_bottles", "stack_blocks_two", "place_shoe",
+          "move_can_pot", "lift_pot", "handover_block"]
+for _name, _extra in {"failfix_obs": "--context_groups obs",
+                      "failfix_predobs": "--context_groups pred obs",
+                      "failfix_diff": "--context_groups diff obs",
+                      "failfix_window": "--context_groups pred obs --context_window",
+                      # ablations of the meta-training itself (format pred+obs)
+                      "failfix_predobs_ownonly": "--context_groups pred obs --p_cross 0 --p_success 0 --p_noctx 0",
+                      "failfix_predobs_notext": "--context_groups pred obs --p_text 0",
+                      "failfix_predobs_small": "--context_groups pred obs --steps 3000",
+                      }.items():
+    GRID[_name] = (dict(EPISODES=_FF_EP, SUCCESS="false", OUTSIDE="none", TASKS=" ".join(TABLE8),
+                        EXTRA=f"{_META} {_extra} --fixes {_FF_FIX}"),
+                   ["table_h_m05", "table_h_m10"])
+# generalisation to an unseen TASK: meta-trained without stack_blocks_two, tested on it
+GRID["failfix_predobs_holdtask"] = (dict(EPISODES=_FF_EP, SUCCESS="false", OUTSIDE="none",
+                                         TASKS=" ".join(t for t in TABLE8 if t != "stack_blocks_two"),
+                                         EXTRA=f"{_META} --context_groups pred obs --fixes {_FF_FIX}"),
+                                    ["table_h_m05", "table_h_m10"])
+# demo in context -> success (no failure): the E3 counterpart, for icl_meta_demo
+GRID["democtx_meta"] = (dict(EPISODES=_FF_FIX, SUCCESS="true", OUTSIDE="none", CONTEXT_K="1", DRIVERS="expert_replay",
+                             TASKS=" ".join(TABLE8),
+                             EXTRA=f"--max_frames 20 --steps 12000 --grad_accum 4 --save_every 2000 "
+                                   f"--context_pool {_FF_FIX}"),
+                        ["table_h_m05", "table_h_m10"])
 ICL_CONFIGS = ["table_h_m05", "table_h_m075", "table_h_m10", "table_h_z00", "demo_randomized"]
 
 
@@ -88,8 +119,10 @@ def train(a):
         e = dict(FAWAM_ROOT=str(ROOT), OUT=str(out), **{k: str(v) for k, v in env.items()})
         if "hard" not in name:
             e.setdefault("TASKS", " ".join(TABLE4))
+        if name.startswith(("failfix_", "democtx_")):
+            e.setdefault("TIME", "47:00:00")
         out.mkdir(parents=True, exist_ok=True)
-        cmd = ["sbatch", f"--job-name=fawam_train_{name}", f"--time={a.time}", f"--output={out}/slurm_%j.out",
+        cmd = ["sbatch", f"--job-name=fawam_train_{name}", f"--time={e.get('TIME', a.time)}", f"--output={out}/slurm_%j.out",
                f"--chdir={ROOT}"]
         if os.environ.get("PARTITION"):
             cmd.append(f"--partition={os.environ['PARTITION']}")
@@ -129,7 +162,7 @@ def methods(a):
             variants[f"{name}@inside"] = dict(adapter_path=f"{ADAPTERS}/{name}", adapter_use="inside")
             variants[f"{name}@outside"] = dict(adapter_path=f"{ADAPTERS}/{name}", adapter_use="outside")
         for vname, spec in variants.items():
-            if name.startswith(("e3_", "failfix_")):
+            if name.startswith(("e3_", "failfix_", "democtx_")):
                 continue  # evaluated with prefill in p4 / through Method.learn.meta_adapter in p5
             f = mdir / f"{vname.replace('@', '__')}.json"
             f.write_text(json.dumps(dict(name=vname, **spec), indent=1))

@@ -216,7 +216,9 @@ class FawamServer(VA_Server):
             logger.info("******************* Reset server ******************")
             self._reset(prompt=obs.get("prompt"), seed=obs.get("seed"), method=obs.get("method"),
                         task=obs.get("task_name"))
-            if obs.get("prefill_paths"):
+            if obs.get("prefill"):
+                self.pending_prefill = obs["prefill"]
+            elif obs.get("prefill_paths"):
                 self.pending_prefill = dict(paths=list(obs["prefill_paths"]), gap=int(obs.get("prefill_gap", 1)),
                                             include_pred=bool(obs.get("prefill_include_pred", False)))
             return dict(method=self.method.short())
@@ -268,6 +270,8 @@ class FawamServer(VA_Server):
             self._new_slot_meta()
             self.ep_frame0 = self.frame_st_id
             self.init_ready = False
+            if obs.get("prefill"):  # reset-with-memory: the next first chunk starts after this in-context memory
+                self.pending_prefill = obs["prefill"]
         elif op == "truncate":
             keep = int(obs.get("keep", 2))
             c = self._cache()
@@ -293,62 +297,125 @@ class FawamServer(VA_Server):
 
     # ------------------------------------------------------------------------------------------ in-context prefill
 
-    def _select_demos(self, spec):
-        if spec.get("paths"):
-            return list(spec["paths"])
-        bank = Path(spec["bank"])
+    def _bank_paths(self, item):
+        """Resolve a bank item {"bank", "select": nearest|random|same_seed, "k", "seed"} to episode paths."""
+        bank = Path(item["bank"])
         index = json.loads((bank / "index.json").read_text())
         cands = [e for e in index if self.task is None or e["task"] == self.task]
+        if item.get("setting"):
+            cands = [e for e in cands if e.get("setting") == item["setting"]]
         if not cands:
             logger.warning(f"demo bank {bank} has no episode for task {self.task}; no prefill")
             return []
-        k = int(spec.get("k", 1))
-        if spec.get("select", "nearest") == "random":
+        k = int(item.get("k", 1))
+        sel = item.get("select", "nearest")
+        if sel == "same_seed":
+            hit = [e for e in cands if int(e.get("seed", -1)) == int(item.get("seed", -2))]
+            return [str(bank / e["path"]) for e in hit[:k]]
+        if sel == "random":
             idx = self._rng.choice(len(cands), size=min(k, len(cands)), replace=False)
             return [str(bank / cands[i]["path"]) for i in idx]
-        # nearest: cosine similarity of the initial head-camera latent
-        q = self.init_latent[0, :, 0, 8:].float().flatten()
-        feats = torch.from_numpy(np.load(bank / "init_latents.npy")).to(q.device)  # N, D (same order as index)
-        sel = torch.tensor([i for i, e in enumerate(index) if e in cands], device=q.device)
-        sims = F.cosine_similarity(feats[sel], q[None], dim=1)
-        top = sel[sims.argsort(descending=True)[:k]].tolist()
-        return [str(bank / index[i]["path"]) for i in top]
+        q = self.init_latent[0, :, 0, 8:].float().flatten()  # nearest: initial head-camera latent
+        feats = torch.from_numpy(np.load(bank / "init_latents.npy")).to(q.device)
+        sel_i = torch.tensor([i for i, e in enumerate(index) if e in cands], device=q.device)
+        sims = F.cosine_similarity(feats[sel_i], q[None], dim=1)
+        return [str(bank / index[i]["path"]) for i in sel_i[sims.argsort(descending=True)[:k]].tolist()]
+
+    def _context_items(self, spec):
+        """Normalise a prefill spec to a list of items {path, groups, segment, actions, role}.
+        Legacy keys (paths / bank / k / select / include_pred) are still accepted."""
+        items = []
+        for it in spec.get("items", []):
+            if it.get("bank"):
+                for p in self._bank_paths(it):
+                    items.append({**it, "path": p})
+            else:
+                items.append(dict(it))
+        legacy = list(spec.get("paths", []))
+        if spec.get("bank") and not spec.get("items"):
+            legacy += self._bank_paths(spec)
+        groups = ["pred", "obs"] if spec.get("include_pred") else ["obs"]
+        items += [dict(path=p, groups=groups) for p in legacy]
+        return items
+
+    def _segment_rows(self, li, item, ana):
+        """Rows of an episode to write: all, or a window around the analysed failure ({"before": b, "after": a})."""
+        seg = item.get("segment", "full")
+        if seg == "full" or not ana or ana.get("latent") is None:
+            return np.arange(len(li))
+        b, a = (seg.get("before", 4), seg.get("after", 2)) if isinstance(seg, dict) else (4, 2)
+        L = int(ana["latent"])
+        return np.where((li >= L - b) & (li <= L + a))[0]
 
     def _prefill(self, spec):
-        """Write whole recorded episodes (latents + the action chunks that produced them) into the KV cache before the
-        episode starts; the episode then begins at frame id = prefilled frames + gap. With include_pred, every
-        episode is preceded by its *imagined* version (the model's own predictions per chunk), so the context shows
-        what the model expected and what actually happened (Learn-from-Failure, docs/METHOD.md)."""
-        paths = self._select_demos(spec)
+        """In-context memory (docs/ICL.md): write recorded episodes into the KV cache before the episode (or, after a
+        context reset, before the next chunk). Per item:
+          groups   which latents: obs (what happened), pred (what the model imagined), diff (obs - pred: where the
+                   imagination was wrong); several groups = several consecutive segments
+          segment  full | {"before": b, "after": a} latents around the analysed failure (analysis.json)
+          actions  executed | corrected (analysis correction applied: what should have been done)
+        Global: gap (RoPE frames between segments and before the episode), position sequential | aligned (each segment
+        occupies the same frame ids the coming episode will use = phase-aligned memory), attn_scale (keys of the
+        context tokens scaled: >1 makes the model attend to the memory more)."""
+        from fawam.latent_data import relabel_planned
+        items = self._context_items(spec)
         gap = int(spec.get("gap", 1))
-        groups = ["pred", "obs"] if spec.get("include_pred") else ["obs"]
-        base = 0
-        for p in paths:
-            ep = Path(p)
+        aligned = spec.get("position", "sequential") == "aligned"
+        start = int(self.frame_st_id)
+        base = start
+        mask_before = self._cache()["mask"].clone()
+        for it in items:
+            ep = Path(it["path"])
             ep = ep / "episode.h5" if ep.is_dir() else ep
-            for group in groups:
+            ana_p = ep.parent / it.get("analysis", "analysis.json")
+            ana = json.loads(ana_p.read_text()) if ana_p.exists() else None
+            for group in it.get("groups", ["obs"]):
                 with h5py.File(ep, "r") as f:
-                    if f"model/{group}" not in f:
+                    src = "pred" if group == "pred" else "obs"
+                    if f"model/{src}" not in f:
                         continue
-                    lat = canvas_from_h5(f, group).to(self.device, self.dtype)
+                    lat = canvas_from_h5(f, src)
+                    li = f[f"model/{src}/latent_index"][()]
+                    chunk_of = f[f"model/{src}/chunk_id"][()]
                     planned = f["actions/planned"][()]
-                    chunk_of = f[f"model/{group}/chunk_id"][()]
-                    li = f[f"model/{group}/latent_index"][()]
-                li0 = int(li[0])
-                for c in range(len(planned)):
-                    rows = np.where(chunk_of == c)[0]
-                    if len(rows) == 0:
-                        continue
-                    lat_c = lat[:, :, rows]
-                    act_c = self.preprocess_action(planned[c][:, :len(rows)]).to(lat_c)
-                    fst = base + int(li[rows[0]]) - li0
+                    if group == "diff":
+                        pl = f["model/pred/latent_index"][()]
+                        pidx = {int(k): i for i, k in enumerate(pl)}
+                        pred = canvas_from_h5(f, "pred")
+                        keep = np.array([int(k) in pidx for k in li])
+                        lat = lat[:, :, keep] - pred[:, :, [pidx[int(k)] for k in li[keep]]]
+                        li, chunk_of = li[keep], chunk_of[keep]
+                if it.get("actions") == "corrected":
+                    planned = relabel_planned(planned, chunk_of, li, ana)
+                rows = self._segment_rows(li, it, ana)
+                if len(rows) == 0:
+                    continue
+                lat = lat.to(self.device, self.dtype)
+                li0, li1 = int(li[rows[0]]), int(li[rows[-1]])
+                seg0 = start if aligned else base
+                for c in np.unique(chunk_of[rows]):
+                    crow = rows[chunk_of[rows] == c]
+                    first_row = np.where(chunk_of == c)[0][0]
+                    lat_c = lat[:, :, crow]
+                    act = planned[c][:, crow - first_row]
+                    act_c = self.preprocess_action(act).to(lat_c)
+                    fst = seg0 + int(li[crow[0]]) - li0
                     input_dict = self._prepare_latent_input(lat_c, act_c, frame_st_id=fst)
-                    self._tf(self._repeat_input_for_cfg(input_dict['latent_res_lst']), 2, False, fst, len(rows))
-                    self._tf(self._repeat_input_for_cfg(input_dict['action_res_lst']), 2, True, fst, len(rows))
-                base += int(li[-1]) - li0 + 1 + gap
-                self.episode_log["prefill"].append(f"{ep}:{group}")
-        self.ep_frame0 = self.frame_st_id = base
-        logger.info(f"prefilled {len(paths)} episode(s) ({'+'.join(groups)}), episode starts at frame {base}")
+                    self._tf(self._repeat_input_for_cfg(input_dict['latent_res_lst']), 2, False, fst, len(crow))
+                    self._tf(self._repeat_input_for_cfg(input_dict['action_res_lst']), 2, True, fst, len(crow))
+                if not aligned:
+                    base += li1 - li0 + 1 + gap
+                self.episode_log["prefill"].append(dict(path=str(ep), group=group, actions=it.get("actions", "executed"),
+                                                        frames=[li0, li1], role=it.get("role")))
+        new_slots = self._cache()["mask"] & ~mask_before
+        alpha = float(spec.get("attn_scale", 1.0))
+        if alpha != 1.0 and new_slots.any():
+            for attn in self._attn1:  # q.k logits of the memory tokens scale with alpha (keys are post-norm/RoPE)
+                attn.attn_caches[self.cache_name]["k"][:, new_slots] *= alpha
+        self.ctx_slots = new_slots
+        self.ep_frame0 = self.frame_st_id = start if aligned else base
+        logger.info(f"in-context memory: {len(items)} item(s), {int(new_slots.sum())} tokens, episode continues at "
+                    f"frame {self.frame_st_id} ({'aligned' if aligned else 'sequential'})")
 
     # ------------------------------------------------------------------------------------------ inference
 

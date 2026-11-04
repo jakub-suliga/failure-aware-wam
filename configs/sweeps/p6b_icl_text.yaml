@@ -1,0 +1,12 @@
+# P6b: WELCHER TEXT begleitet die Erinnerung (Erinnerung = vorgestellter + realer Fehlversuch) und WOHER kommt die
+# Analyse (Orakel / Vorhersagefehler + Rollout / nur Vorhersagefehler). VLM-Variante in p6b_icl_text_vlm.
+name: p6b_icl_text
+out: results/sweeps/p6b_icl_text
+episodes: 30
+per_job: 10
+n_par: 2
+time: "16:00:00"
+tasks: [move_playingcard_away, place_mouse_pad, pick_diverse_bottles, stack_blocks_two]
+configs: [table_h_m05, demo_randomized]
+methods: [icl_fail_predobs, icl_txt_instruction, icl_txt_negative, icl_txt_corr_neg, icl_txt_note,
+          icl_fail_predobs_PR, icl_fail_window_PR, icl_fail_predobs_P]
