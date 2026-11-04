@@ -155,6 +155,13 @@ class FawamServer(VA_Server):
 
     # ------------------------------------------------------------------------------------------ memory usage probe
 
+    def _pose_probe(self):
+        if not hasattr(self, "_pp"):
+            p = ROOT / "artifacts" / "probe" / "pose_probe.npz"
+            from fawam.pose_probe import PoseProbe
+            self._pp = PoseProbe(p) if p.exists() else None
+        return self._pp
+
     def _memory_mask(self):
         """Occupied memory slots (None if no memory is in the cache)."""
         if self.ctx_slots is None:
@@ -392,6 +399,10 @@ class FawamServer(VA_Server):
         if sel == "same_seed":
             hit = [e for e in cands if int(e.get("seed", -1)) == int(item.get("seed", -2))]
             return [str(bank / e["path"]) for e in hit[:k]]
+        if item.get("exclude_seed") is not None:  # e.g. the failure of ANOTHER seed (content manipulation)
+            cands = [e for e in cands if int(e.get("seed", -1)) != int(item["exclude_seed"])]
+            if not cands:
+                return []
         if sel == "random":
             idx = self._rng.choice(len(cands), size=min(k, len(cands)), replace=False)
             return [str(bank / cands[i]["path"]) for i in idx]
@@ -417,6 +428,31 @@ class FawamServer(VA_Server):
         groups = ["pred", "obs"] if spec.get("include_pred") else ["obs"]
         items += [dict(path=p, groups=groups) for p in legacy]
         return items
+
+    def _manipulate(self, lat, rows, manip):
+        """Content manipulation of a memory segment (docs/ICL.md 6a): if the model really reads the content, these
+        should hurt. lat (1, C, F, 24, 20) on the CPU; only `rows` are written to the cache."""
+        if not manip or manip == "no_actions":
+            return lat
+        lat = lat.clone()
+        g = torch.Generator().manual_seed(1234)
+        if manip == "shuffle_time":
+            lat[:, :, rows] = lat[:, :, rows[torch.randperm(len(rows), generator=g).numpy()]]
+        elif manip == "reverse_time":
+            lat[:, :, rows] = lat[:, :, rows[::-1].copy()]
+        elif manip == "noise":
+            lat[:, :, rows] = torch.randn(lat[:, :, rows].shape, generator=g)
+        elif manip.startswith("blank_"):
+            cams = {"blank_head": ["cam_high"], "blank_wrists": ["cam_left_wrist", "cam_right_wrist"],
+                    "blank_left": ["cam_left_wrist"], "blank_right": ["cam_right_wrist"]}[manip]
+            for cam in cams:
+                hs, ws = self.LATENT_CAM_SLICES[cam]
+                sub = lat[:, :, rows]
+                sub[..., hs, ws] = 0.0  # 0 in the normalized latent space = the VAE's mean latent
+                lat[:, :, rows] = sub
+        else:
+            raise ValueError(f"unknown memory manipulation {manip}")
+        return lat
 
     def _segment_rows(self, li, item, ana):
         """Rows of an episode to write: all, or a window around the analysed failure ({"before": b, "after": a})."""
@@ -476,6 +512,7 @@ class FawamServer(VA_Server):
                 rows = self._segment_rows(li, it, ana)
                 if len(rows) == 0:
                     continue
+                lat = self._manipulate(lat, rows, it.get("manip"))
                 lat = lat.to(self.device, self.dtype)
                 li0, li1 = int(li[rows[0]]), int(li[rows[-1]])
                 seg0 = start if aligned else base
@@ -485,6 +522,8 @@ class FawamServer(VA_Server):
                     lat_c = lat[:, :, crow]
                     act = planned[c][:, crow - first_row]
                     act_c = self.preprocess_action(act).to(lat_c)
+                    if it.get("manip") == "no_actions":
+                        act_c = torch.zeros_like(act_c)
                     fst = seg0 + int(li[crow[0]]) - li0
                     input_dict = self._prepare_latent_input(lat_c, act_c, frame_st_id=fst)
                     part = MEM_PARTS.index(f"{it.get('role', 'failure')}:{group}") \
@@ -532,7 +571,7 @@ class FawamServer(VA_Server):
         return self._tf(self._repeat_input_for_cfg(input_dict['latent_res_lst']), update_cache, False, frame_st_id,
                         self.job_config.frame_chunk_size)
 
-    def _denoise_video(self, latents, timesteps, latent_cond, frame_st_id, first, probe=False):
+    def _denoise_video(self, latents, timesteps, latent_cond, frame_st_id, first, probe=False, extra_excl=None):
         cfg = self.job_config
         fcs = cfg.frame_chunk_size
         records = []
@@ -540,6 +579,8 @@ class FawamServer(VA_Server):
         probe_step = (len(timesteps) - 1) // 2
         excl = self._exclusion(action_before=None if self.method.video_history_keep is None
                                else frame_st_id - self.method.video_history_keep)
+        if extra_excl is not None:
+            excl = extra_excl if excl is None else (excl | extra_excl)
         with self._excluding(excl):
             for i, t in enumerate(timesteps[:-1]):
                 if mem is not None and i == probe_step:
@@ -644,6 +685,8 @@ class FawamServer(VA_Server):
 
         with torch.no_grad():
             self._mem_video = self._mem_video_infl = self._mem_video_brk = None
+            mem_now = self._memory_mask() if (m.measure_memory and m.memory_imagination) else None
+            noise0 = cands[0].clone() if mem_now is not None else None
             results = [self._denoise_video(c, timesteps, latent_cond, frame_st_id, first, probe=(ci == 0))
                        for ci, c in enumerate(cands)]
             idx, scores = self._score_candidates([r[0] for r in results], latent_cond, frame_st_id, noise_seed)
@@ -707,10 +750,27 @@ class FawamServer(VA_Server):
                 a_nm = self.action_scheduler.step(p_nm, t, a_nm, return_dict=False)
                 a_nm[:, :, 0:1] = action_cond if first else a_nm[:, :, 0:1]
             a_nm[:, ~self.action_mask] *= 0
-            d = np.abs(self.postprocess_action(actions.clone()) - self.postprocess_action(a_nm))  # 16, F, H raw
+            sd = self.postprocess_action(actions.clone()) - self.postprocess_action(a_nm)  # 16, F, H raw, signed
+            d = np.abs(sd)
             mem_rec.update(cf_dxyz_left=float(d[0:3].mean()), cf_dxyz_right=float(d[8:11].mean()),
                            cf_dz_left=float(d[2].mean()), cf_dz_right=float(d[10].mean()),
-                           cf_dgrip=float(d[[7, 15]].mean()))
+                           cf_dgrip=float(d[[7, 15]].mean()),
+                           cf_sdz_left=float(sd[2, -1].mean()), cf_sdz_right=float(sd[10, -1].mean()))
+        if mem_rec is not None and noise0 is not None:
+            # imagination vs. action: where does the model IMAGINE the grippers with and without the memory?
+            lat_nm, _ = self._denoise_video(noise0, timesteps, latent_cond, frame_st_id, first, extra_excl=mem_now)
+            with self._excluding(mem_now):
+                _, hid_nm = self._run_with_hidden_capture(
+                    fcs, partial(self._video_step, lat_nm, timesteps[-1], latent_cond, frame_st_id, 0))
+            pp = self._pose_probe()
+            if pp is not None:
+                p_mem = pp(hidden.float().numpy())[-1]  # last imagined frame of the chunk, [left xyz, right xyz]
+                p_nm = pp(hid_nm.float().numpy())[-1]
+                d = p_mem - p_nm
+                mem_rec.update(imag_dx_left=float(d[0]), imag_dy_left=float(d[1]), imag_dz_left=float(d[2]),
+                               imag_dx_right=float(d[3]), imag_dy_right=float(d[4]), imag_dz_right=float(d[5]))
+            mem_rec["imag_latent_change"] = float((latents.float() - lat_nm.float()).norm() /
+                                                  (latents.float().norm() + 1e-8))
         if mem_rec is not None:
             self.episode_log.setdefault('memory', []).append(mem_rec)
         if m.action_noise:
@@ -813,7 +873,10 @@ class FawamServer(VA_Server):
                 gm.attrs['parts'] = json.dumps(MEM_PARTS)
                 gm.attrs['cams'] = json.dumps(MEM_CAMS)
                 for key in ('share_action', 'share_video', 'infl_action', 'infl_video', 'memory_tokens',
-                            'cf_dxyz_left', 'cf_dxyz_right', 'cf_dz_left', 'cf_dz_right', 'cf_dgrip'):
+                            'cf_dxyz_left', 'cf_dxyz_right', 'cf_dz_left', 'cf_dz_right', 'cf_dgrip',
+                            'cf_sdz_left', 'cf_sdz_right',
+                            'imag_dx_left', 'imag_dy_left', 'imag_dz_left', 'imag_dx_right', 'imag_dy_right',
+                            'imag_dz_right', 'imag_latent_change'):
                     gm[key] = np.array([np.nan if r.get(key) is None else r.get(key, np.nan) for r in mem],
                                        dtype=np.float64)
             if log.get('ttt_update'):

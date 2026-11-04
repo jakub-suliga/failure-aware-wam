@@ -1,0 +1,19 @@
+# P6f: NUTZT das Modell die Erinnerung, und wofür? (docs/ICL.md 6a)
+#  - Vorstellung vs. Aktion (+imagcf): die vorgestellten Frames werden zusätzlich ohne Erinnerung entrauscht; die
+#    Pose-Probe misst, ob die Erinnerung die vorgestellte Greiferposition verschiebt oder nur die Aktion
+#  - Inhalts-Manipulationen: Zeit mischen/umdrehen, Rauschen, Kamera schwärzen, Aktionen weglassen, Fehlversuch eines
+#    anderen Seeds. Trainingsfrei und meta-trainiert (failfix_predobs). Liest das Modell den Inhalt, sinkt der Erfolg.
+# Attention-Aufschlüsselung (Teil / Kamera / Fehlerfenster) und Einfluss werden in jedem Versuch mit Erinnerung
+# gemessen; Auswertung: python -m fawam.analysis_gap memory results/sweeps/p6f_icl_analysis
+name: p6f_icl_analysis
+out: results/sweeps/p6f_icl_analysis
+episodes: 30
+per_job: 10
+n_par: 2
+time: "20:00:00"
+tasks: [move_playingcard_away, place_mouse_pad, pick_diverse_bottles, stack_blocks_two]
+configs: [table_h_m05, table_h_m10]
+methods: [icl_fail_predobs+imagcf, icl_meta_predobs+imagcf, icl_meta_window+imagcf, icl_type_ttt_wam+imagcf,
+          icl_type_film_memory+imagcf, icl_type_film_error+imagcf, icl_type_prompt_vane+imagcf,
+          icl_manip_shuffle_time, icl_manip_reverse_time, icl_manip_noise, icl_manip_blank_head, icl_manip_blank_wrists, icl_manip_no_actions, icl_manip_otherseed,
+          icl_meta_manip_shuffle_time, icl_meta_manip_reverse_time, icl_meta_manip_noise, icl_meta_manip_blank_head, icl_meta_manip_blank_wrists, icl_meta_manip_no_actions, icl_meta_manip_otherseed]

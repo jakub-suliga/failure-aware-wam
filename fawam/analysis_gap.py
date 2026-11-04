@@ -137,6 +137,25 @@ def memory(a):
                                                          np.maximum(g["share_video"][()], 1e-8)))
             if "cf_dxyz_left" in g:
                 r["cf_dxyz_mm"] = float(np.nanmean(np.maximum(g["cf_dxyz_left"][()], g["cf_dxyz_right"][()]))) * 1000
+            for stream in ("action", "video"):  # attention breakdown, normalised by the token share of each part
+                if f"brk_{stream}_part" in g:
+                    parts = json.loads(g.attrs["parts"])
+                    pm, ps = g[f"brk_{stream}_part"][()].mean(0), g[f"brk_{stream}_part_share"][()].mean(0)
+                    tot = pm.sum() + 1e-12
+                    for i, name in enumerate(parts):
+                        if ps[i] > 0:
+                            r[f"{stream}:{name}:frac"] = float(pm[i] / tot)       # share of the memory attention
+                    cm = g[f"brk_{stream}_cam"][()].mean(0)
+                    for i, name in enumerate(json.loads(g.attrs["cams"])):
+                        r[f"{stream}:cam:{name}"] = float(cm[i] / (cm.sum() + 1e-12))
+                    wm = g[f"brk_{stream}_win"][()].mean(0)
+                    r[f"{stream}:in_failure_window"] = float(wm[1] / (wm.sum() + 1e-12))
+            if "imag_dz_left" in g:  # imagination vs. action shift caused by the memory (signed, mm)
+                arm = 0 if np.nanmean(np.abs(g["cf_sdz_left"][()])) >= np.nanmean(np.abs(g["cf_sdz_right"][()])) else 1
+                side = ("left", "right")[arm]
+                r["action_dz_mm"] = float(np.nanmean(g[f"cf_sdz_{side}"][()])) * 1000
+                r["imagined_dz_mm"] = float(np.nanmean(g[f"imag_dz_{side}"][()])) * 1000
+                r["imag_latent_change"] = float(np.nanmean(g["imag_latent_change"][()]))
             if "ttt_update" in f["fawam"].attrs:
                 r["ttt_update"] = float(np.mean(list(json.loads(f["fawam"].attrs["ttt_update"]).values())))
             rows.append(r)
@@ -146,9 +165,14 @@ def memory(a):
         print("no episodes with a memory")
         return
     cols = [c for c in ("attn_ratio_action", "attn_ratio_video", "infl_action", "infl_video", "cf_dxyz_mm",
-                        "ttt_update", "memory_tokens") if c in df]
+                        "action_dz_mm", "imagined_dz_mm", "imag_latent_change", "ttt_update", "memory_tokens")
+            if c in df]
+    brk_cols = sorted(c for c in df.columns if c.count(":") >= 1)
     with pd.option_context("display.width", 250, "display.max_rows", 500):
         print(df.groupby("method")[cols].mean().round(3))
+        if brk_cols:
+            print("\nwhich part of the memory gets the attention (fraction of the memory attention)")
+            print(df.groupby("method")[brk_cols].mean().round(3).T)
         print("\nsuccess vs. failure (does using the memory go with success?)")
         print(df.groupby(["method", "success"])[["attn_ratio_action", "infl_action"]].mean().unstack().round(3))
     out = Path(a.sweep)

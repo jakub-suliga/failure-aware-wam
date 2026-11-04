@@ -150,6 +150,9 @@ inneren Schritt.
 | `svf_salt` | Skalierung der Singulärwerte der Key-Projektionen (Self + Cross, Layer 22–29) | SALT |
 | `dense_last2` | Full-Finetuning der Layer 28–29 (Attention + FFN) | Paper-Baseline (Full Finetuning) |
 | `ttt_plus_adapterplus`, `lora_plus_prompt` | Kombinationen | – |
+| `film_memory` | **FiLM aus der Erinnerung**: Die gemittelten Erinnerungs-Tokens eines Blocks → Low-Rank-MLP → Offset von Scale/Shift/Gate der AdaLN-Modulation. Global statt pro Token | FiLM / AdaLN-Zero |
+| `film_error` | **FiLM aus dem Fehlervektor**: Δ der Analyse, Arm, Fehlertyp, Lücken-Statistik (16 Werte). Reicht eine strukturierte Fehlerbeschreibung ohne Bilder? | – |
+| `film_memory_plus_adapterplus` | FiLM + Adapter+ | – |
 
 Jeder Typ läuft zusätzlich ohne Erinnerung (`icl_type_<t>_noctx`). Nur wenn der Typ **mit** Erinnerung besser ist als
 **ohne**, nutzt er wirklich den Kontext und ist nicht einfach ein besser finetuntes Modell.
@@ -188,6 +191,28 @@ KV-Cache liegt (`fawam/server.py`, `Method.measure_memory`, Standard an), drei D
 | **Einfluss** auf die Vorhersage | gleiche Eingabe einmal mit, einmal mit ausgeblendeter Erinnerung: relative Änderung der Video- bzw. Aktionsvorhersage | 0 = die Erinnerung ändert nichts |
 | **Kontrafakt** (Standard bei ICL-Versuchen) | der ganze Aktions-Chunk wird ein zweites Mal ohne Erinnerung entrauscht (gleiches Rauschen, ohne Cache-Commit): mittlere Abweichung der Arm-Positionen in mm, Greifhöhe, Greifer | wie viele Millimeter die Erinnerung die Bewegung verschiebt |
 | **Fast-Weight-Änderung** (nur TTT-Adapter) | ‖W₁ − W_init‖ / ‖W_init‖ pro Layer nach dem Einlesen | wie stark die Erinnerung die Gewichte bewegt |
+
+**Aufschlüsselung der Attention** (bei jeder Messung): Jedes Erinnerungs-Token wird beim Einlesen markiert. Daraus
+ergibt sich der Anteil der Erinnerungs-Attention nach
+- **Teil** (vorgestellter Fehlversuch / realer Fehlversuch / Fehlerkarte / Demo / eigener Erfolg),
+- **Kamera** (Kopf / linkes / rechtes Handgelenk / Aktions-Tokens),
+- **Zeit** (im Fehlerfenster −4 … +2 Latents oder außerhalb).
+
+**Inhalts-Manipulationen** (`icl_manip_*` trainingsfrei, `icl_meta_manip_*` mit Meta-Adapter, Sweep `p6f`): Zeit mischen,
+Zeit umdrehen, Rauschen statt Bildern, Kopfkamera bzw. Handgelenkkameras schwärzen, Aktionen weglassen, Fehlversuch
+eines anderen Seeds (`fail_other_seed`, Fehler-Bank). Sinkt der Erfolg bei einer Manipulation, nutzt das Modell genau
+diesen Inhalt.
+
+**Vorstellung vs. Aktion** (`+imagcf`, Sweep `p6f`): Die vorgestellten Frames jedes Chunks werden zusätzlich ohne
+Erinnerung entrauscht. Die Pose-Probe (1,1 cm Fehler) liest aus beiden Versionen die vorgestellte Greiferposition ab.
+Neben der signierten Aktionsverschiebung (mm) steht damit die Verschiebung der Vorstellung (mm):
+- Ändert die Erinnerung nur die Aktion, ist es ein „Reflex“.
+- Ändert sie zuerst die Vorstellung, plant das Modell um.
+
+Das kostet etwa +60 % Zeit pro Versuch mit Erinnerung und ist nur in `p6f` aktiv.
+
+Getestet ohne Modell (`fawam/tests/test_memory_probe.py`): Die Attention landet im richtigen Teil, ausgeblendete
+Erinnerung zählt nicht, Manipulationen ändern nur das Segment. Mit echtem Modell noch nicht.
 
 Auswertung: `python -m fawam.analysis_gap memory results/sweeps/<sweep>` erzeugt pro Methode:
 - die mittlere Aufmerksamkeitsquote, den Einfluss und den Kontrafakt,
@@ -231,10 +256,10 @@ Grobe Kosten: ~45 min pro Job (10 Seeds, bis zu 2 Versuche, 2 Paare pro GPU, mit
 | 1 | Setup + Smoke + Screening-Smoke. Parallel P0 (TABLE4 × z00/m05/m10/m075/Hard) und **P7 Meta-Daten** (160 Jobs) | ~250 |
 | 2 | Analyse auf P0/P7, Demo-Banken. **Meta-Training starten:** 10 Format-/Ablations-Adapter + 23 Typ-Adapter (je ~25 h). Parallel **p6a, p6b, p6c** (trainingsfrei, 984 Jobs) | ~750 + ~800 |
 | 3–4 | p6a–c laufen weiter, Meta-Adapter werden fertig | – |
-| 4–6 | **p6d** (Formate, 513 Jobs) und **p6e** (alle 23 Typen, 1128 Jobs) | ~1250 |
+| 4–6 | **p6d** (Formate, 513 Jobs), **p6e** (alle 26 Typen inkl. FiLM, 1272 Jobs), **p6f** (Nutzungsanalyse: Manipulationen, Vorstellung vs. Aktion, 504 Jobs) | ~1700 |
 | 7 | Auswertung (`compare`, `memory`), Nachläufe für unvollständige Zellen (`--status`, erneut `--submit`) | – |
 
-Zusammen ~3000 GPU-h. Mit ~20 gleichzeitigen GPUs passt das in eine Woche. Mit weniger GPUs bleibt die Reihenfolge
+Zusammen ~3500 GPU-h. Mit ~22 gleichzeitigen GPUs passt das in eine Woche. Mit weniger GPUs bleibt die Reihenfolge
 gleich und es dauert entsprechend länger. Alle Sweeps sind fortsetzbar: Fertige Zellen werden übersprungen.
 
 ## 7. Ablauf auf dem Cluster

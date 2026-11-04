@@ -125,6 +125,9 @@ ADAPTER_TYPES = {
     "dense_last2":      ("combo", "--dense_blocks 28 29 --dense_targets attn ffn"),  # full fine-tuning (2 blocks)
     "ttt_plus_adapterplus": ("combo", "--ttt_dim 128 --use_adapterplus"),
     "lora_plus_prompt": ("combo", "--use_lora --lora_targets attn --prompt_tokens 16"),
+    "film_memory":      ("combo", "--film_source memory"),                            # FiLM from the memory
+    "film_error":       ("combo", "--film_source error"),                             # FiLM from the failure vector
+    "film_memory_plus_adapterplus": ("combo", "--film_source memory --use_adapterplus"),
 }
 _META_T = _META.replace("--steps 12000", "--steps 6000")
 for _t, (_kind, _extra) in ADAPTER_TYPES.items():
@@ -180,6 +183,13 @@ def banks(a):
             continue
         build(argparse.Namespace(roots=[str(src)], out=str(ROOT / "artifacts" / "demo_bank" / cfg), success=True,
                                  settings=None, drivers=None))
+    # failure banks (own failures of many seeds) for the memory manipulation "fail_other_seed"
+    for cfg in ICL_CONFIGS:
+        roots = [ROOT / ROLL.format(cfg=cfg), ROOT / "results/sweeps/p7_meta_data/base" / cfg]
+        roots = [str(r) for r in roots if r.exists()]
+        if roots:
+            build(argparse.Namespace(roots=roots, out=str(ROOT / "artifacts" / "fail_bank" / cfg), success=False,
+                                     settings=None, drivers=["policy"]))
 
 
 def methods(a):

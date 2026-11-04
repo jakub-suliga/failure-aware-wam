@@ -56,6 +56,7 @@ class Method:
     # does the model use the memory? (docs/ICL.md, section 6c) - measured whenever a memory is in the KV cache
     measure_memory: bool = True        # attention mass on memory tokens per layer + influence at one denoising step
     memory_counterfactual: str = "step"  # step | full (whole action chunk again without memory: delta in metres) | off
+    memory_imagination: bool = False   # also denoise the imagined frames without memory; pose probe on both
 
     # --- online intervention (client, B/C) ---------------------------------------------------------------------
     intervention: dict = None          # see INTERVENTION_DEFAULTS
@@ -129,7 +130,10 @@ ICL_DEFAULTS = dict(
                              # the retry: context reset + memory) | both
     demo_bank="artifacts/demo_bank/{setting}",
     max_items=3,
-    counterfactual="full",   # memory usage measurement in the attempt with memory: step | full | off
+    counterfactual="full",   # memory usage measurement in the attempt with memory: step | full | full_video | off
+    manip=None,              # content manipulation of the failure memory: shuffle_time | reverse_time | noise |
+                             # blank_head | blank_wrists | no_actions (docs/ICL.md 6a)
+    fail_bank="artifacts/fail_bank/{setting}",  # failures of other seeds (content fail_other_seed)
 )
 
 # ---------------------------------------------------------------------------------------------- presets
@@ -340,6 +344,8 @@ PRESETS = {
     "icl_plus_adapter": dict(learn=dict(mode="both", signals=["oracle", "gap"],
                                         meta_adapter="artifacts/adapters/failfix_predobs")),
     "cf_full": dict(memory_counterfactual="full"),
+    # imagination vs. action: also denoise the imagined frames without the memory (pose probe on both, ~+60% time)
+    "imagcf": dict(learn=dict(icl=dict(counterfactual="full_video"))),
     "cf_off": dict(memory_counterfactual="off", measure_memory=False),
     "lff_adapter_lifelong": dict(learn=dict(mode="adapter", signals=["oracle", "gap"], persist=True)),
     "lff_lifelong_PRI": dict(learn=dict(mode="adapter", signals=["gap", "rollout", "imagine"], persist=True)),
@@ -351,6 +357,19 @@ META_TYPES = ["adapterplus", "adapterplus_b32", "adapterplus_b512", "houlsby", "
               "adapterplus_action", "adapterplus_first10", "adapterplus_last10", "lora_r16_attn", "lora_r16_attn_ffn",
               "lora_r64_all", "ia3", "adaln", "ia3_adaln", "prompt_t3vf", "prompt_vane", "ttt_wam", "ttt_wam_both",
               "svf_salt", "dense_last2", "ttt_plus_adapterplus", "lora_plus_prompt"]
+# content manipulations of the memory (training-free and meta-trained, memory = imagined + observed failure)
+MANIPS = ["shuffle_time", "reverse_time", "noise", "blank_head", "blank_wrists", "no_actions"]
+for _mp in MANIPS:
+    PRESETS[f"icl_manip_{_mp}"] = dict(learn=dict(mode="icl", signals=["oracle", "gap"], icl=dict(manip=_mp)))
+    PRESETS[f"icl_meta_manip_{_mp}"] = dict(learn=dict(mode="icl", signals=["oracle", "gap"],
+                                                       meta_adapter="artifacts/adapters/failfix_predobs",
+                                                       icl=dict(manip=_mp)))
+PRESETS["icl_manip_otherseed"] = dict(learn=dict(mode="icl", signals=["oracle", "gap"],
+                                                 icl=dict(content=["fail_other_seed"])))
+PRESETS["icl_meta_manip_otherseed"] = dict(learn=dict(mode="icl", signals=["oracle", "gap"],
+                                                      meta_adapter="artifacts/adapters/failfix_predobs",
+                                                      icl=dict(content=["fail_other_seed"])))
+META_TYPES += ["film_memory", "film_error", "film_memory_plus_adapterplus"]
 for _t in META_TYPES:
     PRESETS[f"icl_type_{_t}"] = dict(learn=dict(mode="icl", signals=["oracle", "gap"],
                                                 meta_adapter=f"artifacts/adapters/failfix_type_{_t}",
@@ -361,10 +380,11 @@ for _t in META_TYPES:
 
 
 def _merge(base: dict, over: dict):
+    """Recursive merge (so "icl_x+imagcf" only changes learn.icl.counterfactual)."""
     out = copy.deepcopy(base)
     for k, v in over.items():
         if isinstance(v, dict) and isinstance(out.get(k), dict):
-            out[k] = {**out[k], **v}
+            out[k] = _merge(out[k], v)
         else:
             out[k] = copy.deepcopy(v)
     return out

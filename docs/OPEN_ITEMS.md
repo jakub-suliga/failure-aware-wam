@@ -54,6 +54,16 @@ Details zu den Methoden stehen in [EXPERIMENTS.md](EXPERIMENTS.md), die Befunde 
       Läuft automatisch im Screening-Smoke mit.
 - [ ] Attention-Messung nutzt nur den bedingten CFG-Zweig und einen Denoising-Schritt pro Chunk. Bei Bedarf mehr Schritte.
 
+- [ ] Mit echtem Modell prüfen (Screening-Smoke reicht):
+      - Token-Markierung der Erinnerung (Teil/Kamera/Fenster),
+      - Manipulationen im Prefill,
+      - `fail_other_seed`: braucht `artifacts/fail_bank/<setting>` aus `adapter_grid.py banks`,
+      - Vorstellung-vs.-Aktion-Kontrafakt (`+imagcf`),
+      - FiLM-memory-Statistik beim Prefill und FiLM-error aus der Reset-Nachricht.
+- [ ] FiLM-error: Der Fehlervektor kommt aus der Analyse. Bei `signals=gap` ohne Δ enthält er nur Typ und Lücke.
+- [ ] Die Vorstellungs-Probe ist auf Basismodell-Hidden-States gefittet. Mit Meta-Adapter verschiebt sich die
+      Repräsentation evtl. leicht. Gegenprüfen mit `imag_latent_change`.
+
 ## 1b. Learn-from-Failure (Kern, [METHOD.md](METHOD.md))
 
 - [ ] **Lernt der Adapter die Korrektur?** `python -m fawam.tests.test_lff_effect <fail ep> <adapter>` vergleicht die

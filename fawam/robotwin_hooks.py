@@ -257,7 +257,7 @@ def make_context_spec(icl, ep_dir, seed, setting, seed_failures=(), successes=()
     from pathlib import Path
     seg = "full" if icl["segment"] == "full" else dict(icl["window"])
     fail_item = lambda p: dict(path=str(p), groups=list(icl["groups"]), segment=seg, actions=icl["actions"],
-                               role="failure")
+                               role="failure", manip=icl.get("manip"))
     bank = icl["demo_bank"].format(setting=setting or "")
     bank = bank if Path(bank).is_absolute() else str(Path(__file__).resolve().parents[1] / bank)
     items = []
@@ -269,6 +269,11 @@ def make_context_spec(icl, ep_dir, seed, setting, seed_failures=(), successes=()
         elif kind.startswith("demo_"):
             sel = {"demo_same_seed": "same_seed", "demo_nearest": "nearest", "demo_random": "random"}[kind]
             items.append(dict(bank=bank, select=sel, seed=int(seed), k=1, groups=["obs"], role="demo"))
+        elif kind == "fail_other_seed":
+            fb = icl.get("fail_bank", "artifacts/fail_bank/{setting}").format(setting=setting or "")
+            fb = fb if Path(fb).is_absolute() else str(Path(__file__).resolve().parents[1] / fb)
+            items.append(dict(bank=fb, select="random", exclude_seed=int(seed), k=1, groups=list(icl["groups"]),
+                              role="failure", manip=icl.get("manip")))
         elif kind == "success_own":
             items += [dict(path=p, groups=["obs"], role="success") for p in list(successes)[-icl["max_items"]:]]
     return dict(items=items, gap=int(icl["gap"]), position=icl["position"], attn_scale=float(icl["attn_scale"]))
@@ -411,7 +416,9 @@ class LearnFromFailure:
         if c["mode"] in ("icl", "both"):
             prefill = self.build_context(ep_dir, ana, seed)
             icl = c["icl"]
-            m.memory_counterfactual = icl.get("counterfactual", "full")  # how much does the memory move the actions?
+            cf = icl.get("counterfactual", "full")  # how much does the memory move the actions (and the imagination)?
+            m.memory_counterfactual = "full" if cf == "full_video" else cf
+            m.memory_imagination = cf == "full_video"
             if icl["timing"] in ("trigger", "both"):
                 m.trigger_prefill = prefill
                 m.intervention = {**INTERVENTION_DEFAULTS, "action": "reset_memory", "max_interventions": 1}
