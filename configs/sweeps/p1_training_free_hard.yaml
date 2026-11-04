@@ -1,0 +1,9 @@
+name: p1_training_free_hard
+out: results/sweeps/p1_training_free_hard
+episodes: 50
+per_job: 15
+n_par: 3
+time: "12:00:00"
+tasks: [handover_block, pick_diverse_bottles, stack_blocks_three, hanging_mug]
+configs: [demo_randomized]
+methods: [base, ig2, acthist2, ig2+acthist2, bon4_medoid, bon4_probe, neg_drop, neg_generic, steer_l19_a1]

@@ -1,0 +1,11 @@
+# P1b: online detection + intervention (B) and retries with memory (E2/E4)
+name: p1_intervention
+out: results/sweeps/p1_intervention
+episodes: 30
+per_job: 15
+n_par: 3
+time: "14:00:00"
+tasks: [move_playingcard_away, place_mouse_pad, pick_diverse_bottles, handover_block]
+configs: [table_h_m05, table_h_m10, demo_randomized]
+methods: [base, reset_on_gap, truncate_on_gap, reprompt_on_gap, neg_on_gap, oracle_on_gap, reset_on_oracle,
+          ig2+reset_on_gap, retry_plain, retry_memory, retry_text, retry_memory_text]

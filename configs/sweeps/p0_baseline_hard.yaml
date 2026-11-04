@@ -1,0 +1,10 @@
+# P0: base LingBot-VA in the hard setting (domain randomization) - failure statistics on more tasks
+name: p0_baseline_hard
+out: results/sweeps/p0_baseline_hard
+episodes: 100
+per_job: 24
+n_par: 3
+time: "12:00:00"
+tasks: [handover_block, pick_diverse_bottles, stack_blocks_three, hanging_mug, blocks_ranking_rgb, place_cans_plasticbox, open_microwave, put_bottles_dustbin]
+configs: [demo_randomized]
+methods: [base]

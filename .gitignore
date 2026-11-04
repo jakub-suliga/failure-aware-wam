@@ -10,3 +10,7 @@
 *.mp4
 __pycache__/
 *.pyc
+# fawam artifacts: big / regenerable ones stay local; gap_stats.json and artifacts/probe/ (KBs) are tracked
+/artifacts/text_emb/
+/artifacts/adapters/
+/artifacts/demo_bank/

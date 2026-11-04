@@ -1,0 +1,12 @@
+# P1: training-free test-time methods (A1-A7) under the table-height shift; z00 checks that nothing breaks nominally
+name: p1_training_free_table
+out: results/sweeps/p1_training_free_table
+episodes: 30
+per_job: 15
+n_par: 3
+time: "12:00:00"
+tasks: [move_playingcard_away, place_mouse_pad, pick_diverse_bottles, stack_blocks_two]
+configs: [table_h_m05, table_h_m10, table_h_z00]
+methods: [base, ig1.5, ig2, ig3, ig2_half, acthist0, acthist2, acthist4, vidhist0, ig2+acthist2,
+          bon4_medoid, bon4_random, bon4_probe, bon8_medoid, ag2, vg3, vg7, neg_missed, neg_generic,
+          steer_l19_a1, steer_l19_a3, steps50]

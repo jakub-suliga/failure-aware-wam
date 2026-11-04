@@ -1,0 +1,12 @@
+# P2: training / in-context data. The planner's trajectory is replayed through the policy's own observation and
+# latent pipeline (driver expert_replay); the model's proposal per chunk is recorded next to the expert chunk.
+name: p2_expert_data
+out: results/sweeps/p2_expert_data
+driver: expert_replay
+episodes: 60
+per_job: 30
+n_par: 3
+time: "10:00:00"
+tasks: [move_playingcard_away, place_mouse_pad, pick_diverse_bottles, stack_blocks_two, place_shoe, move_can_pot, lift_pot, handover_block]
+configs: [table_h_z00, table_h_m025, table_h_m05, table_h_m075, table_h_m10, table_h_p05, demo_randomized]
+methods: [base]

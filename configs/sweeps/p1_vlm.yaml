@@ -1,0 +1,11 @@
+# P1c: VLM failure analysis in the loop (C2). Starts a vLLM server inside each job (needs PY_VLLM env).
+name: p1_vlm
+out: results/sweeps/p1_vlm
+episodes: 30
+per_job: 10
+n_par: 2
+time: "14:00:00"
+vlm: true
+tasks: [move_playingcard_away, place_mouse_pad, pick_diverse_bottles, handover_block]
+configs: [table_h_m05, demo_randomized]
+methods: [vlm_on_gap, oracle_on_gap]

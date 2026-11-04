@@ -1,0 +1,122 @@
+"""Imagination-execution gap at the first grasp (docs/FINDINGS.md, section 5) and method comparison tables.
+
+  python -m fawam.analysis_gap gap results/table_height results/table_height_n10      -> gap table per setting
+  python -m fawam.analysis_gap compare results/sweeps/<sweep>                         -> success per method x setting
+
+`gap`: for every episode, the first time a gripper is commanded closed; at that latent the cosine distance between the
+predicted and the observed latent of that arm's wrist camera, plus the commanded vs. object height.
+`compare`: success rates with Wilson 95% intervals per (method, task, setting) from episode.h5 attributes, written to
+<sweep>/summary.csv and printed as a pivot.
+"""
+import argparse
+import json
+from pathlib import Path
+
+import h5py
+import numpy as np
+import pandas as pd
+
+from fawam.latent_data import find_episodes
+
+
+def first_close_gap(f):
+    raw = f["actions/executed_raw_action"][()]
+    li = f["actions/executed_latent_index"][()]
+    closes = []
+    for arm, ch in ((0, 7), (1, 15)):
+        hit = np.where(raw[:, ch] < 0.5)[0]
+        closes.append(hit[0] if len(hit) else None)
+    valid = [(k, arm) for arm, k in enumerate(closes) if k is not None]
+    if not valid:
+        return None
+    k, arm = min(valid)
+    L = int(li[k])
+    cam = ["cam_left_wrist", "cam_right_wrist"][arm]
+    pi = {int(x): i for i, x in enumerate(f["model/pred/latent_index"][()])}
+    oi = {int(x): i for i, x in enumerate(f["model/obs/latent_index"][()])}
+    if L not in pi or L not in oi:
+        return None
+    p = f[f"model/pred/latents/{cam}"][pi[L]].astype(np.float32).ravel()
+    o = f[f"model/obs/latents/{cam}"][oi[L]].astype(np.float32).ravel()
+    row = dict(close_step=int(f["actions/executed_env_step"][k]), close_latent=L, arm=arm,
+               cos_at_grasp=float(1 - p @ o / (np.linalg.norm(p) * np.linalg.norm(o) + 1e-8)))
+    if "sim/left_ee_pose" in f and "sim/object_pose" in f:
+        env_step = f["sim/env_step"][()]
+        j = int(np.searchsorted(env_step, row["close_step"]))
+        j = min(j, len(env_step) - 1)
+        ee = f[f"sim/{['left', 'right'][arm]}_ee_pose"][j][:3]
+        objs = f["sim/object_pose"][j][:, :3]
+        o_near = objs[np.argmin(np.linalg.norm(objs[:, :2] - ee[:2], axis=1))]
+        row.update(ee_z=float(ee[2]), obj_z=float(o_near[2]), dz=float(ee[2] - o_near[2]))
+    return row
+
+
+def gap(a):
+    rows = []
+    for e in find_episodes(a.roots):
+        with h5py.File(e / "episode.h5", "r") as f:
+            r = first_close_gap(f)
+            if r is None:
+                continue
+            r.update(task=str(f.attrs["task_name"]), setting=str(f.attrs["task_config"]),
+                     success=bool(f.attrs["success"]), method=str(f.attrs.get("fawam_method", "base")), path=str(e))
+            rows.append(r)
+    df = pd.DataFrame(rows)
+    if a.out:
+        df.to_csv(a.out, index=False)
+    with pd.option_context("display.width", 200):
+        print(df.groupby(["setting", "success"])[["cos_at_grasp", "dz"]].agg(["mean", "std", "count"]).round(3))
+
+
+def wilson(k, n, z=1.96):
+    if n == 0:
+        return (np.nan, np.nan)
+    p = k / n
+    d = 1 + z * z / n
+    c = p + z * z / (2 * n)
+    h = z * np.sqrt(p * (1 - p) / n + z * z / (4 * n * n))
+    return ((c - h) / d, (c + h) / d)
+
+
+def compare(a):
+    rows = []
+    for e in find_episodes([a.sweep]):
+        with h5py.File(e / "episode.h5", "r") as f:
+            at = f.attrs
+            rows.append(dict(method=str(at.get("fawam_method", "base")), task=str(at["task_name"]),
+                             setting=str(at["task_config"]), success=bool(at["success"]),
+                             attempt=int(at.get("attempt", 1)), seed=int(at["seed"]),
+                             interventions=len(json.loads(at.get("interventions", "[]"))),
+                             env_steps=int(at["env_steps"])))
+    df = pd.DataFrame(rows)
+    if df.empty:
+        print("no episodes")
+        return
+    first = df[df.attempt == 1]
+    g = first.groupby(["method", "task", "setting"]).success.agg(["sum", "count"]).reset_index()
+    g["rate"] = g["sum"] / g["count"]
+    g[["lo", "hi"]] = [wilson(k, n) for k, n in zip(g["sum"], g["count"])]
+    retry = df.groupby(["method", "task", "setting", "seed"]).success.max().groupby(
+        ["method", "task", "setting"]).mean().rename("rate_with_retry")
+    g = g.join(retry, on=["method", "task", "setting"])
+    out = Path(a.sweep) / "summary.csv"
+    g.to_csv(out, index=False)
+    with pd.option_context("display.width", 250, "display.max_rows", 500):
+        print(g.pivot_table(index="method", columns=["task", "setting"], values="rate").round(2))
+    print(f"wrote {out}")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    g = sub.add_parser("gap")
+    g.add_argument("roots", nargs="+")
+    g.add_argument("--out")
+    c = sub.add_parser("compare")
+    c.add_argument("sweep")
+    a = ap.parse_args()
+    {"gap": gap, "compare": compare}[a.cmd](a)
+
+
+if __name__ == "__main__":
+    main()
