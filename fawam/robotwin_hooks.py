@@ -408,6 +408,7 @@ class LearnFromFailure:
         if c["mode"] in ("icl", "both"):
             prefill = self.build_context(ep_dir, ana, seed)
             icl = c["icl"]
+            m.memory_counterfactual = icl.get("counterfactual", "full")  # how much does the memory move the actions?
             if icl["timing"] in ("trigger", "both"):
                 m.trigger_prefill = prefill
                 m.intervention = {**INTERVENTION_DEFAULTS, "action": "reset_memory", "max_interventions": 1}

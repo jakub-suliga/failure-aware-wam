@@ -34,7 +34,14 @@ STREAMS = ("video", "action")
 
 @dataclass
 class AdapterConfig:
-    kind: str = "dual"  # dual | inside | outside | lora | none
+    """kind: dual | inside | outside | lora | ia3 | adaln | combo | none.
+    combo = any union of the components below (use_adapterplus, use_lora, ia3, adaln, outside via kind dual/outside is
+    separate). Components (docs/ICL.md, adapter types):
+      Adapter+ (bottleneck, sites, inside_streams, blocks, adapter_learn_scale=False -> Houlsby-style fixed scale)
+      LoRA on lora_targets: attn (self-attn q/k/v/o, both streams), cross (text cross-attn q/k/v/o), ffn (in/out)
+      (IA)^3: learned scales on self-attn keys/values and on the FFN hidden activation
+      AdaLN: learned offset of every block's modulation table (scale/shift/gate of norms)"""
+    kind: str = "dual"
     inside_streams: list = field(default_factory=lambda: ["video", "action"])  # streams with internal adapters
     sites: list = field(default_factory=lambda: list(SITES))
     blocks: list = None  # block indices with internal adapters (None = all)
@@ -46,10 +53,34 @@ class AdapterConfig:
     num_blocks: int = 30
     latent_channels: int = 48
     patch: int = 2
+    ffn_dim: int = 14336
+    lora_targets: list = field(default_factory=lambda: ["attn"])
+    adapter_learn_scale: bool = True
+    use_adapterplus: bool = False  # combo
+    use_lora: bool = False         # combo
+    ia3: bool = False
+    adaln: bool = False
+    adapter_norm: bool = True       # False (+ adapter_learn_scale False) = plain residual MLP (paper baseline)
+    # VANE / T3VF: learnable prompt tokens read by every block through a gated attention (prompt bank + top-k router)
+    prompt_tokens: int = 0
+    prompt_bank: int = 1
+    prompt_topk: int = 1
+    # WAM-TTT: fast-weight residual branch; one analytic inner SGD step on the in-context memory tokens
+    ttt_dim: int = 0
+    ttt_eta: float = 0.1
+    ttt_streams: list = field(default_factory=lambda: ["video"])
+    # SALT: singular-value scaling (log-scale beta, clipped) of selected projections
+    svf_blocks: list = None
+    svf_targets: list = field(default_factory=lambda: ["self_k"])  # self_k | self_v | cross_k
+    svf_clip: float = 0.15
+    # dual-site paper baseline: dense (full-rank) deltas = full fine-tuning of selected linears
+    dense_blocks: list = None
+    dense_targets: list = field(default_factory=lambda: ["attn"])  # attn | ffn
+    outside_type: str = "mlp"       # mlp (residual MLP) | channel (channel-wise scale + shift, paper baseline)
 
     @property
     def has_inside(self):
-        return self.kind in ("dual", "inside")
+        return self.kind in ("dual", "inside") or (self.kind == "combo" and self.use_adapterplus)
 
     @property
     def has_outside(self):
@@ -57,7 +88,31 @@ class AdapterConfig:
 
     @property
     def has_lora(self):
-        return self.kind == "lora"
+        return self.kind == "lora" or (self.kind == "combo" and self.use_lora)
+
+    @property
+    def has_ia3(self):
+        return self.kind == "ia3" or self.ia3
+
+    @property
+    def has_adaln(self):
+        return self.kind == "adaln" or self.adaln
+
+    @property
+    def has_prompt(self):
+        return self.prompt_tokens > 0
+
+    @property
+    def has_ttt(self):
+        return self.ttt_dim > 0
+
+    @property
+    def has_svf(self):
+        return bool(self.svf_blocks)
+
+    @property
+    def has_dense(self):
+        return bool(self.dense_blocks)
 
     def block_ids(self):
         return list(range(self.num_blocks)) if self.blocks is None else list(self.blocks)
@@ -68,12 +123,12 @@ class AdapterConfig:
 class AdapterPlus(nn.Module):
     """h + c * W_up GELU(W_down LN(h)) (Steitz & Roth 2024), zero-initialised W_up."""
 
-    def __init__(self, dim, bottleneck):
+    def __init__(self, dim, bottleneck, learn_scale=True, norm=True):
         super().__init__()
-        self.norm = nn.LayerNorm(dim)
+        self.norm = nn.LayerNorm(dim) if norm else nn.Identity()
         self.down = nn.Linear(dim, bottleneck)
         self.up = nn.Linear(bottleneck, dim)
-        self.scale = nn.Parameter(torch.ones(dim))
+        self.scale = nn.Parameter(torch.ones(dim), requires_grad=learn_scale)
         nn.init.zeros_(self.up.weight)
         nn.init.zeros_(self.up.bias)
 
@@ -118,6 +173,166 @@ class LoRADelta(nn.Module):
         return (x.float() @ self.A.t() @ self.B.t()) * self.scaling
 
 
+class IA3(nn.Module):
+    """(IA)^3 (Liu et al. 2022): learned rescaling of self-attention keys/values and the FFN hidden activation."""
+
+    def __init__(self, dim, ffn_dim):
+        super().__init__()
+        self.k = nn.Parameter(torch.ones(dim))
+        self.v = nn.Parameter(torch.ones(dim))
+        self.ff = nn.Parameter(torch.ones(ffn_dim))
+
+
+class ChannelScale(nn.Module):
+    """Outside site, paper baseline: channel-wise scale and shift of the imagined latent, zero-initialised."""
+
+    def __init__(self, channels=48):
+        super().__init__()
+        self.s = nn.Parameter(torch.zeros(channels))
+        self.b = nn.Parameter(torch.zeros(channels))
+
+    def forward(self, latents):
+        x = latents.float()
+        sh = (1, -1) + (1,) * (x.dim() - 2)
+        return (x * (1 + self.s.view(sh)) + self.b.view(sh)).to(latents.dtype)
+
+
+class PromptMemory(nn.Module):
+    """VANE (latent-prompt bank with top-k routing) / T3VF (learnable query tokens), adapted to a frozen block:
+    h + g * Attn(W_q LN(h), P, P), with a bank of prompts P_i (n tokens each) mixed by a router on the mean hidden state.
+    g is zero-initialised (identical to the base at init)."""
+
+    def __init__(self, dim, n_tokens, bank=1, topk=1):
+        super().__init__()
+        self.prompts = nn.Parameter(torch.randn(bank, n_tokens, dim) * 0.02)
+        self.router = nn.Linear(dim, bank) if bank > 1 else None
+        self.topk = min(topk, bank)
+        self.norm = nn.LayerNorm(dim)
+        self.q = nn.Linear(dim, dim, bias=False)
+        self.gate = nn.Parameter(torch.zeros(dim))
+        self.heads = 24 if dim % 24 == 0 else 1  # LingBot-VA: 24 heads of 128
+
+    def forward(self, h):
+        x = self.norm(h.float())  # B, L, D
+        if self.router is not None:
+            w = self.router(x.mean(1)).softmax(-1)  # B, bank
+            top = w.topk(self.topk, dim=-1)
+            mix = torch.zeros_like(w).scatter(-1, top.indices, top.values)
+            mix = mix / mix.sum(-1, keepdim=True)
+            P = torch.einsum("bk,knd->bnd", mix, self.prompts)
+        else:
+            P = self.prompts[:1].expand(x.shape[0], -1, -1)
+        B, L, D = x.shape
+        hd = D // self.heads
+        q = self.q(x).view(B, L, self.heads, hd).transpose(1, 2)
+        k = P.reshape(B, -1, self.heads, hd).transpose(1, 2)
+        o = F.scaled_dot_product_attention(q, k, k).transpose(1, 2).reshape(B, L, D)
+        return (h.float() + self.gate * o).type_as(h)
+
+
+class TTTBranch(nn.Module):
+    """WAM-TTT-style fast-weight residual branch (linear fast weight, Spatial-TTT form):
+        dz = W_O f_W(W_Q LN(z)),  f_W(x) = W x
+    The fast weight W starts at W_init and takes ONE inner SGD step on the key-value reconstruction loss
+    ||W k - v||^2 over the in-context memory tokens (k = W_K LN(h), v = W_V LN(h)); for a linear f_W the step is
+    analytic from two running sums (S_kk = sum k k^T, S_vk = sum v k^T), so the server can accumulate them while it
+    prefills the memory and gradients flow through it in meta-training. W_O zero-initialised: identity at init."""
+
+    def __init__(self, dim, dh, eta=0.1):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim)
+        self.Wq, self.Wk, self.Wv = (nn.Linear(dim, dh, bias=False) for _ in range(3))
+        self.Wo = nn.Linear(dh, dim, bias=False)
+        nn.init.zeros_(self.Wo.weight)
+        self.W_init = nn.Parameter(torch.eye(dh))
+        self.eta = eta
+
+    def stats(self, h_ctx):
+        x = self.norm(h_ctx.float()).reshape(-1, h_ctx.shape[-1])
+        k, v = F.normalize(self.Wk(x), dim=-1), self.Wv(x)
+        return k.t() @ k, v.t() @ k, x.shape[0]
+
+    def fast_weight(self, stats):
+        if stats is None or stats[2] == 0:
+            return self.W_init
+        S_kk, S_vk, n = stats
+        return self.W_init - self.eta * 2.0 / n * (self.W_init @ S_kk - S_vk)
+
+    def forward(self, h, stats=None):
+        W = self.fast_weight(stats)
+        q = F.normalize(self.Wq(self.norm(h.float())), dim=-1)
+        return (h.float() + self.Wo(q @ W.t())).type_as(h)
+
+
+class SVFDelta(nn.Module):
+    """SALT: W(beta) = U diag(sigma * exp(beta)) V^T of a frozen linear, beta clipped to [-c, c]; only beta is trained.
+    The SVD of the base weight is computed when attached (not saved)."""
+
+    def __init__(self, rank, clip=0.15):
+        super().__init__()
+        self.beta = nn.Parameter(torch.zeros(rank))
+        self.clip = clip
+        self.register_buffer("U", torch.empty(0), persistent=False)
+        self.register_buffer("S", torch.empty(0), persistent=False)
+        self.register_buffer("Vh", torch.empty(0), persistent=False)
+
+    def set_base(self, weight):
+        w = weight.full_tensor() if hasattr(weight, "full_tensor") else weight
+        U, S, Vh = torch.linalg.svd(w.detach().float(), full_matrices=False)
+        self.U, self.S, self.Vh = U, S, Vh
+
+    def forward(self, x):
+        scale = self.S * (torch.exp(self.beta.clamp(-self.clip, self.clip)) - 1)
+        return ((x.float() @ self.Vh.t()) * scale) @ self.U.t()
+
+
+class DenseDelta(nn.Module):
+    """Full-rank delta of a frozen linear (= full fine-tuning of that weight), zero-initialised."""
+
+    def __init__(self, in_features, out_features):
+        super().__init__()
+        self.D = nn.Parameter(torch.zeros(out_features, in_features))
+
+    def forward(self, x):
+        return x.float() @ self.D.t()
+
+
+SVF_PATHS = {"self_k": ("attn1", "to_k"), "self_v": ("attn1", "to_v"), "cross_k": ("attn2", "to_k")}
+
+
+def dense_specs(cfg):
+    out = []
+    d, f = cfg.dim, cfg.ffn_dim
+    for b in cfg.dense_blocks or []:
+        if "attn" in cfg.dense_targets:
+            out += [(f"{b}_{n}", ("attn1", n), d, d) for n in ("to_q", "to_k", "to_v", "to_out")]
+        if "ffn" in cfg.dense_targets:
+            out += [(f"{b}_ff_in", ("ffn", "in"), d, f), (f"{b}_ff_out", ("ffn", "out"), f, d)]
+    return out
+
+
+def lora_specs(cfg):
+    """(key, module path, in, out) of every LoRA delta for the configured targets."""
+    out = []
+    d, f = cfg.dim, cfg.ffn_dim
+    for b in cfg.block_ids():
+        if "attn" in cfg.lora_targets:
+            out += [(f"{b}_{n}", ("attn1", n), d, d) for n in ("to_q", "to_k", "to_v", "to_out")]
+        if "cross" in cfg.lora_targets:
+            out += [(f"{b}_x_{n}", ("attn2", n), d, d) for n in ("to_q", "to_k", "to_v", "to_out")]
+        if "ffn" in cfg.lora_targets:
+            out += [(f"{b}_ff_in", ("ffn", "in"), d, f), (f"{b}_ff_out", ("ffn", "out"), f, d)]
+    return out
+
+
+def _linear(block, path):
+    mod, name = path
+    if mod == "ffn":
+        return block.ffn.net[0].proj if name == "in" else block.ffn.net[2]
+    attn = getattr(block, mod)
+    return attn.to_out[0] if name == "to_out" else getattr(attn, name)
+
+
 class AdapterSet(nn.Module):
     """All trainable parts of one adaptation: internal adapters per stream/block/site, external residual, LoRA."""
 
@@ -128,13 +343,37 @@ class AdapterSet(nn.Module):
         if cfg.has_inside:
             for stream in cfg.inside_streams:
                 self.inside[stream] = nn.ModuleDict({
-                    str(b): nn.ModuleDict({s: AdapterPlus(cfg.dim, cfg.bottleneck) for s in cfg.sites})
+                    str(b): nn.ModuleDict({s: AdapterPlus(cfg.dim, cfg.bottleneck, cfg.adapter_learn_scale,
+                                                          cfg.adapter_norm) for s in cfg.sites})
                     for b in cfg.block_ids()})
-        self.outside = ExternalResidual(cfg.latent_channels, cfg.patch, cfg.outside_hidden) if cfg.has_outside else None
-        self.lora = nn.ModuleDict()  # filled by install() (needs the base linears)
+        self.outside = (ChannelScale(cfg.latent_channels) if cfg.outside_type == "channel" else
+                        ExternalResidual(cfg.latent_channels, cfg.patch, cfg.outside_hidden)) if cfg.has_outside else None
+        self.lora = nn.ModuleDict({k: LoRADelta(i, o, cfg.lora_rank, cfg.lora_alpha)
+                                   for k, _, i, o in lora_specs(cfg)}) if cfg.has_lora else nn.ModuleDict()
+        self.ia3 = nn.ModuleDict({str(b): IA3(cfg.dim, cfg.ffn_dim) for b in cfg.block_ids()}) if cfg.has_ia3 \
+            else nn.ModuleDict()
+        self.adaln = nn.ParameterDict({str(b): nn.Parameter(torch.zeros(1, 6, cfg.dim)) for b in cfg.block_ids()}) \
+            if cfg.has_adaln else nn.ParameterDict()
+        self.prompt = nn.ModuleDict({str(b): PromptMemory(cfg.dim, cfg.prompt_tokens, cfg.prompt_bank, cfg.prompt_topk)
+                                     for b in cfg.block_ids()}) if cfg.has_prompt else nn.ModuleDict()
+        self.ttt = nn.ModuleDict({st: nn.ModuleDict({str(b): TTTBranch(cfg.dim, cfg.ttt_dim, cfg.ttt_eta)
+                                                     for b in cfg.block_ids()}) for st in cfg.ttt_streams}) \
+            if cfg.has_ttt else nn.ModuleDict()
+        self.svf = nn.ModuleDict({f"{b}_{t}": SVFDelta(cfg.dim, cfg.svf_clip) for b in (cfg.svf_blocks or [])
+                                  for t in cfg.svf_targets}) if cfg.has_svf else nn.ModuleDict()
+        self.dense = nn.ModuleDict({k: DenseDelta(i, o) for k, _, i, o in dense_specs(cfg)}) if cfg.has_dense \
+            else nn.ModuleDict()
 
     def inside_parameters(self):
-        return list(self.inside.parameters()) + list(self.lora.parameters())
+        """Trainable non-outside parameters (Houlsby-style adapters keep their fixed scale out)."""
+        out = []
+        for name, p in self.named_parameters():
+            if name.startswith("outside."):
+                continue
+            if name.endswith(".scale") and name.startswith("inside.") and not self.cfg.adapter_learn_scale:
+                continue
+            out.append(p)
+        return out
 
     def outside_parameters(self):
         return [] if self.outside is None else list(self.outside.parameters())
@@ -149,7 +388,7 @@ class AdapterSet(nn.Module):
     def save(self, path):
         path = Path(path)
         path.mkdir(parents=True, exist_ok=True)
-        state = {k: v.detach().cpu() for k, v in self.state_dict().items()}
+        state = {k: v.detach().cpu() for k, v in self.state_dict().items()}  # SVD buffers are not persistent
         torch.save(state, path / "adapter.pt")
         (path / "adapter_config.json").write_text(json.dumps(asdict(self.cfg), indent=2))
 
@@ -157,11 +396,7 @@ class AdapterSet(nn.Module):
     def load(cls, path, transformer=None, device="cpu"):
         path = Path(path)
         cfg = AdapterConfig(**json.loads((path / "adapter_config.json").read_text()))
-        aset = cls(cfg)
-        if cfg.has_lora:  # create the LoRA deltas (shapes from the config) before loading their weights
-            for b in cfg.block_ids():
-                for name in ("to_q", "to_k", "to_v", "to_out"):
-                    aset.lora[f"{b}_{name}"] = LoRADelta(cfg.dim, cfg.dim, cfg.lora_rank, cfg.lora_alpha)
+        aset = cls(cfg)  # creates every component (LoRA shapes from the config) before loading the weights
         state = torch.load(path / "adapter.pt", map_location="cpu", weights_only=True)
         missing, unexpected = aset.load_state_dict(state, strict=False)
         if missing or unexpected:
@@ -184,6 +419,9 @@ class AdapterContext:
         self.segments = None
         self.enabled = True
         self.steer = {}  # block index -> (vector (dim,), alpha, streams)
+        self.ttt_accumulate = False  # server prefill: TTT branches collect memory statistics
+        self.ctx_frames = 0  # training: in-context frames at the start of the sequence (TTT memory)
+        self.n_frames = 1
 
 
 def _apply_segments(h, segments, fn_for_stream):
@@ -221,7 +459,10 @@ def adapted_block_forward(block, block_id, holder, hidden_states, encoder_hidden
                           update_cache=0, cache_name="pos"):
     """Upstream WanTransformerBlock.forward + adapter site after the self-attention residual and after the block."""
     aset, ctx = holder.adapters, holder.ctx
-    temb_scale_shift_table = block.scale_shift_table[None] + temb.float()
+    table = block.scale_shift_table
+    if aset is not None and ctx.enabled and str(block_id) in aset.adaln:
+        table = table + aset.adaln[str(block_id)]
+    temb_scale_shift_table = table[None] + temb.float()
     shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = \
         rearrange(temb_scale_shift_table, 'b l n c -> b n l c').chunk(6, dim=1)
     shift_msa, scale_msa, gate_msa = shift_msa.squeeze(1), scale_msa.squeeze(1), gate_msa.squeeze(1)
@@ -232,6 +473,11 @@ def adapted_block_forward(block, block_id, holder, hidden_states, encoder_hidden
                               update_cache=update_cache, cache_name=cache_name)
     hidden_states = (hidden_states.float() + attn_output * gate_msa).type_as(hidden_states)
     hidden_states = _site(hidden_states, aset, ctx, block_id, "attn")
+    if aset is not None and ctx.enabled:
+        if str(block_id) in aset.prompt:
+            hidden_states = aset.prompt[str(block_id)](hidden_states)
+        if len(aset.ttt):
+            hidden_states = _ttt(hidden_states, aset, ctx, block_id, holder)
 
     norm_hidden_states = block.norm2(hidden_states.float()).type_as(hidden_states)
     attn_output = block.attn2(norm_hidden_states, encoder_hidden_states, encoder_hidden_states, None,
@@ -245,12 +491,47 @@ def adapted_block_forward(block, block_id, holder, hidden_states, encoder_hidden
     return _steer(hidden_states, ctx, block_id)
 
 
+def _ttt(h, aset, ctx, block_id, holder):
+    """Fast-weight branch. Training (segments): stats from the clean in-context frames of the same stream in this
+    sequence. Inference: while the server prefills the memory (ctx.ttt_accumulate) the stats are summed per block and
+    stream; afterwards every forward uses the stepped fast weight."""
+    b = str(block_id)
+    if ctx.segments is None:
+        br = aset.ttt[ctx.stream][b] if ctx.stream in aset.ttt and b in aset.ttt[ctx.stream] else None
+        if br is None:
+            return h
+        key = (ctx.stream, b)
+        if ctx.ttt_accumulate:
+            S_kk, S_vk, n = br.stats(h[:1])
+            old = holder.ttt_stats.get(key)
+            holder.ttt_stats[key] = (S_kk, S_vk, n) if old is None else (old[0] + S_kk, old[1] + S_vk, old[2] + n)
+            return br(h, None)
+        return br(h, holder.ttt_stats.get(key))
+    # training: [noisy video | clean video | noisy action | clean action], context = first ctx_frames frames
+    outs, start = [], 0
+    nf = max(ctx.n_frames, 1)
+    for i, (n, stream) in enumerate(ctx.segments):
+        part = h[:, start:start + n]
+        br = aset.ttt[stream][b] if (stream in aset.ttt and b in aset.ttt[stream]) else None
+        if br is not None:
+            clean = h[:, start + (n if i % 2 == 0 else 0):start + (2 * n if i % 2 == 0 else n)]
+            n_ctx = (n // nf) * ctx.ctx_frames
+            stats = br.stats(clean[:, :n_ctx]) if n_ctx > 0 else None
+            part = br(part, stats)
+        outs.append(part)
+        start += n
+    if start < h.shape[1]:
+        outs.append(h[:, start:])
+    return torch.cat(outs, dim=1)
+
+
 class AdapterHolder:
     """Attached to the transformer as `_fawam`: the active AdapterSet (or None) and the forward context."""
 
     def __init__(self):
         self.adapters = None
         self.ctx = AdapterContext()
+        self.ttt_stats = {}  # (stream, block) -> (S_kk, S_vk, n) of the prefilled in-context memory
 
 
 def _unwrap(block):
@@ -273,6 +554,7 @@ def install(transformer):
     def forward(input_dict, update_cache=0, cache_name="pos", action_mode=False, train_mode=False):
         if train_mode:
             holder.ctx.segments = train_segments(input_dict, transformer.patch_size)
+            holder.ctx.n_frames = int(input_dict["latent_dict"]["noisy_latents"].shape[2])
         else:
             holder.ctx.segments = None
             holder.ctx.stream = "action" if action_mode else "video"
@@ -296,31 +578,66 @@ def train_segments(input_dict, patch_size):
 
 
 def add_lora(transformer, aset):
-    """LoRA on attn1 q/k/v/out of the adapted blocks (shared weights: affects both streams), as forward hooks."""
-    cfg = aset.cfg
+    """Forward hooks for LoRA deltas and (IA)^3 scales (FSDP-managed base weights are never touched). Hooks are
+    installed once per linear and look the active AdapterSet up at call time, so adapters can be swapped."""
     holder = install(transformer)
-    if getattr(holder, "lora_hooks", None):
-        return
-    holder.lora_hooks = []
-    for b in cfg.block_ids():
-        attn = _unwrap(transformer.blocks[b]).attn1
-        for name, lin in (("to_q", attn.to_q), ("to_k", attn.to_k), ("to_v", attn.to_v), ("to_out", attn.to_out[0])):
-            key = f"{b}_{name}"
-            if key not in aset.lora:
-                aset.lora[key] = LoRADelta(lin.in_features, lin.out_features, cfg.lora_rank, cfg.lora_alpha)
+    hooked = holder.__dict__.setdefault("hooked", set())
+    for key, path, _, _ in lora_specs(aset.cfg) if aset.cfg.has_lora else []:
+        if key in hooked:
+            continue
+        lin = _linear(_unwrap(transformer.blocks[int(key.split("_")[0])]), path)
 
-            def hook(mod, inp, out, key=key):
-                if holder.adapters is None or not holder.ctx.enabled or key not in holder.adapters.lora:
+        def hook(mod, inp, out, key=key):
+            a = holder.adapters
+            if a is None or not holder.ctx.enabled or key not in a.lora:
+                return out
+            return out + a.lora[key](inp[0]).to(out.dtype)
+
+        lin.register_forward_hook(hook)
+        hooked.add(key)
+    for key, mod in list(aset.svf.items()) + list(aset.dense.items()):
+        b, rest = key.split("_", 1)
+        blk = _unwrap(transformer.blocks[int(b)])
+        lin = _linear(blk, SVF_PATHS[rest] if isinstance(mod, SVFDelta) else
+                      next(p for k_, p, _, _ in dense_specs(aset.cfg) if k_ == key))
+        if isinstance(mod, SVFDelta) and mod.S.numel() == 0:
+            mod.set_base(lin.weight)
+            mod.to(next(mod.parameters()).device)
+        hk = f"{'svf' if isinstance(mod, SVFDelta) else 'dense'}_{key}"
+        if hk in hooked:
+            continue
+
+        def hook(mod_, inp, out, key=key, which="svf" if isinstance(mod, SVFDelta) else "dense"):
+            a = holder.adapters
+            table = getattr(a, which, {}) if a is not None else {}
+            if a is None or not holder.ctx.enabled or key not in table:
+                return out
+            return out + table[key](inp[0]).to(out.dtype)
+
+        lin.register_forward_hook(hook)
+        hooked.add(hk)
+    for b in aset.cfg.block_ids() if aset.cfg.has_ia3 else []:
+        blk = _unwrap(transformer.blocks[b])
+        for which, mod in (("k", blk.attn1.to_k), ("v", blk.attn1.to_v), ("ff", blk.ffn.net[0])):
+            key = f"ia3_{b}_{which}"
+            if key in hooked:
+                continue
+
+            def hook(mod_, inp, out, b=b, which=which):
+                a = holder.adapters
+                if a is None or not holder.ctx.enabled or str(b) not in a.ia3:
                     return out
-                return out + holder.adapters.lora[key](inp[0]).to(out.dtype)
+                return out * getattr(a.ia3[str(b)], which).to(out.dtype)
 
-            holder.lora_hooks.append(lin.register_forward_hook(hook))
+            mod.register_forward_hook(hook)
+            hooked.add(key)
 
 
 def attach(transformer, aset):
     """Install the routing (if needed) and activate `aset` (None detaches)."""
     holder = install(transformer)
-    if aset is not None and aset.cfg.has_lora:
+    if aset is not None and (aset.cfg.has_lora or aset.cfg.has_ia3 or aset.cfg.has_svf or aset.cfg.has_dense):
         add_lora(transformer, aset)
+    holder.ttt_stats = {}
     holder.adapters = aset
     return holder

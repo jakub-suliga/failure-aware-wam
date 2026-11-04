@@ -121,7 +121,89 @@ def test_train_step():
     print(f"train step: ok (video {lv.item():.3f}, action {la.item():.3f})")
 
 
+def test_types():
+    """Every adapter type: identical to the base at init, gradients reach it, save/load round trip."""
+    import tempfile
+    variants = {
+        "adapterplus": dict(kind="inside"),
+        "houlsby": dict(kind="inside", adapter_learn_scale=False),
+        "adapterplus_attn_site": dict(kind="inside", sites=["attn"]),
+        "lora_attn": dict(kind="lora", lora_targets=["attn"]),
+        "lora_all": dict(kind="lora", lora_targets=["attn", "cross", "ffn"]),
+        "ia3": dict(kind="ia3"),
+        "adaln": dict(kind="adaln"),
+        "combo": dict(kind="combo", use_adapterplus=True, use_lora=True, ia3=True, adaln=True,
+                      lora_targets=["attn", "ffn"]),
+        "blocks_last": dict(kind="inside", blocks=[2]),
+        "residual_mlp": dict(kind="inside", adapter_norm=False, adapter_learn_scale=False),
+        "prompt_t3vf": dict(kind="combo", prompt_tokens=4),
+        "prompt_bank_vane": dict(kind="combo", prompt_tokens=4, prompt_bank=8, prompt_topk=2),
+        "ttt_wam": dict(kind="combo", ttt_dim=8, ttt_streams=["video", "action"]),
+        "svf_salt": dict(kind="combo", svf_blocks=[1, 2], svf_targets=["self_k", "cross_k"]),
+        "dense_fullft": dict(kind="combo", dense_blocks=[2], dense_targets=["attn", "ffn"]),
+        "outside_channel": dict(kind="outside", outside_type="channel"),
+    }
+    base = make()
+    base.create_empty_cache("pos", 8, 240, 32, device=DEV, dtype=torch.bfloat16, batch_size=1)
+    with torch.no_grad():
+        ref = base(video_input(), update_cache=0)
+    for name, kw in variants.items():
+        m = make()
+        m.create_empty_cache("pos", 8, 240, 32, device=DEV, dtype=torch.bfloat16, batch_size=1)
+        m.requires_grad_(False)
+        aset = fa.AdapterSet(fa.AdapterConfig(dim=64, num_blocks=3, bottleneck=8, ffn_dim=128, lora_rank=4,
+                                              **kw)).to(DEV)
+        fa.attach(m, aset)
+        with torch.no_grad():
+            out = m(video_input(), update_cache=0)
+        assert torch.equal(out, ref), f"{name}: must equal the base model at init"
+        params = aset.inside_parameters()
+        for p in params:
+            p.requires_grad_(True)
+        # nudge zero-initialised parts so every parameter gets a gradient path
+        with torch.no_grad():
+            for k, p in aset.named_parameters():
+                if k.endswith((".B", "up.weight", ".gate", "Wo.weight", ".beta", ".D", ".s")) or k.startswith("adaln"):
+                    p.add_(1e-2)
+        if aset.outside is not None and not params:  # outside-only: gradient through the latent correction
+            params = aset.outside_parameters()
+            aset.outside(torch.randn(1, 48, 2, 24, 20, device=DEV)).pow(2).mean().backward()
+        else:
+            m(video_input(), update_cache=0).float().pow(2).mean().backward()
+        n_grad = sum(p.grad is not None and p.grad.abs().sum() > 0 for p in params)
+        assert n_grad > 0, f"{name}: no gradients"
+        d = tempfile.mkdtemp()
+        aset.save(d)
+        b = fa.AdapterSet.load(d, device=DEV)
+        assert set(b.state_dict()) == set(aset.state_dict()), f"{name}: save/load keys differ"
+        if not kw.get("adapter_learn_scale", True):
+            ids = {id(p) for p in params}
+            assert not any(n.endswith(".scale") and id(p) in ids for n, p in aset.named_parameters()), name
+        print(f"type {name:22s} ok ({sum(p.numel() for p in params)} params, {n_grad}/{len(params)} with grad)")
+
+
+def test_ttt_memory():
+    """The TTT branch must change the output only through the memory statistics, and equal the training path."""
+    m = make()
+    m.create_empty_cache("pos", 8, 240, 32, device=DEV, dtype=torch.bfloat16, batch_size=1)
+    aset = fa.AdapterSet(fa.AdapterConfig(kind="combo", dim=64, num_blocks=3, ttt_dim=8, ffn_dim=128)).to(DEV)
+    holder = fa.attach(m, aset)
+    with torch.no_grad():
+        for br in aset.ttt["video"].values():
+            br.Wo.weight.add_(0.05)
+        a = m(video_input(frame_st=4), update_cache=0)  # no memory: fast weight = W_init
+        holder.ctx.ttt_accumulate = True
+        m(video_input(frame_st=0), update_cache=2)       # "prefill" a memory chunk
+        holder.ctx.ttt_accumulate = False
+        assert len(holder.ttt_stats) == 3, holder.ttt_stats.keys()
+        b = m(video_input(frame_st=4), update_cache=0)
+    assert not torch.equal(a, b), "memory statistics must change the TTT branch"
+    print("ttt memory: ok")
+
+
 if __name__ == "__main__":
+    test_types()
+    test_ttt_memory()
     test_identity()
     test_exclusion()
     test_train_step()

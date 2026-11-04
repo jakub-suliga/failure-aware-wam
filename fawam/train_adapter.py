@@ -154,7 +154,14 @@ def train_inside(a):
         aset = fa.AdapterSet.load(a.init, device=device)
     else:
         acfg = fa.AdapterConfig(kind=a.kind, inside_streams=a.inside_streams, bottleneck=a.bottleneck,
-                                lora_rank=a.lora_rank, blocks=a.blocks)
+                                lora_rank=a.lora_rank, lora_alpha=a.lora_alpha or float(a.lora_rank),
+                                blocks=a.blocks, sites=a.sites, lora_targets=a.lora_targets,
+                                adapter_learn_scale=not a.no_adapter_scale, use_adapterplus=a.use_adapterplus,
+                                use_lora=a.use_lora, ia3=a.ia3, adaln=a.adaln, adapter_norm=not a.no_adapter_norm,
+                                prompt_tokens=a.prompt_tokens, prompt_bank=a.prompt_bank, prompt_topk=a.prompt_topk,
+                                ttt_dim=a.ttt_dim, ttt_eta=a.ttt_eta, ttt_streams=a.ttt_streams,
+                                svf_blocks=a.svf_blocks, svf_targets=a.svf_targets, dense_blocks=a.dense_blocks,
+                                dense_targets=a.dense_targets, outside_type=a.outside_type)
         aset = fa.AdapterSet(acfg).to(device)
     fa.attach(tf, aset)
     params = aset.inside_parameters()
@@ -190,6 +197,7 @@ def train_inside(a):
         if ctx:  # in-context frames are conditioning only
             fw[:ctx] = 0
             fwa[:ctx] = 0
+        tf._fawam.ctx.ctx_frames = ctx  # TTT branches: the first ctx frames are the in-context memory
         pred = tf(input_dict, train_mode=True)
         lv, la = flow_losses(input_dict, pred, patch, sched_v, sched_a, fw, fwa)
         loss = a.lambda_video * lv + a.lambda_action * la
@@ -266,6 +274,7 @@ def validate(tf, ds, a, sched_v, sched_a, patch, device, n=24):
             inp = dict(latent_dict=ld, action_dict=ad, chunk_size=2, window_size=128)
             fw = torch.ones(lat.shape[2])
             fw[:ctx] = 0
+            tf._fawam.ctx.ctx_frames = ctx
             lv, la = flow_losses(inp, tf(inp, train_mode=True), patch, sched_v, sched_a, fw, fw)
             tv, ta = tv + float(lv), ta + float(la)
         out.append((tv / n, ta / n))
@@ -318,7 +327,7 @@ def train_outside(a):
             aset.outside = fa.ExternalResidual(aset.cfg.latent_channels, aset.cfg.patch,
                                                aset.cfg.outside_hidden).to(device)
     else:
-        aset = fa.AdapterSet(fa.AdapterConfig(kind="outside")).to(device)
+        aset = fa.AdapterSet(fa.AdapterConfig(kind="outside", outside_type=a.outside_type)).to(device)
     params = aset.outside_parameters()
     opt = torch.optim.AdamW(params, lr=a.lr_outside, weight_decay=a.weight_decay)
     out = Path(a.out)
@@ -359,7 +368,27 @@ def main():
     ap.add_argument("--text_cache", default=str(ROOT / "artifacts" / "text_emb"))
     ap.add_argument("--out", required=True)
     ap.add_argument("--init", help="existing adapter dir to continue from / to add the outside residual to")
-    ap.add_argument("--kind", default="dual", choices=["dual", "inside", "lora", "outside"])
+    ap.add_argument("--kind", default="dual", choices=["dual", "inside", "lora", "outside", "ia3", "adaln", "combo"])
+    ap.add_argument("--sites", nargs="+", default=["attn", "block"], help="Adapter+ sites")
+    ap.add_argument("--lora_targets", nargs="+", default=["attn"], help="attn | cross | ffn")
+    ap.add_argument("--lora_alpha", type=float, default=None, help="default = rank")
+    ap.add_argument("--no_adapter_scale", action="store_true", help="Houlsby-style Adapter (fixed scale 1)")
+    ap.add_argument("--use_adapterplus", action="store_true", help="combo: Adapter+")
+    ap.add_argument("--use_lora", action="store_true", help="combo: LoRA")
+    ap.add_argument("--ia3", action="store_true", help="add (IA)^3")
+    ap.add_argument("--adaln", action="store_true", help="add AdaLN-modulation tuning")
+    ap.add_argument("--no_adapter_norm", action="store_true", help="Adapter without LayerNorm (plain residual MLP)")
+    ap.add_argument("--prompt_tokens", type=int, default=0, help="VANE/T3VF prompt tokens per prompt (0 = off)")
+    ap.add_argument("--prompt_bank", type=int, default=1)
+    ap.add_argument("--prompt_topk", type=int, default=1)
+    ap.add_argument("--ttt_dim", type=int, default=0, help="WAM-TTT fast-weight branch width (0 = off)")
+    ap.add_argument("--ttt_eta", type=float, default=0.1)
+    ap.add_argument("--ttt_streams", nargs="+", default=["video"])
+    ap.add_argument("--svf_blocks", type=int, nargs="*", help="SALT singular-value scaling in these blocks")
+    ap.add_argument("--svf_targets", nargs="+", default=["self_k"])
+    ap.add_argument("--dense_blocks", type=int, nargs="*", help="full fine-tuning (dense deltas) of these blocks")
+    ap.add_argument("--dense_targets", nargs="+", default=["attn"])
+    ap.add_argument("--outside_type", default="mlp", choices=["mlp", "channel"])
     ap.add_argument("--inside_streams", nargs="+", default=["video", "action"])
     ap.add_argument("--blocks", type=int, nargs="*", help="block indices with adapters (default: all 30)")
     ap.add_argument("--bottleneck", type=int, default=128)

@@ -114,6 +114,51 @@ def compare(a):
     print(f"wrote {out}")
 
 
+def memory(a):
+    """Does the model use the in-context memory? Per method: attention ratio on memory tokens (mass / token share;
+    1 = like any other token, < 1 = ignored), per-layer profile, influence (relative change of the prediction when the
+    memory is hidden), optional full counterfactual (mean |delta| of the arm positions in mm), and whether these
+    differ between successful and failed attempts."""
+    rows, layers = [], {}
+    for e in find_episodes([a.sweep]):
+        with h5py.File(e / "episode.h5", "r") as f:
+            if "fawam/memory" not in f:
+                continue
+            g = f["fawam/memory"]
+            at = f.attrs
+            meth = str(at.get("fawam_method", "base"))
+            aa, sa = g["attn_action"][()], g["share_action"][()]
+            r = dict(method=meth, task=str(at["task_name"]), success=bool(at["success"]),
+                     attn_ratio_action=float(np.nanmean(np.nanmean(aa, 1) / np.maximum(sa, 1e-8))),
+                     infl_action=float(np.nanmean(g["infl_action"][()])), infl_video=float(np.nanmean(g["infl_video"][()])),
+                     memory_tokens=float(np.nanmean(g["memory_tokens"][()])))
+            if "attn_video" in g:
+                r["attn_ratio_video"] = float(np.nanmean(np.nanmean(g["attn_video"][()], 1) /
+                                                         np.maximum(g["share_video"][()], 1e-8)))
+            if "cf_dxyz_left" in g:
+                r["cf_dxyz_mm"] = float(np.nanmean(np.maximum(g["cf_dxyz_left"][()], g["cf_dxyz_right"][()]))) * 1000
+            if "ttt_update" in f["fawam"].attrs:
+                r["ttt_update"] = float(np.mean(list(json.loads(f["fawam"].attrs["ttt_update"]).values())))
+            rows.append(r)
+            layers.setdefault(meth, []).append(np.nanmean(aa / np.maximum(sa, 1e-8)[:, None], 0))
+    df = pd.DataFrame(rows)
+    if df.empty:
+        print("no episodes with a memory")
+        return
+    cols = [c for c in ("attn_ratio_action", "attn_ratio_video", "infl_action", "infl_video", "cf_dxyz_mm",
+                        "ttt_update", "memory_tokens") if c in df]
+    with pd.option_context("display.width", 250, "display.max_rows", 500):
+        print(df.groupby("method")[cols].mean().round(3))
+        print("\nsuccess vs. failure (does using the memory go with success?)")
+        print(df.groupby(["method", "success"])[["attn_ratio_action", "infl_action"]].mean().unstack().round(3))
+    out = Path(a.sweep)
+    df.to_csv(out / "memory_usage.csv", index=False)
+    prof = pd.DataFrame({m: np.nanmean(np.stack(v), 0) for m, v in layers.items()})
+    prof.index.name = "layer"
+    prof.to_csv(out / "memory_attention_per_layer.csv")
+    print(f"wrote {out / 'memory_usage.csv'} and memory_attention_per_layer.csv")
+
+
 def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -124,8 +169,10 @@ def main():
     c.add_argument("sweep")
     c.add_argument("--adapt_episodes", type=int, default=0,
                    help="paper protocol: drop the first N episodes per client run (adaptation phase)")
+    mm = sub.add_parser("memory")
+    mm.add_argument("sweep")
     a = ap.parse_args()
-    {"gap": gap, "compare": compare}[a.cmd](a)
+    {"gap": gap, "compare": compare, "memory": memory}[a.cmd](a)
 
 
 if __name__ == "__main__":

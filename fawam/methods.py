@@ -53,6 +53,9 @@ class Method:
     learn: dict = None                 # see LEARN_DEFAULTS
 
     trigger_prefill: dict = None       # memory spec inserted by the intervention action "reset_memory"
+    # does the model use the memory? (docs/ICL.md, section 6c) - measured whenever a memory is in the KV cache
+    measure_memory: bool = True        # attention mass on memory tokens per layer + influence at one denoising step
+    memory_counterfactual: str = "step"  # step | full (whole action chunk again without memory: delta in metres) | off
 
     # --- online intervention (client, B/C) ---------------------------------------------------------------------
     intervention: dict = None          # see INTERVENTION_DEFAULTS
@@ -126,6 +129,7 @@ ICL_DEFAULTS = dict(
                              # the retry: context reset + memory) | both
     demo_bank="artifacts/demo_bank/{setting}",
     max_items=3,
+    counterfactual="full",   # memory usage measurement in the attempt with memory: step | full | off
 )
 
 # ---------------------------------------------------------------------------------------------- presets
@@ -335,9 +339,25 @@ PRESETS = {
     "icl_vs_adapter": dict(learn=dict(mode="adapter", signals=["oracle", "gap"])),
     "icl_plus_adapter": dict(learn=dict(mode="both", signals=["oracle", "gap"],
                                         meta_adapter="artifacts/adapters/failfix_predobs")),
+    "cf_full": dict(memory_counterfactual="full"),
+    "cf_off": dict(memory_counterfactual="off", measure_memory=False),
     "lff_adapter_lifelong": dict(learn=dict(mode="adapter", signals=["oracle", "gap"], persist=True)),
     "lff_lifelong_PRI": dict(learn=dict(mode="adapter", signals=["gap", "rollout", "imagine"], persist=True)),
 }
+
+
+# test presets for the adapter-type comparison of ICL meta-training (cluster/adapter_grid.py ADAPTER_TYPES)
+META_TYPES = ["adapterplus", "adapterplus_b32", "adapterplus_b512", "houlsby", "residual_mlp", "adapterplus_video",
+              "adapterplus_action", "adapterplus_first10", "adapterplus_last10", "lora_r16_attn", "lora_r16_attn_ffn",
+              "lora_r64_all", "ia3", "adaln", "ia3_adaln", "prompt_t3vf", "prompt_vane", "ttt_wam", "ttt_wam_both",
+              "svf_salt", "dense_last2", "ttt_plus_adapterplus", "lora_plus_prompt"]
+for _t in META_TYPES:
+    PRESETS[f"icl_type_{_t}"] = dict(learn=dict(mode="icl", signals=["oracle", "gap"],
+                                                meta_adapter=f"artifacts/adapters/failfix_type_{_t}",
+                                                icl=dict(groups=["pred", "obs"])))
+    PRESETS[f"icl_type_{_t}_noctx"] = dict(learn=dict(mode="icl", signals=["oracle", "gap"],
+                                                      meta_adapter=f"artifacts/adapters/failfix_type_{_t}",
+                                                      icl=dict(content=[])))
 
 
 def _merge(base: dict, over: dict):

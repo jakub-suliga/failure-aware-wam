@@ -42,6 +42,18 @@ Details zu den Methoden stehen in [EXPERIMENTS.md](EXPERIMENTS.md), die Befunde 
       implementiert. Das Meta-Training enthält diesen Fall bereits (p_cross).
 - [ ] Meta-Training: 12 000 Schritte sind eine Schätzung. Nach der ersten Validierungskurve anpassen.
 
+- [ ] Adapter-Typen (ICL.md 5b): mit echtem Modell prüfen, dass `ttt_wam` (Statistik beim Prefill), `svf_salt`
+      (SVD der FSDP-Gewichte beim Laden) und `dense_last2` im Server laden und laufen. Bisher nur kleines Modell getestet.
+- [ ] TTT-Zweig: Bei Kontext-Reset mitten im Versuch werden die Statistiken gelöscht und neu gesammelt. Prüfen, dass
+      das auch beim Trigger-Zeitpunkt passiert.
+- [ ] Speicher der Meta-Typen: `dense_last2` ~3 GB Optimizer-State, `lora_r64_all` größer als r16. Auf der H100 unkritisch.
+- [ ] Die Adapter-Typen gibt es auch im LfF-Adapter-Weg (`fawam.learn`), dort werden sie aber noch nicht variiert.
+
+- [ ] Kontext-Nutzungsmessung (ICL.md 6a) mit echtem Modell prüfen: Attention-Quote der Erinnerung ist
+      plausibel (≈ 1 bei zufälligem Kontext?), Einfluss = 0 ohne Erinnerung, Kontrafakt-Abweichung in mm.
+      Läuft automatisch im Screening-Smoke mit.
+- [ ] Attention-Messung nutzt nur den bedingten CFG-Zweig und einen Denoising-Schritt pro Chunk. Bei Bedarf mehr Schritte.
+
 ## 1b. Learn-from-Failure (Kern, [METHOD.md](METHOD.md))
 
 - [ ] **Lernt der Adapter die Korrektur?** `python -m fawam.tests.test_lff_effect <fail ep> <adapter>` vergleicht die

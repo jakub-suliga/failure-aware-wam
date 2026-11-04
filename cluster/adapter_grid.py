@@ -99,6 +99,39 @@ GRID["failfix_predobs_holdtask"] = (dict(EPISODES=_FF_EP, SUCCESS="false", OUTSI
                                          TASKS=" ".join(t for t in TABLE8 if t != "stack_blocks_two"),
                                          EXTRA=f"{_META} --context_groups pred obs --fixes {_FF_FIX}"),
                                     ["table_h_m05", "table_h_m10"])
+# Adapter TYPES for ICL meta-training (docs/ICL.md, 5b): same data/format (pred+obs memory), only the module varies.
+# (kind, extra trainer args). Steps 6000 x accum 4 for the comparison (the main failfix_predobs uses 12000).
+ADAPTER_TYPES = {
+    "adapterplus":      ("inside", ""),                                              # dual-site paper, inside site
+    "adapterplus_b32":  ("inside", "--bottleneck 32"),
+    "adapterplus_b512": ("inside", "--bottleneck 512"),
+    "houlsby":          ("inside", "--no_adapter_scale"),                            # bottleneck adapter
+    "residual_mlp":     ("inside", "--no_adapter_scale --no_adapter_norm"),          # paper baseline
+    "adapterplus_video":  ("inside", "--inside_streams video"),
+    "adapterplus_action": ("inside", "--inside_streams action"),
+    "adapterplus_first10": ("inside", "--blocks " + " ".join(map(str, range(10)))),
+    "adapterplus_last10":  ("inside", "--blocks " + " ".join(map(str, range(20, 30)))),
+    "lora_r16_attn":    ("lora", "--lora_rank 16 --lora_targets attn"),              # FailBank
+    "lora_r16_attn_ffn": ("lora", "--lora_rank 16 --lora_targets attn ffn"),
+    "lora_r64_all":     ("lora", "--lora_rank 64 --lora_targets attn cross ffn"),
+    "ia3":              ("ia3", ""),
+    "adaln":            ("adaln", ""),
+    "ia3_adaln":        ("combo", "--ia3 --adaln"),
+    "prompt_t3vf":      ("combo", "--prompt_tokens 16"),                             # T3VF query tokens
+    "prompt_vane":      ("combo", "--prompt_tokens 16 --prompt_bank 8 --prompt_topk 2"),  # VANE prompt bank
+    "ttt_wam":          ("combo", "--ttt_dim 128 --ttt_streams video"),              # WAM-TTT fast weights
+    "ttt_wam_both":     ("combo", "--ttt_dim 128 --ttt_streams video action"),
+    "svf_salt":         ("combo", "--svf_blocks " + " ".join(map(str, range(22, 30))) + " --svf_targets self_k cross_k"),
+    "dense_last2":      ("combo", "--dense_blocks 28 29 --dense_targets attn ffn"),  # full fine-tuning (2 blocks)
+    "ttt_plus_adapterplus": ("combo", "--ttt_dim 128 --use_adapterplus"),
+    "lora_plus_prompt": ("combo", "--use_lora --lora_targets attn --prompt_tokens 16"),
+}
+_META_T = _META.replace("--steps 12000", "--steps 6000")
+for _t, (_kind, _extra) in ADAPTER_TYPES.items():
+    GRID[f"failfix_type_{_t}"] = (dict(EPISODES=_FF_EP, SUCCESS="false", OUTSIDE="none", TASKS=" ".join(TABLE8),
+                                       KIND=_kind, EXTRA=f"{_META_T} --context_groups pred obs {_extra} "
+                                                         f"--fixes {_FF_FIX}"),
+                                  ["table_h_m05", "table_h_m10"])
 # demo in context -> success (no failure): the E3 counterpart, for icl_meta_demo
 GRID["democtx_meta"] = (dict(EPISODES=_FF_FIX, SUCCESS="true", OUTSIDE="none", CONTEXT_K="1", DRIVERS="expert_replay",
                              TASKS=" ".join(TABLE8),

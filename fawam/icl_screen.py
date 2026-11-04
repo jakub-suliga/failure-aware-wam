@@ -56,6 +56,19 @@ def pairs(fails, fixes, limit, seed=0, any_seed=False):
     return out[:limit] if limit else out
 
 
+def memory_usage(records):
+    """Mean over chunks: attention ratio on the memory (attention mass / memory share of the tokens; 1 = no
+    preference, 0 = ignored) for the action and video tokens, and the relative change of the prediction when the
+    memory is hidden."""
+    if not records:
+        return dict(attn_ratio_action=np.nan, attn_ratio_video=np.nan, infl_action=np.nan, infl_video=np.nan)
+    ra = [np.nanmean(r["attn_action"]) / max(r["share_action"], 1e-8) for r in records]
+    rv = [np.nanmean(r["attn_video"]) / max(r["share_video"], 1e-8) for r in records if r.get("attn_video") is not None]
+    f = lambda k: float(np.nanmean([np.nan if r.get(k) is None else r[k] for r in records]))
+    return dict(attn_ratio_action=float(np.mean(ra)), attn_ratio_video=float(np.mean(rv)) if rv else np.nan,
+                infl_action=f("infl_action"), infl_video=f("infl_video"))
+
+
 @torch.no_grad()
 def run_variant(server, fail_dir, fix_dir, key, name):
     m = resolve(name, root=ROOT)
@@ -98,8 +111,10 @@ def run_variant(server, fail_dir, fix_dir, key, name):
         r = server._commit_observation(lat[:, :, rows], planned[c][:, :n])
         g = r.get("gap", {})
         gaps.append(max(g.get("cam_left_wrist", 0), g.get("cam_right_wrist", 0)))
+    mem = server.episode_log.get("memory", [])
+    use = memory_usage(mem)
     server.transformer.clear_cache(server.cache_name)
-    return dict(action_mse=float(np.mean(err)), action_mse_window=float(np.mean(err_win)) if err_win else np.nan,
+    return dict(**use, action_mse=float(np.mean(err)), action_mse_window=float(np.mean(err_win)) if err_win else np.nan,
                 gap_first=float(gaps[0]) if gaps else np.nan, gap_mean=float(np.mean(gaps)) if gaps else np.nan,
                 memory_tokens=int(server.ctx_slots.sum()) if spec and getattr(server, "ctx_slots", None) is not None else 0)
 

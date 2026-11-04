@@ -79,6 +79,10 @@ class FawamServer(VA_Server):
         for i, attn in enumerate(self._attn1):
             attn.key_exclude = None
             attn.update_cache = partial(self._tracked_update_cache, attn.update_cache, i == 0)
+            attn.attn_op = partial(self._memory_probe_op, i, attn, attn.attn_op)
+        self.ctx_slots = None
+        self._prefilling = False
+        self._probe = None  # list per layer of attention mass on memory tokens while a probe is active
         stats_path = ROOT / "artifacts" / "gap_stats.json"
         self.gap_stats = json.loads(stats_path.read_text()) if stats_path.exists() else {}
 
@@ -88,6 +92,8 @@ class FawamServer(VA_Server):
         slots = orig(cache_name, key, value, is_pred)
         if self._excl is not None:
             self._excl[slots] = False
+        if first_block and self.ctx_slots is not None and not self._prefilling:
+            self.ctx_slots[slots] = False  # a memory slot that gets overwritten is no longer memory
         if first_block and self._slot_kind is not None and self._call is not None:
             kind, frames = self._call
             self._slot_kind[slots] = kind
@@ -126,17 +132,64 @@ class FawamServer(VA_Server):
         if mask is None:
             yield
             return
+        prev_excl, prev_keys = self._excl, [attn.key_exclude for attn in self._attn1]
         self._excl = mask.clone()
         for attn in self._attn1:
             attn.key_exclude = self._excl
         try:
             yield
         finally:
-            for attn in self._attn1:
-                attn.key_exclude = None
-            self._excl = torch.zeros_like(mask)
+            for attn, k in zip(self._attn1, prev_keys):
+                attn.key_exclude = k
+            self._excl = prev_excl if prev_excl is not None else torch.zeros_like(mask)
+
+    # ------------------------------------------------------------------------------------------ memory usage probe
+
+    def _memory_mask(self):
+        """Occupied memory slots (None if no memory is in the cache)."""
+        if self.ctx_slots is None:
+            return None
+        m = self.ctx_slots & self._cache()["mask"]
+        return m if bool(m.any()) else None
+
+    def _memory_probe_op(self, li, attn, op, q, k, v):
+        out = op(q, k, v)
+        if self._probe is None:
+            return out
+        c = attn.attn_caches[self.cache_name]
+        mask = c["mask"] if attn.key_exclude is None else c["mask"] & ~attn.key_exclude
+        valid = mask.nonzero(as_tuple=False).squeeze(-1)
+        mem = self.ctx_slots[valid]
+        if not bool(mem.any()):
+            self._probe[li].append((0.0, 0.0))
+            return out
+        qq, kk = q[0].float(), k[0].float()  # conditional branch; (Lq, H, D), (Lk, H, D)
+        mass = 0.0
+        for h in range(qq.shape[1]):  # per head keeps the score matrix small
+            w = (qq[:, h] @ kk[:, h].t() / qq.shape[-1] ** 0.5).softmax(-1)
+            mass += float(w[:, mem].sum(-1).mean())
+        self._probe[li].append((mass / qq.shape[1], float(mem.float().mean())))
+        return out
+
+    @contextmanager
+    def _probing(self):
+        self._probe = [[] for _ in self._attn1]
+        try:
+            yield
+        finally:
+            res = self._probe
+            self._probe = None
+            self._last_probe = res
+
+    def _probe_summary(self):
+        """(attention mass on memory per layer, memory share of the attended tokens)"""
+        r = self._last_probe
+        mass = np.array([np.mean([x[0] for x in l]) if l else np.nan for l in r], np.float32)
+        share = float(np.nanmean([np.mean([x[1] for x in l]) for l in r if l])) if any(r) else np.nan
+        return mass, share
 
     def _new_slot_meta(self):
+        self.ctx_slots = None
         n = self._cache()["k"].shape[1]
         self._slot_kind = torch.full((n,), -1, device=self.device, dtype=torch.long)
         self._slot_frame = torch.full((n,), -1, device=self.device, dtype=torch.long)
@@ -270,6 +323,7 @@ class FawamServer(VA_Server):
             self._new_slot_meta()
             self.ep_frame0 = self.frame_st_id
             self.init_ready = False
+            self.holder.ttt_stats = {}
             if obs.get("prefill"):  # reset-with-memory: the next first chunk starts after this in-context memory
                 self.pending_prefill = obs["prefill"]
         elif op == "truncate":
@@ -364,6 +418,9 @@ class FawamServer(VA_Server):
         start = int(self.frame_st_id)
         base = start
         mask_before = self._cache()["mask"].clone()
+        self.holder.ttt_stats = {}
+        self.holder.ctx.ttt_accumulate = True  # TTT fast-weight branches learn from the memory while it is written
+        self._prefilling = True
         for it in items:
             ep = Path(it["path"])
             ep = ep / "episode.h5" if ep.is_dir() else ep
@@ -407,6 +464,15 @@ class FawamServer(VA_Server):
                     base += li1 - li0 + 1 + gap
                 self.episode_log["prefill"].append(dict(path=str(ep), group=group, actions=it.get("actions", "executed"),
                                                         frames=[li0, li1], role=it.get("role")))
+        self.holder.ctx.ttt_accumulate = False
+        self._prefilling = False
+        a = self.holder.adapters
+        if a is not None and len(a.ttt) and self.holder.ttt_stats:  # how far the memory moved the fast weights
+            upd = {}
+            for (stream, b), st in self.holder.ttt_stats.items():
+                br = a.ttt[stream][b]
+                upd[f"{stream}_{b}"] = float((br.fast_weight(st) - br.W_init).norm() / (br.W_init.norm() + 1e-8))
+            self.episode_log["ttt_update"] = upd
         new_slots = self._cache()["mask"] & ~mask_before
         alpha = float(spec.get("attn_scale", 1.0))
         if alpha != 1.0 and new_slots.any():
@@ -424,15 +490,29 @@ class FawamServer(VA_Server):
         return self._tf(self._repeat_input_for_cfg(input_dict['latent_res_lst']), update_cache, False, frame_st_id,
                         self.job_config.frame_chunk_size)
 
-    def _denoise_video(self, latents, timesteps, latent_cond, frame_st_id, first):
+    def _denoise_video(self, latents, timesteps, latent_cond, frame_st_id, first, probe=False):
         cfg = self.job_config
         fcs = cfg.frame_chunk_size
         records = []
+        mem = self._memory_mask() if (probe and self.method.measure_memory) else None
+        probe_step = (len(timesteps) - 1) // 2
         excl = self._exclusion(action_before=None if self.method.video_history_keep is None
                                else frame_st_id - self.method.video_history_keep)
         with self._excluding(excl):
             for i, t in enumerate(timesteps[:-1]):
-                pred = self._video_step(latents, t, latent_cond, frame_st_id, 0)
+                if mem is not None and i == probe_step:
+                    with self._probing():
+                        pred = self._video_step(latents, t, latent_cond, frame_st_id, 0)
+                    self._mem_video = self._probe_summary()
+                    if self.method.memory_counterfactual != "off":
+                        base_excl = self._excl if excl is not None else None
+                        both = mem if base_excl is None else (mem | base_excl)
+                        with self._excluding(both):
+                            nomem = self._video_step(latents, t, latent_cond, frame_st_id, 0)
+                        self._mem_video_infl = float((pred.float() - nomem.float()).norm() /
+                                                     (pred.float().norm() + 1e-8))
+                else:
+                    pred = self._video_step(latents, t, latent_cond, frame_st_id, 0)
                 pred = data_seq_to_patch(cfg.patch_size, pred, fcs, self.latent_height, self.latent_width,
                                          batch_size=2 if self.use_cfg else 1)
                 if cfg.guidance_scale > 1:
@@ -520,7 +600,9 @@ class FawamServer(VA_Server):
         latent_cond = init_latent[:, :, 0:1].to(self.dtype) if first else None
 
         with torch.no_grad():
-            results = [self._denoise_video(c, timesteps, latent_cond, frame_st_id, first) for c in cands]
+            self._mem_video = self._mem_video_infl = None
+            results = [self._denoise_video(c, timesteps, latent_cond, frame_st_id, first, probe=(ci == 0))
+                       for ci, c in enumerate(cands)]
             idx, scores = self._score_candidates([r[0] for r in results], latent_cond, frame_st_id, noise_seed)
             latents, denoise_records = results[idx]
             if self.use_outside:
@@ -537,6 +619,9 @@ class FawamServer(VA_Server):
             excl_c = self._exclusion(action_before=hist)
             use_ig = m.imagination_guidance != 1.0
             n_steps = len(action_timesteps)
+            mem = self._memory_mask() if m.measure_memory else None
+            mem_rec = None
+            actions0 = actions.clone() if (mem is not None and m.memory_counterfactual == "full") else None
             for i, t in enumerate(action_timesteps):
                 last = i == n_steps - 1
                 action_cond = torch.zeros([1, cfg.action_dim, 1, self.action_per_frame, 1], device=self.device,
@@ -544,7 +629,21 @@ class FawamServer(VA_Server):
                 if last:
                     self._action_noise(actions, t, action_cond, frame_st_id, 1, excl_c)
                 else:
-                    pred = self._action_noise(actions, t, action_cond, frame_st_id, 0, excl_c)
+                    if mem is not None and i == (n_steps - 1) // 2:
+                        with self._probing():
+                            pred = self._action_noise(actions, t, action_cond, frame_st_id, 0, excl_c)
+                        a_mass, a_share = self._probe_summary()
+                        infl = np.nan
+                        if m.memory_counterfactual != "off":
+                            both = mem if excl_c is None else (mem | excl_c)
+                            p_nm = self._action_noise(actions, t, action_cond, frame_st_id, 0, both)
+                            infl = float((pred.float() - p_nm.float()).norm() / (pred.float().norm() + 1e-8))
+                        v_mass, v_share = self._mem_video if self._mem_video is not None else (None, np.nan)
+                        mem_rec = dict(frame_st_id=int(frame_st_id), attn_action=a_mass, share_action=a_share,
+                                       infl_action=infl, attn_video=v_mass, share_video=v_share,
+                                       infl_video=self._mem_video_infl, memory_tokens=int(mem.sum()))
+                    else:
+                        pred = self._action_noise(actions, t, action_cond, frame_st_id, 0, excl_c)
                     if use_ig and i < m.imagination_guidance_until * (n_steps - 1):
                         excl_u = self._exclusion(pred_video=True, action_before=hist)
                         pred_u = self._action_noise(actions, t, action_cond, frame_st_id, 0, excl_u)
@@ -552,6 +651,23 @@ class FawamServer(VA_Server):
                     actions = self.action_scheduler.step(pred, t, actions, return_dict=False)
                 actions[:, :, 0:1] = action_cond if first else actions[:, :, 0:1]
 
+        if actions0 is not None and mem_rec is not None:
+            # full counterfactual: the same chunk denoised again with the memory hidden (no cache commit)
+            a_nm = actions0
+            both = mem if excl_c is None else (mem | excl_c)
+            for i, t in enumerate(action_timesteps[:-1]):
+                action_cond = torch.zeros([1, cfg.action_dim, 1, self.action_per_frame, 1], device=self.device,
+                                          dtype=self.dtype) if first else None
+                p_nm = self._action_noise(a_nm, t, action_cond, frame_st_id, 0, both)
+                a_nm = self.action_scheduler.step(p_nm, t, a_nm, return_dict=False)
+                a_nm[:, :, 0:1] = action_cond if first else a_nm[:, :, 0:1]
+            a_nm[:, ~self.action_mask] *= 0
+            d = np.abs(self.postprocess_action(actions.clone()) - self.postprocess_action(a_nm))  # 16, F, H raw
+            mem_rec.update(cf_dxyz_left=float(d[0:3].mean()), cf_dxyz_right=float(d[8:11].mean()),
+                           cf_dz_left=float(d[2].mean()), cf_dz_right=float(d[10].mean()),
+                           cf_dgrip=float(d[[7, 15]].mean()))
+        if mem_rec is not None:
+            self.episode_log.setdefault('memory', []).append(mem_rec)
         if m.action_noise:
             g = torch.Generator(device=self.device).manual_seed((noise_seed + 31337) % 2**31)
             first_ok = 1 if first else 0  # never perturb the conditioning frame
@@ -637,6 +753,19 @@ class FawamServer(VA_Server):
                 g['cand_chosen'] = np.array([c['chosen'] for c in cand])
                 n = max(len(c['scores']) for c in cand)
                 g['cand_scores'] = np.array([c['scores'] + [np.nan] * (n - len(c['scores'])) for c in cand])
+            mem = log.get('memory', [])
+            if mem:
+                gm = g.require_group('memory')
+                gm['frame_st_id'] = np.array([r['frame_st_id'] for r in mem])
+                gm['attn_action'] = np.stack([r['attn_action'] for r in mem])          # chunk, layer
+                if all(r['attn_video'] is not None for r in mem):
+                    gm['attn_video'] = np.stack([r['attn_video'] for r in mem])
+                for key in ('share_action', 'share_video', 'infl_action', 'infl_video', 'memory_tokens',
+                            'cf_dxyz_left', 'cf_dxyz_right', 'cf_dz_left', 'cf_dz_right', 'cf_dgrip'):
+                    gm[key] = np.array([np.nan if r.get(key) is None else r.get(key, np.nan) for r in mem],
+                                       dtype=np.float64)
+            if log.get('ttt_update'):
+                g.attrs['ttt_update'] = json.dumps(log['ttt_update'])
             gaps = log.get('gaps', [])
             if gaps:
                 g['gap_frame_st_id'] = np.array([x['frame_st_id'] for x in gaps])

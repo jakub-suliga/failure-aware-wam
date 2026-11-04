@@ -125,6 +125,38 @@ Loss senkt. 12 000 Schritte mit Gradient-Accumulation 4 (≈ 1–2 Tage auf eine
 
 Getestet auf der CPU: Paarung, Mischung und Laden mit echten Episoden. Die Paare waren dafür künstlich zugeordnet.
 
+### 5b. Welcher Adapter-Typ lernt am besten, Erinnerungen zu nutzen? (Sweep `p6e_icl_adapter_types`)
+
+Alle Meta-Adapter werden auf denselben Daten (P7) und demselben Format (vorgestellter + realer Fehlversuch) trainiert,
+6000 Schritte × 4. Nur das Modul ändert sich. Alle sind beim Start identisch zum Basismodell, eingefroren nach dem
+Meta-Training und reines ICL beim Test. Getestet mit einem kleinen Modell: identisch beim Start, Gradienten,
+Speichern/Laden. Beim TTT-Zweig zusätzlich: Die Erinnerung ändert die Ausgabe, und der Meta-Gradient läuft durch den
+inneren Schritt.
+
+| Typ | Modul | Quelle |
+|---|---|---|
+| `adapterplus` (+ `_b32`, `_b512`) | Adapter+ nach Attention und Block, Bottleneck 128 / 32 / 512 | dein Dual-Site-Paper |
+| `adapterplus_video` / `_action` | nur ein Strom | WAM-TTT adaptiert nur den Video-Expert |
+| `adapterplus_first10` / `_last10` | nur frühe bzw. späte Layer | Ablation |
+| `houlsby` | Bottleneck-Adapter ohne gelernte Kanal-Skalierung | Houlsby 2019, Paper-Baseline |
+| `residual_mlp` | Residual-MLP ohne Norm und Skalierung | Paper-Baseline |
+| `lora_r16_attn` | LoRA r16 auf Self-Attention q/k/v/o | FailBank (r16) |
+| `lora_r16_attn_ffn`, `lora_r64_all` | LoRA zusätzlich auf FFN bzw. Cross-Attention | Ablation |
+| `ia3` | gelernte Skalierung von Keys, Values und FFN-Aktivierung | (IA)³ |
+| `adaln`, `ia3_adaln` | gelernte Verschiebung der AdaLN-Modulation pro Block | DiT-spezifisch |
+| `prompt_t3vf` | 16 lernbare Query-/Prompt-Tokens, gelesen über gated Attention | T³VF (nur die Query-Tokens werden adaptiert) |
+| `prompt_vane` | Bank aus 8 Prompts, Router wählt top-2 | VANE (Mixture of Latent Prompts) |
+| `ttt_wam`, `ttt_wam_both` | **Fast-Weight-Zweig**: Ein innerer SGD-Schritt auf der Erinnerung (Key-Value-Rekonstruktion) passt die Gewichte beim Einlesen an. Analytisch, also meta-trainierbar | WAM-TTT (dort: LoRA 30 / 0 vs. TTT 100 / 88,9) |
+| `svf_salt` | Skalierung der Singulärwerte der Key-Projektionen (Self + Cross, Layer 22–29) | SALT |
+| `dense_last2` | Full-Finetuning der Layer 28–29 (Attention + FFN) | Paper-Baseline (Full Finetuning) |
+| `ttt_plus_adapterplus`, `lora_plus_prompt` | Kombinationen | – |
+
+Jeder Typ läuft zusätzlich ohne Erinnerung (`icl_type_<t>_noctx`). Nur wenn der Typ **mit** Erinnerung besser ist als
+**ohne**, nutzt er wirklich den Kontext und ist nicht einfach ein besser finetuntes Modell.
+
+**Alle 23 Typen kommen in die Simulation** (1128 Jobs, mit und ohne Erinnerung). Validierungs-Loss und
+Offline-Screening laufen zusätzlich als Diagnose, nicht als Filter.
+
 ## 6. Zwei Testebenen
 
 1. **Offline-Screening (schnell, keine Simulation):** `fawam/icl_screen.py` bzw. `cluster/icl_screen_job.sh`.
@@ -144,6 +176,34 @@ Getestet auf der CPU: Paarung, Mischung und Laden mit echten Episoden. Die Paare
 | `p6c_icl_insert` | Wie (Abschnitt 4) | 264 |
 | `p6d_icl_meta` | Meta-trainiert (Abschnitt 5) | 396 |
 
+## 6a. Nutzt das Modell die Erinnerung überhaupt? (bei jedem Versuch mit Erinnerung gemessen)
+
+Erfolg allein zeigt nicht, *warum* etwas wirkt. Deshalb misst der Server in jedem Chunk, in dem eine Erinnerung im
+KV-Cache liegt (`fawam/server.py`, `Method.measure_memory`, Standard an), drei Dinge. Gespeichert wird das in
+`episode.h5:/fawam/memory`.
+
+| Messung | Wie | Lesart |
+|---|---|---|
+| **Aufmerksamkeit** pro Layer, getrennt für Video- und Aktions-Tokens | Attention-Masse der Queries auf die Erinnerungs-Tokens (mittlerer Denoising-Schritt, Mittel über Heads), geteilt durch den Anteil der Erinnerung an allen Tokens | 1 = wie jedes andere Token, < 1 = ignoriert, > 1 = bevorzugt |
+| **Einfluss** auf die Vorhersage | gleiche Eingabe einmal mit, einmal mit ausgeblendeter Erinnerung: relative Änderung der Video- bzw. Aktionsvorhersage | 0 = die Erinnerung ändert nichts |
+| **Kontrafakt** (Standard bei ICL-Versuchen) | der ganze Aktions-Chunk wird ein zweites Mal ohne Erinnerung entrauscht (gleiches Rauschen, ohne Cache-Commit): mittlere Abweichung der Arm-Positionen in mm, Greifhöhe, Greifer | wie viele Millimeter die Erinnerung die Bewegung verschiebt |
+| **Fast-Weight-Änderung** (nur TTT-Adapter) | ‖W₁ − W_init‖ / ‖W_init‖ pro Layer nach dem Einlesen | wie stark die Erinnerung die Gewichte bewegt |
+
+Auswertung: `python -m fawam.analysis_gap memory results/sweeps/<sweep>` erzeugt pro Methode:
+- die mittlere Aufmerksamkeitsquote, den Einfluss und den Kontrafakt,
+- die Aufschlüsselung nach Erfolg und Fehlschlag des Versuchs: Geht Nutzung der Erinnerung mit Erfolg einher?
+- das Layer-Profil (`memory_attention_per_layer.csv`).
+
+Das Offline-Screening schreibt dieselben Größen pro Variante mit.
+
+Typische Befunde, die man so erkennt:
+- **Erfolg ohne Nutzung:** gleicher Erfolg wie `retry_plain`, Aufmerksamkeit ≈ 0 und Einfluss ≈ 0.
+- **Nutzung ohne Erfolg:** hohe Aufmerksamkeit, Kontrafakt von einigen mm, aber in die falsche Richtung.
+- **Echtes ICL:** Der Kontrafakt verschiebt die Greifhöhe in Richtung der Korrektur, und der Erfolg steigt.
+
+Kosten: Die Attention-Messung braucht einen Schritt pro Chunk, also vernachlässigbar. Der volle Kontrafakt kostet etwa
++30 % Zeit pro Versuch mit Erinnerung. Abschalten mit `+cf_off`.
+
 ## 6b. Wie es andere Arbeiten machen: mit oder ohne Training?
 
 | Arbeit | ICL von wem? | Training nötig? | Was sie zeigen |
@@ -161,6 +221,21 @@ Getestet auf der CPU: Paarung, Mischung und Laden mit echten Episoden. Die Paare
 (Meta-Training oder ICL im Curriculum). Trainingsfrei klappt es, wenn ein großes VLM als Agent über einer eingefrorenen
 Policy lernt, nicht die Policy selbst. Das passt zu unserer Beobachtung (Demo im Kontext stört trainingsfrei) und
 begründet den Schwerpunkt auf dem Meta-Training. Die trainingsfreien Varianten bleiben als Kontrolle im Plan.
+
+## 6c. Wochenplan (alles in die Simulation)
+
+Grobe Kosten: ~45 min pro Job (10 Seeds, bis zu 2 Versuche, 2 Paare pro GPU, mit Kontrafakt).
+
+| Tag | Läuft | GPU-h (grob) |
+|---|---|---|
+| 1 | Setup + Smoke + Screening-Smoke. Parallel P0 (TABLE4 × z00/m05/m10/m075/Hard) und **P7 Meta-Daten** (160 Jobs) | ~250 |
+| 2 | Analyse auf P0/P7, Demo-Banken. **Meta-Training starten:** 10 Format-/Ablations-Adapter + 23 Typ-Adapter (je ~25 h). Parallel **p6a, p6b, p6c** (trainingsfrei, 984 Jobs) | ~750 + ~800 |
+| 3–4 | p6a–c laufen weiter, Meta-Adapter werden fertig | – |
+| 4–6 | **p6d** (Formate, 513 Jobs) und **p6e** (alle 23 Typen, 1128 Jobs) | ~1250 |
+| 7 | Auswertung (`compare`, `memory`), Nachläufe für unvollständige Zellen (`--status`, erneut `--submit`) | – |
+
+Zusammen ~3000 GPU-h. Mit ~20 gleichzeitigen GPUs passt das in eine Woche. Mit weniger GPUs bleibt die Reihenfolge
+gleich und es dauert entsprechend länger. Alle Sweeps sind fortsetzbar: Fertige Zellen werden übersprungen.
 
 ## 7. Ablauf auf dem Cluster
 
