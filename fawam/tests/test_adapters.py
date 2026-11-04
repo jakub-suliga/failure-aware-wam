@@ -142,6 +142,8 @@ def test_types():
         "svf_salt": dict(kind="combo", svf_blocks=[1, 2], svf_targets=["self_k", "cross_k"]),
         "dense_fullft": dict(kind="combo", dense_blocks=[2], dense_targets=["attn", "ffn"]),
         "outside_channel": dict(kind="outside", outside_type="channel"),
+        "film_memory": dict(kind="combo", film_source="memory", film_rank=8),
+        "film_error": dict(kind="combo", film_source="error", film_rank=8),
     }
     base = make()
     base.create_empty_cache("pos", 8, 240, 32, device=DEV, dtype=torch.bfloat16, batch_size=1)
@@ -163,8 +165,17 @@ def test_types():
         # nudge zero-initialised parts so every parameter gets a gradient path
         with torch.no_grad():
             for k, p in aset.named_parameters():
-                if k.endswith((".B", "up.weight", ".gate", "Wo.weight", ".beta", ".D", ".s")) or k.startswith("adaln"):
+                if k.endswith((".B", "up.weight", ".gate", "Wo.weight", ".beta", ".D", ".s")) or k.startswith("adaln") \
+                        or (k.startswith("film") and k.endswith("up.bias")):
                     p.add_(1e-2)
+        h = m._fawam
+        if aset.cfg.film_source == "error":
+            h.ctx.film_error = torch.randn(16, device=DEV)
+        if aset.cfg.film_source == "memory":  # simulate a prefilled memory
+            h.ctx.ttt_accumulate = True
+            with torch.no_grad():
+                m(video_input(frame_st=0), update_cache=0)
+            h.ctx.ttt_accumulate = False
         if aset.outside is not None and not params:  # outside-only: gradient through the latent correction
             params = aset.outside_parameters()
             aset.outside(torch.randn(1, 48, 2, 24, 20, device=DEV)).pow(2).mean().backward()

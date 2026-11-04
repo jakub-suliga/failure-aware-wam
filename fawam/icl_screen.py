@@ -83,6 +83,8 @@ def run_variant(server, fail_dir, fix_dir, key, name):
     if m.learn and m.learn.get("icl"):
         icl = m.learn["icl"]
         spec = make_context_spec(icl, fail_dir, key[2], key[1], [str(fail_dir)], [])
+        from fawam.adapters import error_vector
+        spec["error_vec"] = error_vector(ana).tolist()
         prompt, neg = icl_prompt(icl, ana, instr)
         adapter = m.learn.get("meta_adapter") or adapter
     method = dict(name=name, adapter_path=adapter, negative_prompt=neg)

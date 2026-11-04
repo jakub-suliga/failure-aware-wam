@@ -352,6 +352,10 @@ class FailFixDataset(EpisodeDataset):
         cat = {k: np.concatenate([p[k] for p in seq], axis=1) for k in ("latents", "actions", "actions_mask",
                                                                          "weight_video", "weight_action")}
         fail_ep = self._load(fail_path, "obs")
+        from fawam.adapters import error_vector
+        mem_path = fail_path if kind == "own" else None
+        ana_p = Path(fail_path) / "analysis.json"
+        err = error_vector(json.loads(ana_p.read_text())) if (kind in ("own", "cross") and ana_p.exists()) else None
         use_corr = kind in ("own",) and self.rng.random() < self.p_text
         text = fail_ep["correction"] if use_corr else fail_ep["text"]
         text = "" if self.rng.random() < self.cfg_prob else text
@@ -360,7 +364,9 @@ class FailFixDataset(EpisodeDataset):
                     context_frames=torch.tensor(ctx_frames), weight_video=torch.from_numpy(cat["weight_video"][0]),
                     weight_action=torch.from_numpy(cat["weight_action"][0]),
                     actions_neg=torch.from_numpy(cat["actions"]), window_mask=torch.zeros(cat["latents"].shape[1]),
-                    relabeled=torch.tensor(False), kind=kind)
+                    relabeled=torch.tensor(False), kind=kind,
+                    error_vec=torch.from_numpy(err if err is not None else np.zeros(16, np.float32)),
+                    has_error=torch.tensor(err is not None))
 
 
 def split_pairs_by_seed(ds, val_frac=0.1, seed=0):

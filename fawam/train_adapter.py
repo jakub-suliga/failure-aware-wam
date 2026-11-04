@@ -161,7 +161,8 @@ def train_inside(a):
                                 prompt_tokens=a.prompt_tokens, prompt_bank=a.prompt_bank, prompt_topk=a.prompt_topk,
                                 ttt_dim=a.ttt_dim, ttt_eta=a.ttt_eta, ttt_streams=a.ttt_streams,
                                 svf_blocks=a.svf_blocks, svf_targets=a.svf_targets, dense_blocks=a.dense_blocks,
-                                dense_targets=a.dense_targets, outside_type=a.outside_type)
+                                dense_targets=a.dense_targets, outside_type=a.outside_type,
+                                film_source=a.film_source, film_rank=a.film_rank)
         aset = fa.AdapterSet(acfg).to(device)
     fa.attach(tf, aset)
     params = aset.inside_parameters()
@@ -198,6 +199,7 @@ def train_inside(a):
             fw[:ctx] = 0
             fwa[:ctx] = 0
         tf._fawam.ctx.ctx_frames = ctx  # TTT branches: the first ctx frames are the in-context memory
+        tf._fawam.ctx.film_error = s["error_vec"].to(device) if bool(s.get("has_error", False)) else None
         pred = tf(input_dict, train_mode=True)
         lv, la = flow_losses(input_dict, pred, patch, sched_v, sched_a, fw, fwa)
         loss = a.lambda_video * lv + a.lambda_action * la
@@ -275,6 +277,7 @@ def validate(tf, ds, a, sched_v, sched_a, patch, device, n=24):
             fw = torch.ones(lat.shape[2])
             fw[:ctx] = 0
             tf._fawam.ctx.ctx_frames = ctx
+            tf._fawam.ctx.film_error = smp["error_vec"].to(device) if bool(smp.get("has_error", False)) else None
             lv, la = flow_losses(inp, tf(inp, train_mode=True), patch, sched_v, sched_a, fw, fw)
             tv, ta = tv + float(lv), ta + float(la)
         out.append((tv / n, ta / n))
@@ -389,6 +392,8 @@ def main():
     ap.add_argument("--dense_blocks", type=int, nargs="*", help="full fine-tuning (dense deltas) of these blocks")
     ap.add_argument("--dense_targets", nargs="+", default=["attn"])
     ap.add_argument("--outside_type", default="mlp", choices=["mlp", "channel"])
+    ap.add_argument("--film_source", default="none", choices=["none", "memory", "error"])
+    ap.add_argument("--film_rank", type=int, default=64)
     ap.add_argument("--inside_streams", nargs="+", default=["video", "action"])
     ap.add_argument("--blocks", type=int, nargs="*", help="block indices with adapters (default: all 30)")
     ap.add_argument("--bottleneck", type=int, default=128)

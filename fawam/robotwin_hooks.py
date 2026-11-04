@@ -320,7 +320,10 @@ class LearnFromFailure:
 
     def build_context(self, ep_dir, ana, seed):
         """Memory spec for fawam.server._prefill from the ICL config (docs/ICL.md)."""
-        return make_context_spec(self.cfg["icl"], ep_dir, seed, self.setting, self.seed_failures, self.successes)
+        spec = make_context_spec(self.cfg["icl"], ep_dir, seed, self.setting, self.seed_failures, self.successes)
+        from fawam.adapters import error_vector
+        spec["error_vec"] = error_vector(ana).tolist()  # used only by FiLM-error adapters
+        return spec
 
     def first_method(self):
         m = self.copy.deepcopy(self.m)

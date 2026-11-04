@@ -18,6 +18,8 @@ tokens belong to, or, for training (video and action tokens concatenated), the s
 """
 import json
 import math
+
+import numpy as np
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -77,6 +79,11 @@ class AdapterConfig:
     dense_blocks: list = None
     dense_targets: list = field(default_factory=lambda: ["attn"])  # attn | ffn
     outside_type: str = "mlp"       # mlp (residual MLP) | channel (channel-wise scale + shift, paper baseline)
+    # FiLM / conditional AdaLN: per-block offsets of the modulation table (scale/shift/gate) computed from
+    #   memory: the pooled in-context memory tokens at that block | error: a compact failure vector from the analysis
+    film_source: str = "none"       # none | memory | error
+    film_rank: int = 64
+    error_dim: int = 16
 
     @property
     def has_inside(self):
@@ -97,6 +104,10 @@ class AdapterConfig:
     @property
     def has_adaln(self):
         return self.kind == "adaln" or self.adaln
+
+    @property
+    def has_film(self):
+        return self.film_source in ("memory", "error")
 
     @property
     def has_prompt(self):
@@ -264,6 +275,45 @@ class TTTBranch(nn.Module):
         return (h.float() + self.Wo(q @ W.t())).type_as(h)
 
 
+class FiLMHead(nn.Module):
+    """Low-rank map condition -> offset of one block's modulation table (1, 6, dim); last layer zero-initialised
+    (AdaLN-Zero style), so the adapted block equals the base block at init."""
+
+    def __init__(self, cond_dim, dim, rank):
+        super().__init__()
+        self.norm = nn.LayerNorm(cond_dim)
+        self.down = nn.Linear(cond_dim, rank)
+        self.up = nn.Linear(rank, 6 * dim)
+        nn.init.zeros_(self.up.weight)
+        nn.init.zeros_(self.up.bias)
+        self.dim = dim
+
+    def forward(self, c):
+        return self.up(F.gelu(self.down(self.norm(c.float())))).view(-1, 6, self.dim)
+
+
+ERROR_TYPES = ["missed_grasp", "misaligned_grasp", "dropped", "misplaced", "unknown"]
+
+
+def error_vector(ana, dim=16):
+    """Compact failure description for FiLM-error: delta_m (3, in dm), arm one-hot (2), failure type one-hot (5),
+    gap statistics (max, mean, onset position), padded to dim."""
+    v = np.zeros(dim, np.float32)
+    if not ana or not ana.get("failed"):
+        return v
+    v[0:3] = np.asarray(ana.get("delta_m", [0, 0, 0]), np.float32) * 10
+    if ana.get("arm") in ("left", "right"):
+        v[3 + ("left", "right").index(ana["arm"])] = 1
+    ft = ana.get("failure_type", "unknown")
+    v[5 + (ERROR_TYPES.index(ft) if ft in ERROR_TYPES else 4)] = 1
+    g = np.array(list((ana.get("gap") or {}).values()), np.float32)
+    if len(g):
+        v[10], v[11] = g.max(), g.mean()
+        lat = ana.get("latent")
+        v[12] = (lat / max(len(g), 1)) if lat is not None else 0
+    return v
+
+
 class SVFDelta(nn.Module):
     """SALT: W(beta) = U diag(sigma * exp(beta)) V^T of a frozen linear, beta clipped to [-c, c]; only beta is trained.
     The SVD of the base weight is computed when attached (not saved)."""
@@ -363,6 +413,9 @@ class AdapterSet(nn.Module):
                                   for t in cfg.svf_targets}) if cfg.has_svf else nn.ModuleDict()
         self.dense = nn.ModuleDict({k: DenseDelta(i, o) for k, _, i, o in dense_specs(cfg)}) if cfg.has_dense \
             else nn.ModuleDict()
+        cond = cfg.dim if cfg.film_source == "memory" else cfg.error_dim
+        self.film = nn.ModuleDict({str(b): FiLMHead(cond, cfg.dim, cfg.film_rank) for b in cfg.block_ids()}) \
+            if cfg.has_film else nn.ModuleDict()
 
     def inside_parameters(self):
         """Trainable non-outside parameters (Houlsby-style adapters keep their fixed scale out)."""
@@ -419,7 +472,8 @@ class AdapterContext:
         self.segments = None
         self.enabled = True
         self.steer = {}  # block index -> (vector (dim,), alpha, streams)
-        self.ttt_accumulate = False  # server prefill: TTT branches collect memory statistics
+        self.ttt_accumulate = False  # server prefill: TTT branches / FiLM collect memory statistics
+        self.film_error = None  # FiLM-error condition (error_dim,) tensor
         self.ctx_frames = 0  # training: in-context frames at the start of the sequence (TTT memory)
         self.n_frames = 1
 
@@ -462,6 +516,10 @@ def adapted_block_forward(block, block_id, holder, hidden_states, encoder_hidden
     table = block.scale_shift_table
     if aset is not None and ctx.enabled and str(block_id) in aset.adaln:
         table = table + aset.adaln[str(block_id)]
+    if aset is not None and ctx.enabled and str(block_id) in aset.film:
+        off = _film_offset(hidden_states, aset, ctx, block_id, holder)
+        if off is not None:
+            table = table + off[:1].to(table.dtype)
     temb_scale_shift_table = table[None] + temb.float()
     shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = \
         rearrange(temb_scale_shift_table, 'b l n c -> b n l c').chunk(6, dim=1)
@@ -489,6 +547,33 @@ def adapted_block_forward(block, block_id, holder, hidden_states, encoder_hidden
     hidden_states = (hidden_states.float() + ff_output.float() * c_gate_msa).type_as(hidden_states)
     hidden_states = _site(hidden_states, aset, ctx, block_id, "block")
     return _steer(hidden_states, ctx, block_id)
+
+
+def _film_offset(h, aset, ctx, block_id, holder):
+    """FiLM condition for this block. memory: mean of the block-input hidden states of the in-context memory tokens
+    (training: clean context frames of the sequence; inference: summed while the server prefills the memory).
+    error: the failure vector set by the client/trainer. None -> no offset (no memory / no failure)."""
+    head = aset.film[str(block_id)]
+    if aset.cfg.film_source == "error":
+        e = ctx.film_error
+        return None if e is None else head(e.to(h.device)[None])
+    b = str(block_id)
+    if ctx.segments is not None:  # training
+        if ctx.ctx_frames <= 0:
+            return None
+        nf = max(ctx.n_frames, 1)
+        parts, start = [], 0
+        for i, (n, stream) in enumerate(ctx.segments):
+            if i % 2 == 1:  # clean segments
+                parts.append(h[:, start:start + (n // nf) * ctx.ctx_frames])
+            start += n
+        return head(torch.cat(parts, dim=1).float().mean(1))
+    if ctx.ttt_accumulate:  # prefill: collect, no offset yet
+        s_, n_ = holder.film_stats.get(b, (0.0, 0))
+        holder.film_stats[b] = (s_ + h[:1].float().sum(1), n_ + h.shape[1])
+        return None
+    st = holder.film_stats.get(b)
+    return None if st is None else head(st[0] / st[1])
 
 
 def _ttt(h, aset, ctx, block_id, holder):
@@ -532,6 +617,7 @@ class AdapterHolder:
         self.adapters = None
         self.ctx = AdapterContext()
         self.ttt_stats = {}  # (stream, block) -> (S_kk, S_vk, n) of the prefilled in-context memory
+        self.film_stats = {}  # block -> (sum of memory hidden states, count) for FiLM-memory
 
 
 def _unwrap(block):
@@ -639,5 +725,6 @@ def attach(transformer, aset):
     if aset is not None and (aset.cfg.has_lora or aset.cfg.has_ia3 or aset.cfg.has_svf or aset.cfg.has_dense):
         add_lora(transformer, aset)
     holder.ttt_stats = {}
+    holder.film_stats = {}
     holder.adapters = aset
     return holder

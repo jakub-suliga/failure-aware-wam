@@ -42,6 +42,9 @@ from utils.sever_utils import run_async_server_mode  # noqa: E402
 from wan_va_server import VA_Server  # noqa: E402
 
 KIND_VIDEO, KIND_ACTION = 0, 1
+# memory token labels for the attention breakdown (docs/ICL.md 6a)
+MEM_PARTS = ["failure:pred", "failure:obs", "failure:diff", "demo:obs", "success:obs", "other"]
+MEM_CAMS = ["cam_high", "cam_left_wrist", "cam_right_wrist", "action"]
 
 
 def canvas_from_h5(f, group="obs", rows=None):
@@ -82,6 +85,7 @@ class FawamServer(VA_Server):
             attn.attn_op = partial(self._memory_probe_op, i, attn, attn.attn_op)
         self.ctx_slots = None
         self._prefilling = False
+        self._mem_part = self._mem_win = self._mem_cam = self._call_mem = None
         self._probe = None  # list per layer of attention mass on memory tokens while a probe is active
         stats_path = ROOT / "artifacts" / "gap_stats.json"
         self.gap_stats = json.loads(stats_path.read_text()) if stats_path.exists() else {}
@@ -94,6 +98,12 @@ class FawamServer(VA_Server):
             self._excl[slots] = False
         if first_block and self.ctx_slots is not None and not self._prefilling:
             self.ctx_slots[slots] = False  # a memory slot that gets overwritten is no longer memory
+        if first_block and self._prefilling and self._call_mem is not None and self._mem_part is not None:
+            part, rel, cam = self._call_mem
+            n = len(slots)
+            self._mem_part[slots] = part
+            self._mem_win[slots] = rel[:n]
+            self._mem_cam[slots] = cam[:n]
         if first_block and self._slot_kind is not None and self._call is not None:
             kind, frames = self._call
             self._slot_kind[slots] = kind
@@ -164,11 +174,18 @@ class FawamServer(VA_Server):
             self._probe[li].append((0.0, 0.0))
             return out
         qq, kk = q[0].float(), k[0].float()  # conditional branch; (Lq, H, D), (Lk, H, D)
-        mass = 0.0
+        per_key = torch.zeros(kk.shape[0], device=kk.device)
         for h in range(qq.shape[1]):  # per head keeps the score matrix small
             w = (qq[:, h] @ kk[:, h].t() / qq.shape[-1] ** 0.5).softmax(-1)
-            mass += float(w[:, mem].sum(-1).mean())
-        self._probe[li].append((mass / qq.shape[1], float(mem.float().mean())))
+            per_key += w.mean(0)
+        per_key /= qq.shape[1]
+        mk = per_key[mem]
+        vm = valid[mem]
+        brk = dict(part=torch.bincount(self._mem_part[vm], weights=mk, minlength=len(MEM_PARTS)).cpu().numpy(),
+                   cam=torch.bincount(self._mem_cam[vm], weights=mk, minlength=len(MEM_CAMS)).cpu().numpy(),
+                   win=torch.bincount(self._mem_win[vm], weights=mk, minlength=2).cpu().numpy(),
+                   part_share=torch.bincount(self._mem_part[vm], minlength=len(MEM_PARTS)).cpu().numpy() / len(valid))
+        self._probe[li].append((float(mk.sum()), float(mem.float().mean()), brk))
         return out
 
     @contextmanager
@@ -186,11 +203,18 @@ class FawamServer(VA_Server):
         r = self._last_probe
         mass = np.array([np.mean([x[0] for x in l]) if l else np.nan for l in r], np.float32)
         share = float(np.nanmean([np.mean([x[1] for x in l]) for l in r if l])) if any(r) else np.nan
+        brks = [x[2] for l in r for x in l if len(x) > 2]
+        self._last_breakdown = {k: np.mean([b[k] for b in brks], 0) for k in ("part", "cam", "win", "part_share")} \
+            if brks else None
         return mass, share
 
     def _new_slot_meta(self):
         self.ctx_slots = None
         n = self._cache()["k"].shape[1]
+        self._mem_part = torch.full((n,), len(MEM_PARTS) - 1, device=self.device, dtype=torch.long)
+        self._mem_win = torch.zeros(n, device=self.device, dtype=torch.long)  # 1 = inside the failure window
+        self._mem_cam = torch.zeros(n, device=self.device, dtype=torch.long)
+        self._call_mem = None
         self._slot_kind = torch.full((n,), -1, device=self.device, dtype=torch.long)
         self._slot_frame = torch.full((n,), -1, device=self.device, dtype=torch.long)
         self._excl = torch.zeros(n, device=self.device, dtype=torch.bool)
@@ -248,6 +272,7 @@ class FawamServer(VA_Server):
 
     def _reset(self, prompt=None, seed=None, method=None, task=None):
         self._apply_method(method)
+        self.holder.ctx.film_error = None
         super()._reset(prompt=prompt, seed=seed)
         if self.method.negative_prompt:
             self._encode_negative(self.method.negative_prompt)
@@ -324,6 +349,7 @@ class FawamServer(VA_Server):
             self.ep_frame0 = self.frame_st_id
             self.init_ready = False
             self.holder.ttt_stats = {}
+            self.holder.film_stats = {}
             if obs.get("prefill"):  # reset-with-memory: the next first chunk starts after this in-context memory
                 self.pending_prefill = obs["prefill"]
         elif op == "truncate":
@@ -419,6 +445,9 @@ class FawamServer(VA_Server):
         base = start
         mask_before = self._cache()["mask"].clone()
         self.holder.ttt_stats = {}
+        self.holder.film_stats = {}
+        if spec.get("error_vec") is not None:  # FiLM-error condition from the failure analysis
+            self.holder.ctx.film_error = torch.tensor(spec["error_vec"], dtype=torch.float32, device=self.device)
         self.holder.ctx.ttt_accumulate = True  # TTT fast-weight branches learn from the memory while it is written
         self._prefilling = True
         for it in items:
@@ -458,8 +487,21 @@ class FawamServer(VA_Server):
                     act_c = self.preprocess_action(act).to(lat_c)
                     fst = seg0 + int(li[crow[0]]) - li0
                     input_dict = self._prepare_latent_input(lat_c, act_c, frame_st_id=fst)
+                    part = MEM_PARTS.index(f"{it.get('role', 'failure')}:{group}") \
+                        if f"{it.get('role', 'failure')}:{group}" in MEM_PARTS else len(MEM_PARTS) - 1
+                    L = ana.get("latent") if ana else None
+                    win = torch.tensor([int(L is not None and L - 4 <= int(li[r]) <= L + 2) for r in crow],
+                                       device=self.device)
+                    per_v = (self.latent_height // 2) * (self.latent_width // 2)
+                    gh, gw = self.latent_height // 2, self.latent_width // 2
+                    cam_grid = torch.zeros(gh, gw, dtype=torch.long, device=self.device)  # T-canvas: wrists on top
+                    cam_grid[:gh // 3, :gw // 2], cam_grid[:gh // 3, gw // 2:] = 1, 2
+                    self._call_mem = (part, win.repeat_interleave(per_v), cam_grid.flatten().repeat(len(crow)))
                     self._tf(self._repeat_input_for_cfg(input_dict['latent_res_lst']), 2, False, fst, len(crow))
+                    self._call_mem = (part, win.repeat_interleave(self.action_per_frame),
+                                      torch.full((len(crow) * self.action_per_frame,), 3, device=self.device))
                     self._tf(self._repeat_input_for_cfg(input_dict['action_res_lst']), 2, True, fst, len(crow))
+                    self._call_mem = None
                 if not aligned:
                     base += li1 - li0 + 1 + gap
                 self.episode_log["prefill"].append(dict(path=str(ep), group=group, actions=it.get("actions", "executed"),
@@ -504,6 +546,7 @@ class FawamServer(VA_Server):
                     with self._probing():
                         pred = self._video_step(latents, t, latent_cond, frame_st_id, 0)
                     self._mem_video = self._probe_summary()
+                    self._mem_video_brk = self._last_breakdown
                     if self.method.memory_counterfactual != "off":
                         base_excl = self._excl if excl is not None else None
                         both = mem if base_excl is None else (mem | base_excl)
@@ -600,7 +643,7 @@ class FawamServer(VA_Server):
         latent_cond = init_latent[:, :, 0:1].to(self.dtype) if first else None
 
         with torch.no_grad():
-            self._mem_video = self._mem_video_infl = None
+            self._mem_video = self._mem_video_infl = self._mem_video_brk = None
             results = [self._denoise_video(c, timesteps, latent_cond, frame_st_id, first, probe=(ci == 0))
                        for ci, c in enumerate(cands)]
             idx, scores = self._score_candidates([r[0] for r in results], latent_cond, frame_st_id, noise_seed)
@@ -633,6 +676,7 @@ class FawamServer(VA_Server):
                         with self._probing():
                             pred = self._action_noise(actions, t, action_cond, frame_st_id, 0, excl_c)
                         a_mass, a_share = self._probe_summary()
+                        a_brk = self._last_breakdown
                         infl = np.nan
                         if m.memory_counterfactual != "off":
                             both = mem if excl_c is None else (mem | excl_c)
@@ -641,7 +685,8 @@ class FawamServer(VA_Server):
                         v_mass, v_share = self._mem_video if self._mem_video is not None else (None, np.nan)
                         mem_rec = dict(frame_st_id=int(frame_st_id), attn_action=a_mass, share_action=a_share,
                                        infl_action=infl, attn_video=v_mass, share_video=v_share,
-                                       infl_video=self._mem_video_infl, memory_tokens=int(mem.sum()))
+                                       infl_video=self._mem_video_infl, memory_tokens=int(mem.sum()),
+                                       brk_action=a_brk, brk_video=getattr(self, "_mem_video_brk", None))
                     else:
                         pred = self._action_noise(actions, t, action_cond, frame_st_id, 0, excl_c)
                     if use_ig and i < m.imagination_guidance_until * (n_steps - 1):
@@ -760,6 +805,13 @@ class FawamServer(VA_Server):
                 gm['attn_action'] = np.stack([r['attn_action'] for r in mem])          # chunk, layer
                 if all(r['attn_video'] is not None for r in mem):
                     gm['attn_video'] = np.stack([r['attn_video'] for r in mem])
+                for stream in ("action", "video"):  # attention breakdown: summed over layers' mean, per label
+                    brks = [r.get(f"brk_{stream}") for r in mem]
+                    if all(b is not None for b in brks):
+                        for k in ("part", "cam", "win", "part_share"):
+                            gm[f"brk_{stream}_{k}"] = np.stack([b[k] for b in brks])
+                gm.attrs['parts'] = json.dumps(MEM_PARTS)
+                gm.attrs['cams'] = json.dumps(MEM_CAMS)
                 for key in ('share_action', 'share_video', 'infl_action', 'infl_video', 'memory_tokens',
                             'cf_dxyz_left', 'cf_dxyz_right', 'cf_dz_left', 'cf_dz_right', 'cf_dgrip'):
                     gm[key] = np.array([np.nan if r.get(key) is None else r.get(key, np.nan) for r in mem],
