@@ -462,6 +462,11 @@ def main():
     if page.exists():
         (out / "index.html").write_text(page.read_text())
     print(f"{len(variants)} variants, {len(used)} videos, {time.time() - t0:.0f} s -> {out}")
+    try:  # markdown copy for the repo (docs/RESULTS.md, docs/results_summary.json)
+        from fawam import report_md
+        report_md.main(out / "report.json")
+    except Exception as e:
+        print(f"report_md failed: {e!r}")
 
 
 if __name__ == "__main__":

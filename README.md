@@ -6,6 +6,7 @@ test-time methods, few-shot adapters and in-context learning on top of the froze
 
 - **Goal and current plan: [docs/GOAL.md](docs/GOAL.md), [docs/PLAN.md](docs/PLAN.md)** (2026-11-10; they replace the scope of the
   older experiment plans below)
+- **All results, problems, analyses and running work: [docs/RESULTS.md](docs/RESULTS.md)** (generated from the report by `fawam/report_md.py`, numbers in [docs/results_summary.json](docs/results_summary.json)); current work plan (hidden calibration offsets): [docs/PLAN_HID.md](docs/PLAN_HID.md)
 - Findings so far: [docs/FINDINGS.md](docs/FINDINGS.md) (the imagination-execution gap)
 - Experiment plan, methods, data generation, training, cluster workflow: [docs/EXPERIMENTS.md](docs/EXPERIMENTS.md)
 
