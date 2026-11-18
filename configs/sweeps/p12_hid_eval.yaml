@@ -1,0 +1,17 @@
+# p12 hid eval, T1 (plan 2026-11-18): hidden translation offsets on the 3 held-out tasks (never trained on).
+# Attempt 1 = original model under o, retry = variant. Methods are chosen by the pipeline (stage hid_eval) from the
+# configurations that passed the training gate; each with ctx / noctx / shuf.
+name: p12_hid_eval
+out: results/sweeps/p12_hid_eval
+episodes: 30
+per_job: 10
+n_par: 2
+time: "02:00:00"
+seed_offset: 5000
+tasks: [move_playingcard_away, place_object_scale, move_pillbottle_pad]
+configs: [hid_trans]
+methods: [retry_plain, icl_hid_lora, icl_hid_lora_noctx, icl_hid_lora_shuf,
+          hidm3_C2, hidm3_C2_noctx, hidm3_C2_shuf, hidm3_C2_aux03, hidm3_C2_aux03_noctx, hidm3_C2_aux03_shuf,
+          hidm3_C3, hidm3_C3_noctx, hidm3_C3_shuf, hidm3_C3_aux03, hidm3_C3_aux03_noctx, hidm3_C3_aux03_shuf,
+          hidm3_C4, hidm3_C4_noctx, hidm3_C4_shuf, hidm3_C4_aux03, hidm3_C4_aux03_noctx, hidm3_C4_aux03_shuf,
+          hidm3_C5, hidm3_C5_noctx, hidm3_C5_shuf, hidm3_C5_aux03, hidm3_C5_aux03_noctx, hidm3_C5_aux03_shuf]

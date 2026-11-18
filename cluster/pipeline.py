@@ -220,6 +220,51 @@ P7BC_ROOTS = " ".join(str(ROOT / "results/sweeps" / s / "base" / c) for s, cs in
 DIST_TRAIN = [f"failfix_dist_{t}_vlm" for t in ("film_memory_plus_adapterplus", "lora_r16_attn", "adapterplus",
                                                   "ttt_wam")] + ["failfix_dist_ft_adapterplus"]
 ADAPTERS = ROOT / "artifacts" / "adapters"
+# hid minimal path (plan 2026-11-18, docs/PLAN_HID.md): p10_hid_data -> leak test + fail bank -> M3 (all C x aux in
+# one job) and C1xM1 (failfix_hid_lora) -> training gate -> p12_hid_eval only for configurations that passed.
+HID_ROOT = ROOT / "results/sweeps/p10_hid_data/base/hid_trans"
+HID_M3 = ROOT / "artifacts/hid_m3"
+
+
+def hid_leak_ok():
+    """Leak test passed: o is not readable from the first frame (R² < 0.1 for every component)."""
+    p = HID_ROOT / "leak_test.json"
+    if not p.exists():
+        return False
+    first = json.loads(p.read_text()).get("first frame") or {}
+    return bool(first) and max(first.values()) < 0.1
+
+
+def hid_m3_passed():
+    out = []
+    for g in sorted(HID_M3.glob("*/gate.json")):
+        if json.loads(g.read_text()).get("passed"):
+            c = g.parent.name  # e.g. C3_M3_aux0.3
+            out.append("hidm3_" + c.split("_M3")[0] + c.split("_M3")[1].replace(".", "").replace("_aux", "_aux"))
+    return out
+
+
+def hid_lora_passed():
+    """C1xM1 gate from the meta-training log: last validation loss with memory < 0.9 x without memory."""
+    p = ADAPTERS / "failfix_hid_lora" / "train_inside.jsonl"
+    if not (ADAPTERS / "failfix_hid_lora" / "adapter.pt").exists() or not p.exists():
+        return False
+    vals = [json.loads(l) for l in p.read_text().splitlines() if '"val_action"' in l]
+    return bool(vals) and vals[-1]["val_action"] < 0.9 * vals[-1]["val_action_noctx"]
+
+
+def hid_eval():
+    methods = ["retry_plain"]
+    for m in hid_m3_passed():
+        methods += [m, m + "_noctx", m + "_shuf"]
+    if hid_lora_passed():
+        methods += ["icl_hid_lora", "icl_hid_lora_noctx", "icl_hid_lora_shuf"]
+    (GATES / "hid_gate.json").write_text(json.dumps(dict(methods=methods)))
+    if len(methods) == 1:  # nothing passed the gate: no simulation (plan, section 6)
+        return 0
+    return sweep("p12_hid_eval", "--methods", *methods, prio=0)
+
+
 # P8s (user 2026-11-18): P7d data (stronger/new disturbances) -> detailed VLM analysis of P7b+c+d -> adapters with and
 # without the base model trained -> p8s_strong. The first P7d pass (12 episodes per cell) was submitted by hand.
 P7BCD_ROOTS = P7BC_ROOTS + " " + " ".join(str(ROOT / "results/sweeps/p7d_meta_data_strong/base" / c) for c in
@@ -359,6 +404,17 @@ def stages(jobs):
             any((ADAPTERS / n / "adapter.pt").exists() for n in STRONG_TRAIN),
          lambda: sweep("p8s_strong", "--methods", *[m for n in STRONG_TRAIN if (ADAPTERS / n / "adapter.pt").exists()
                                                     for m in STRONG_METHODS[n]], prio=0, env=VLM_ENV)),
+        ("hid_leak", lambda: any(HID_ROOT.glob("episodes/*/*/*/episode.h5")) and idle(jobs, "p10_hid_data"),
+         lambda: cpu_job("hid_leak", f"$PY_RT -m fawam.hid_leak {HID_ROOT} && $PY_RT -m fawam.demo_bank build "
+                                     f"{HID_ROOT} --out {ROOT}/artifacts/fail_bank/hid_trans_eval --success false "
+                                     f"--drivers policy")),
+        ("hid_train", lambda: _stage_done("hid_leak") and hid_leak_ok(),
+         lambda: gpu_job("train_hid_m3", dict(ROOTS=str(HID_ROOT), OUT=str(HID_M3), STEPS="1500",
+                                               EXTRA="--max_hours 2.5"), "train_hid_job.sh", prio=0, time="03:00:00")
+         + train(["failfix_hid_lora"], prio=0, env=FAST_ENV)),
+        ("hid_eval", lambda: _stage_done("hid_train") and sacct_state("fawam_train_hid_m3") in ("COMPLETED", "FAILED",
+                                                                                                 "TIMEOUT")
+            and trainings_idle(jobs, ["failfix_hid_lora"]), hid_eval),
         ("dist_eval_rest", lambda: all((ADAPTERS / n / "adapter.pt").exists()
                                        for n in ("failfix_dist_ttt_wam_vlm", "failfix_dist_ft_adapterplus")),
          lambda: sweep("p8d_heldout_type", "--methods", "icl_dist_ttt_wam_VP_noctx", "ft_dist_adapterplus", prio=0,
