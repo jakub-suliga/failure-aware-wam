@@ -9,7 +9,7 @@ episodes: 30
 per_job: 10
 n_par: 2
 time: "16:00:00"
-tasks: [move_playingcard_away, place_mouse_pad, pick_diverse_bottles, stack_blocks_two]
+tasks: [move_playingcard_away, place_mouse_pad, move_can_pot, handover_block]  # mid success at -5 cm in P0 (TABLE4 had floor/ceiling tasks)
 configs: [table_h_m05, table_h_m10]
 methods: [retry_plain, icl_type_adapterplus, icl_type_adapterplus_b32, icl_type_adapterplus_b512, icl_type_houlsby, icl_type_residual_mlp, icl_type_adapterplus_video, icl_type_adapterplus_action, icl_type_adapterplus_first10, icl_type_adapterplus_last10, icl_type_lora_r16_attn, icl_type_lora_r16_attn_ffn, icl_type_lora_r64_all, icl_type_ia3, icl_type_adaln, icl_type_ia3_adaln, icl_type_prompt_t3vf, icl_type_prompt_vane, icl_type_ttt_wam, icl_type_ttt_wam_both, icl_type_svf_salt, icl_type_dense_last2, icl_type_ttt_plus_adapterplus, icl_type_lora_plus_prompt, icl_type_film_memory, icl_type_film_error, icl_type_film_memory_plus_adapterplus,
           icl_type_adapterplus_noctx, icl_type_adapterplus_b32_noctx, icl_type_adapterplus_b512_noctx, icl_type_houlsby_noctx, icl_type_residual_mlp_noctx, icl_type_adapterplus_video_noctx, icl_type_adapterplus_action_noctx, icl_type_adapterplus_first10_noctx, icl_type_adapterplus_last10_noctx, icl_type_lora_r16_attn_noctx, icl_type_lora_r16_attn_ffn_noctx, icl_type_lora_r64_all_noctx, icl_type_ia3_noctx, icl_type_adaln_noctx, icl_type_ia3_adaln_noctx, icl_type_prompt_t3vf_noctx, icl_type_prompt_vane_noctx, icl_type_ttt_wam_noctx, icl_type_ttt_wam_both_noctx, icl_type_svf_salt_noctx, icl_type_dense_last2_noctx, icl_type_ttt_plus_adapterplus_noctx, icl_type_lora_plus_prompt_noctx, icl_type_film_memory_noctx, icl_type_film_error_noctx, icl_type_film_memory_plus_adapterplus_noctx]

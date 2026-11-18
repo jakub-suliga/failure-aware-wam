@@ -1,0 +1,16 @@
+# Task screening (user 2026-11-15): base LingBot-VA on the 42 RoboTwin tasks outside the 8 used so far, without a
+# disturbance (table_h_z00) and with disturbances other than the table height (user: not the table height):
+# dist_visual = background + clutter + light, dist_cam05 = head camera moved by up to 5 cm,
+# dist_robot10 = noisy start posture of both arms (std 0.1 rad, as in RoboTwin 2.0-Plus, arXiv 2603.22078). Goal: find tasks with ~10-20 % success as further test
+# tasks that the meta-training has never seen. 12 episodes per cell = a coarse estimate only.
+name: p0s_task_screen
+out: results/sweeps/p0s_task_screen
+episodes: 12
+per_job: 12
+n_par: 3
+time: "02:00:00"
+tasks: [move_playingcard_away, place_mouse_pad, pick_diverse_bottles, stack_blocks_two, place_shoe, move_can_pot, lift_pot, handover_block, adjust_bottle, beat_block_hammer, blocks_ranking_rgb, blocks_ranking_size, click_alarmclock, click_bell, dump_bin_bigbin, grab_roller, handover_mic, hanging_mug, move_pillbottle_pad, move_stapler_pad, open_laptop, open_microwave, pick_dual_bottles, place_a2b_left, place_a2b_right, place_bread_basket, place_bread_skillet, place_burger_fries, place_can_basket, place_cans_plasticbox, place_container_plate, place_dual_shoes, place_empty_cup, place_fan, place_object_basket, place_object_scale, place_object_stand, place_phone_stand, press_stapler, put_bottles_dustbin, put_object_cabinet, rotate_qrcode, scan_object, shake_bottle, shake_bottle_horizontally, stack_blocks_three, stack_bowls_three, stack_bowls_two, stamp_seal, turn_switch]
+configs: [table_h_z00, dist_cam05, dist_robot10, dist_objpose]
+# dist_objpose = 2 cm / +-15 deg noise on the object poses. dist_visual dropped 2026-11-15 (barely hurts LingBot-VA in
+# RoboTwin 2.0-Plus; user asked for camera, start posture and object pose).
+methods: [base]

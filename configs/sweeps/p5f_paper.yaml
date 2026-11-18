@@ -8,11 +8,14 @@ out: results/sweeps/p5f_paper
 episodes: 80
 per_job: 40
 n_par: 2
-time: "30:00:00"
-tasks: [move_playingcard_away, place_mouse_pad, pick_diverse_bottles, stack_blocks_two]
+time: "04:30:00"
+tasks: [move_playingcard_away, place_mouse_pad, move_can_pot, handover_block]  # mid success at -5 cm in P0 (TABLE4 had floor/ceiling tasks)
 configs: [table_h_m05, table_h_m10, demo_randomized]
 methods: [base, paper_P_dual, paper_P_inside, paper_P_outside, paper_P_dual_150, paper_Pw_dual, paper_PR_dual,
-          paper_PRI_dual, paper_OP_dual, paper_OP_dual_retry]
+          paper_PRI_dual, paper_OP_dual, paper_OP_dual_retry,
+          paper_P_dual_s10, paper_P_dual_s50, paper_P_dual_video, paper_P_dual_action, paper_P_dual_vidtok,
+          paper_P_dual_n1, paper_P_dual_n6, paper_P_dual_filt, paper_P_dual_lr3,
+          paper_P_dual_n1vidtok]
 method_overrides:
   paper_P_dual_150: {configs: [table_h_m05]}
   paper_OP_dual_retry: {configs: [table_h_m05]}

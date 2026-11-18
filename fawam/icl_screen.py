@@ -135,7 +135,7 @@ def main():
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-    os.environ.setdefault("MASTER_PORT", str(29900 + os.getpid() % 90))
+    os.environ.setdefault("MASTER_PORT", str(__import__("fawam.paths", fromlist=["free_port"]).free_port()))
     init_distributed(1, 0, 0)
     cfg = VA_CONFIGS["robotwin"]
     cfg.wan22_pretrained_model_name_or_path = a.model_path

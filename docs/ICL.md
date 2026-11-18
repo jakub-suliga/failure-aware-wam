@@ -1,5 +1,8 @@
 # In-Context-Learning aus eigenen Fehlern (Schwerpunkt)
 
+> **Stand 2026-11-10: Ziel und aktueller Umfang stehen in [GOAL.md](GOAL.md) und [PLAN.md](PLAN.md).** Dieses Dokument
+> beschreibt den Methodenkatalog im Code; der hier skizzierte Sweep-Umfang ist durch PLAN.md ersetzt.
+
 Stand: 2026-11-04. Das ist ab jetzt der Fokus der Arbeit. Die Adapter-Varianten ([METHOD.md](METHOD.md)) bleiben
 unverändert und dienen als Vergleich: Funktioniert dieselbe Fehlerinformation auch über Gewichte?
 

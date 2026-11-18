@@ -1,0 +1,729 @@
+<title>Failure-Aware WAM</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Public+Sans:wght@400;500;600;700&display=swap">
+<style>
+/* Layout: one column, three stops (Plan, Varianten, Detail). Petrol = Kontext, Orange = trainiert, ohne Farbe = eingefroren. */
+:root {
+  --bg: #f3f5f6; --panel: #ffffff; --ink: #16212b; --muted: #5a6875; --line: #d3dae0;
+  --ctx: #0b7285; --ctx-bg: #dff1f4; --trn: #b4500b; --trn-bg: #fbe8d6;
+  --ok: #1f7a3d; --ok-bg: #dcf0e2; --bad: #b3261e; --bad-bg: #f8dedb; --wait-bg: #e8ecef;
+  --sans: "Public Sans", "Segoe UI", Helvetica, Arial, sans-serif; --mono: "IBM Plex Mono", ui-monospace, Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #11181e; --panel: #19232b; --ink: #e5ebf0; --muted: #9aa8b5; --line: #33414c;
+  --ctx: #56c5d6; --ctx-bg: #12363d; --trn: #f0a060; --trn-bg: #43280f;
+  --ok: #6fcf8d; --ok-bg: #173623; --bad: #f28b82; --bad-bg: #451d1a; --wait-bg: #232f38; color-scheme: dark } }
+:root[data-theme="dark"] {
+  --bg: #11181e; --panel: #19232b; --ink: #e5ebf0; --muted: #9aa8b5; --line: #33414c;
+  --ctx: #56c5d6; --ctx-bg: #12363d; --trn: #f0a060; --trn-bg: #43280f;
+  --ok: #6fcf8d; --ok-bg: #173623; --bad: #f28b82; --bad-bg: #451d1a; --wait-bg: #232f38; color-scheme: dark }
+* { box-sizing: border-box }
+body { background: var(--bg); color: var(--ink); font: 15px/1.5 var(--sans) }
+.wrap { max-width: 1080px; margin: 0 auto; padding-block: 28px 64px; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); display: flex; flex-direction: column; gap: 40px }
+h1 { font-size: 28px; line-height: 1.15; margin: 0; font-weight: 700; text-wrap: balance }
+h2 { font-size: 20px; margin: 0 0 14px; font-weight: 700 }
+h3 { font-size: 13px; margin: 0 0 8px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--muted) }
+ul { margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 4px }
+.sub { color: var(--muted); font-size: 13.5px; margin-top: 6px }
+nav { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 14px }
+nav a { color: var(--ink); text-decoration: none; border: 1px solid var(--line); border-radius: 999px; padding: 4px 14px; font-size: 13.5px; background: var(--panel) }
+#dnav a { border: 1px solid var(--line); border-radius: 999px; padding: 3px 12px; text-decoration: none; color: var(--ink); background: var(--panel) }
+nav a:focus-visible, button:focus-visible, tr:focus-visible { outline: 2px solid var(--ctx); outline-offset: 2px }
+.grid { display: grid; gap: 14px }
+.g2 { grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)) }
+.g4 { grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)) }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 14px 16px; min-width: 0 }
+.fig { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 10px; overflow-x: auto }
+.fig svg { display: block; width: 100%; height: auto; min-width: 620px; color: var(--ink); font-family: var(--sans) }
+figure { margin: 0 } figcaption { font-size: 13px; color: var(--muted); margin-top: 6px }
+.pill { display: inline-block; font: 500 12px/1.5 var(--mono); padding: 1px 8px; border-radius: 999px; background: var(--wait-bg); color: var(--muted); white-space: nowrap }
+.pill.ok { background: var(--ok-bg); color: var(--ok) } .pill.bad { background: var(--bad-bg); color: var(--bad) }
+.pill.ctx { background: var(--ctx-bg); color: var(--ctx) } .pill.trn { background: var(--trn-bg); color: var(--trn) }
+.tw { overflow-x: auto; border: 1px solid var(--line); border-radius: 6px; background: var(--panel) }
+table { border-collapse: collapse; width: 100%; font-size: 14px }
+th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line); vertical-align: middle; white-space: nowrap }
+th { font-size: 12px; color: var(--muted); font-weight: 600; letter-spacing: .04em; text-transform: uppercase }
+tbody tr.v { cursor: pointer } tbody tr.v:hover td { background: var(--bg) }
+tr.sel td { background: var(--ctx-bg) } tr.grp td { background: var(--bg); font-weight: 600; font-size: 13px }
+tr.wait td { color: var(--muted) }
+button.more { font: 500 12px var(--sans); margin-left: 8px; padding: 2px 10px; border: 1px solid var(--line); border-radius: 999px; background: var(--panel); color: var(--ink); cursor: pointer }
+.wraptable td { white-space: normal; min-width: 150px; vertical-align: top } .wraptable td:first-child, .wraptable td:nth-child(2) { min-width: 0; white-space: nowrap }
+a { color: var(--ctx) }
+.num { font-family: var(--mono); font-variant-numeric: tabular-nums }
+.bar { display: inline-block; width: 110px; height: 10px; background: var(--wait-bg); border-radius: 2px; position: relative; vertical-align: middle; margin-right: 8px }
+.bar i { position: absolute; inset: 0 auto 0 0; background: var(--ink); border-radius: 2px }
+.bar b { position: absolute; top: -3px; bottom: -3px; border-left: 1px solid var(--muted); border-right: 1px solid var(--muted); background: transparent }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px }
+.tile { border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px; background: var(--panel); min-width: 0 }
+.tile .k { font-size: 12px; color: var(--muted) } .tile .n { font: 500 22px/1.2 var(--mono); font-variant-numeric: tabular-nums } .tile .d { font-size: 12.5px; color: var(--muted) }
+.seg { display: inline-flex; border: 1px solid var(--line); border-radius: 6px; overflow: hidden }
+.seg button { font: 500 13px var(--sans); padding: 5px 14px; border: 0; background: var(--panel); color: var(--ink); cursor: pointer }
+.seg button[aria-pressed="true"] { background: var(--ink); color: var(--panel) }
+.vid { display: flex; flex-direction: column; gap: 6px }
+video { width: 100%; max-width: 100%; border-radius: 4px; background: #000; display: block }
+.cap { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; font-size: 12.5px; color: var(--muted) }
+.mini svg { width: 100%; height: auto; display: block; color: var(--ink) }
+.empty { border: 1px dashed var(--line); border-radius: 6px; padding: 14px 16px; color: var(--muted); font-size: 14px }
+.detail { display: flex; flex-direction: column; gap: 18px }
+.view { display: flex; flex-direction: column; gap: 40px }
+.view[hidden] { display: none }
+.fig svg.arch { min-width: 860px }
+.q { font-size: 12.5px; color: var(--muted); white-space: normal; max-width: 460px }
+#rows td:first-child { white-space: normal; min-width: 240px }
+.steps { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 10px; counter-reset: st }
+.steps > li { counter-increment: st; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); padding: 10px 12px; min-width: 0 }
+.steps > li.ctx { border-color: var(--ctx); background: var(--ctx-bg) } .steps > li.trn { border-color: var(--trn); background: var(--trn-bg) }
+.steps .t { font-weight: 600; font-size: 14px; margin-bottom: 4px } .steps .t::before { content: counter(st) " · "; font-family: var(--mono); color: var(--muted) }
+.steps ul { font-size: 13px }
+.quote { font-size: 13.5px; border-left: 3px solid var(--ctx); padding-left: 10px; color: var(--ink) }
+</style>
+
+<div class="wrap">
+<header>
+  <h1>Failure-Aware WAM</h1>
+  <div class="sub" id="stamp"></div>
+  <nav><a href="#uebersicht">Stand, Plan &amp; Varianten</a><a href="#log">Probleme &amp; Analysen</a><a href="#training">Training &amp; VLM</a><a href="#paper">Paper</a></nav>
+</header>
+
+<div class="view" id="view-uebersicht">
+<section id="stand">
+  <h2>Stand</h2>
+  <div class="tiles" id="stiles"></div>
+  <div class="grid g2" style="margin-top:14px">
+    <div class="card"><h3>Was gerade bremst</h3><ul id="sblock"></ul></div>
+    <div class="card"><h3>Kette bis zur eigentlichen Idee (Block D)</h3><ul id="schain"></ul></div>
+  </div>
+  <div class="tw" style="margin-top:14px"><table><thead><tr><th>Jobs</th><th>läuft</th><th>wartet</th><th>fertig (48 h)</th><th>abgebrochen (48 h)</th></tr></thead><tbody id="sjobs"></tbody></table></div>
+</section>
+
+<section id="plan">
+  <h2>Plan</h2>
+  <figure>
+    <div class="fig">
+    <svg viewBox="0 0 900 150" role="img" aria-label="Ablauf: Versuch 1 scheitert, VLM-Analyse und Vorhersagefehler werden zum Kontext für Versuch 2.">
+      <defs><marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="currentColor"/></marker></defs>
+      <g font-size="13" fill="currentColor" text-anchor="middle">
+        <rect x="10" y="48" width="140" height="54" rx="4" fill="none" stroke="currentColor" stroke-width="1.3"/>
+        <text x="80" y="71" font-weight="600">Versuch 1</text><text x="80" y="89" font-size="11.5">scheitert (Tisch tiefer)</text>
+        <rect x="210" y="8" width="190" height="54" rx="4" fill="var(--ctx-bg)" stroke="var(--ctx)" stroke-width="1.5"/>
+        <text x="305" y="31" font-weight="600">VLM sieht den Rollout</text><text x="305" y="49" font-size="11.5">„3 cm zu hoch, tiefer greifen“</text>
+        <rect x="210" y="88" width="190" height="54" rx="4" fill="var(--ctx-bg)" stroke="var(--ctx)" stroke-width="1.5"/>
+        <text x="305" y="111" font-weight="600">Vorhersagefehler</text><text x="305" y="129" font-size="11.5">vorgestellt gegen echt, Verlauf</text>
+        <rect x="470" y="48" width="170" height="54" rx="4" fill="var(--ctx-bg)" stroke="var(--ctx)" stroke-width="1.5"/>
+        <text x="555" y="71" font-weight="600">Kontext fürs WAM</text><text x="555" y="89" font-size="11.5">Tokens, Text, Fehlersignal</text>
+        <rect x="710" y="48" width="180" height="54" rx="4" fill="none" stroke="currentColor" stroke-width="1.3"/>
+        <text x="800" y="71" font-weight="600">Versuch 2</text><text x="800" y="89" font-size="11.5">selber Seed: gelingt er?</text>
+      </g>
+      <g stroke="currentColor" stroke-width="1.3" fill="none">
+        <path d="M150 66 H180 V35 H208" marker-end="url(#ar)"/><path d="M150 84 H180 V115 H208" marker-end="url(#ar)"/>
+        <path d="M400 35 H435 V66 H468" marker-end="url(#ar)"/><path d="M400 115 H435 V84 H468" marker-end="url(#ar)"/>
+        <path d="M640 75 H708" marker-end="url(#ar)"/>
+      </g>
+    </svg>
+    </div>
+    <figcaption>Gemessen wird der Anteil der Fehlversuche, die im zweiten Versuch gelingen.</figcaption>
+  </figure>
+  <div class="grid g2" style="margin-top:14px">
+    <div class="card"><h3>Fragen</h3><ul>
+      <li>Wird die Policy bei −5 und −10 cm besser, wenn sie den Fehlerkontext bekommt?</li>
+      <li>Liefert das VLM eine brauchbare Korrektur?</li>
+      <li>Nutzt das WAM den Kontext wirklich?</li>
+      <li>Funktioniert der Dual-Site-Adapter nur mit Vorhersagefehler auf einem WAM?</li></ul></div>
+    <div class="card"><h3>Testaufbau</h3><ul>
+      <li>Eine Testaufgabe: <span class="num">move_playingcard_away</span></li>
+      <li>Tisch −5 cm und −10 cm</li>
+      <li>Alle Methoden auf denselben Seeds</li>
+      <li>Kontext-Training nur auf 7 anderen Aufgaben</li></ul></div>
+  </div>
+  <div class="grid g4" style="margin-top:14px" id="blocks"></div>
+  <div class="card" style="margin-top:14px"><h3>Danach: verallgemeinern</h3><ul>
+    <li>Was hier ein Lebenszeichen gibt, läuft auf 4 weiteren Aufgaben mit anderen Fehlertypen (Fallenlassen, falsch platziert, seitlich daneben).</li>
+    <li>Dazu das Hard-Setting mit zufälliger Szene statt Tischhöhe.</li>
+    <li>Zweites Modell: noch offen, Kandidat ist ein anderes World-Action-Model.</li></ul></div>
+</section>
+
+<section id="befunde">
+  <h2>Befunde bisher</h2>
+  <div class="card"><ul id="find"></ul></div>
+  <div class="sub">Wird bei jedem Daten-Update neu aus den Ergebnissen berechnet. Brüche sind gelöste / wiederholte Fehlversuche bzw. Erfolge / Eval-Episoden. Als Erfolg zählt nur, wenn die Karte am Ende auf dem Tisch liegt; vom Tisch geschleuderte Karten wertet der Simulator als Erfolg, hier sind sie Fehlschläge („weggeflogen“).</div>
+</section>
+
+<section id="varianten">
+  <h2>Varianten</h2>
+  <div class="sub" style="margin:-8px 0 12px">Jede Variante hat eine eigene Seite mit Architektur, Ablauf und Ergebnissen: Zeile anklicken. Balken: Anteil gelöster Fehlversuche, Strich: 95-%-Intervall.</div>
+  <div class="tw"><table><thead><tr><th>Variante</th><th>−5 cm</th><th>−10 cm</th><th>Kontext genutzt</th></tr></thead><tbody id="rows"></tbody></table></div>
+</section>
+
+</div>
+<div class="view" id="view-variante" hidden>
+<section id="detail"><div class="cap" id="dnav" style="margin-bottom:10px"></div><h2 id="dname">Detail</h2><div class="detail" id="dbody"></div></section>
+</div>
+<div class="view" id="view-log" hidden>
+<section id="log">
+  <h2>Probleme &amp; Analysen</h2>
+  <div class="sub" id="jstamp"></div>
+  <h3>Was gerade läuft</h3>
+  <div class="tw"><table><thead><tr><th>Schritt</th><th>Status</th></tr></thead><tbody id="jrun"></tbody></table></div>
+  <h3 style="margin-top:18px">Analysen</h3>
+  <div class="grid g2" id="jana"></div>
+  <h3 style="margin-top:18px">Probleme</h3>
+  <div class="tw"><table class="wraptable"><thead><tr><th>Problem</th><th>Ursache</th><th>Maßnahme</th><th>Status</th></tr></thead><tbody id="jprob"></tbody></table></div>
+  <h3 style="margin-top:18px">VLM-Vergleich: Fehler-Analyse auf 105 Fehlschlägen</h3>
+  <div class="sub">Typ = Fehlertyp richtig · tiefer = sagt „tiefer greifen“, wo der Greifer zu hoch war · tiefer falsch = sagt es, wo kein Höhenfehler vorlag (soll niedrig sein) · Ausfälle = nicht beantwortete Anfragen</div>
+  <div class="tw"><table><thead><tr><th>Modell</th><th>Prompt</th><th>n</th><th>Ausfälle</th><th>Typ</th><th>tiefer</th><th>tiefer falsch</th></tr></thead><tbody id="jvlm"></tbody></table></div>
+</section>
+</div>
+<div class="view" id="view-training" hidden>
+<section id="training">
+  <h2>Training &amp; VLM</h2>
+  <div class="grid g2">
+    <div><h3>Meta-Training: Loss mit gegen ohne Kontext</h3><div id="train"></div></div>
+    <div><h3>VLM gegen Orakel (offline)</h3><div id="vlm"></div></div>
+  </div>
+</section>
+</div>
+<div class="view" id="view-paper" hidden>
+<section id="paper">
+  <h2>Paper nah an der Idee</h2>
+  <div class="tw"><table class="wraptable"><thead><tr><th>Paper</th><th>Wo</th><th>Was es macht</th><th>Was fehlt gegenüber der Idee</th><th>Bei uns getestet als</th></tr></thead><tbody>
+<tr><td><a href="https://jedward225.github.io/RoboRetry/">RoboRetry</a></td><td><span class="pill ">CVPR-WS 2026</span></td><td>Eigener Fehlversuch im Kontext einer VLA, Gewinn durch Korrektur-Sprache</td><td>kein Weltmodell, Korrekturen von Menschen</td><td>C · nur echter Rollout, Rauschen statt Rollout</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2603.03596">MEM</a></td><td><span class="pill ok">CoRL 2026</span></td><td>Gedächtnis für VLAs, Fehlversuch bleibt im Kontext, trainiert mit Korrektur-Demos</td><td>keine automatische Analyse, kein Vorhersagefehler</td><td>D · Tokens + Adapter+</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2607.15275">RoboTTT</a></td><td><span class="pill ok">CoRL 2026</span></td><td>Test-Time-Training mit sehr langem Kontext, erholt sich von Fehlern</td><td>kein VLM, keine Fehleranalyse</td><td>D · Fast-Weights</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2607.06988">WAM-TTT</a></td><td><span class="pill ok">CoRL 2026</span></td><td>Fast-Weights im WAM über Video-Vorhersage, meta-trainiert</td><td>lernt aus menschlichen Videos, nicht aus eigenen Fehlern</td><td>D · Fast-Weights, E · nur Video-Loss</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2607.01111">FAR</a></td><td><span class="pill ">arXiv 2026</span></td><td>Update aus Fehlversuchen mit Präferenz-Loss, Exploration im Retry</td><td>Gewichte statt Kontext, kein VLM</td><td>E · Präferenz-Loss, A · Retry mit Exploration</td></tr>
+<tr><td><a href="https://arxiv.org/pdf/2609.18016">FARE</a></td><td><span class="pill ">arXiv 2026</span></td><td>Kontext-Reset bei Fehlern in autoregressiven WAMs</td><td>keine Analyse, kein Lernen</td><td>E · Kontext-Reset</td></tr>
+<tr><td><a href="https://arxiv.org/pdf/2603.13528">Dream2Fix</a></td><td><span class="pill ">arXiv 2026</span></td><td>VLM liefert Fehlertyp und strukturierte Korrektur</td><td>kein Vorhersagefehler, kein Kontext im WAM</td><td>A · Update mit VLM</td></tr>
+<tr><td><a href="https://arxiv.org/pdf/2609.02159">World-Coherent Decoding</a></td><td><span class="pill ">arXiv 2026</span></td><td>Abweichung Vorstellung gegen Realität im WAM</td><td>nur zum Ranken von Plänen</td><td>Vorhersagefehler als Signal</td></tr>
+<tr><td><a href="https://arxiv.org/abs/2610.35636">OpTTA</a></td><td><span class="pill ">CoRL-WS 2026</span></td><td>Weltmodell zur Testzeit anpassen; weniger Vorhersagefehler reicht nicht fürs Planen</td><td>latentes Weltmodell mit Planer, kein WAM</td><td>B · Dual-Site</td></tr>
+<tr><td><a href="https://arxiv.org/pdf/2609.21740">Sandwich-Residuals</a></td><td><span class="pill ">arXiv 2026</span></td><td>kleine Residual-Module, trainiert auf dem Vorhersagefehler</td><td>Weltmodell, kein WAM</td><td>B · Dual-Site</td></tr>
+  </tbody></table></div>
+  <div class="sub">Keine gefundene Arbeit kombiniert WAM, eigenen Vorhersagefehler, VLM-Analyse und beides als Kontext. Die CoRL-Angaben stammen aus Listen Dritter und sind nicht gegen die offizielle Liste geprüft.</div>
+</section>
+</div>
+</div>
+
+<script src="data.js"></script>
+<script>
+const R = window.REPORT || {variants: {}, training: {}, vlm_vs_oracle: {}, generated: "–"};
+const S = ["table_h_m05", "table_h_m10"], SN = {table_h_m05: "−5 cm", table_h_m10: "−10 cm", table_h_z00: "0 cm"};
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c]));
+const pct = (k, n) => n ? Math.round(100 * k / n) + " %" : "–";
+const f1 = x => x == null ? "–" : (Math.round(x * 10) / 10).toLocaleString("de-DE").replace("-", "−");
+const f2 = x => x == null ? "–" : (Math.round(x * 100) / 100).toLocaleString("de-DE");
+
+// ---------------------------------------------------------------- catalogue of variants
+const TYPES = {adapterplus: ["Tokens + Adapter+", ["adapterplus"], "Kontext als Tokens, Adapter+ lernt ihn zu nutzen"],
+  lora_r16_attn: ["Tokens + LoRA", ["lora"], "LoRA auf der Self-Attention"],
+  adaln: ["AdaLN", ["adaln"], "gelernter Offset der Norm-Modulation"],
+  ia3_adaln: ["(IA)³ + AdaLN", ["ia3", "adaln"], "Skalierung von Keys, Values, FFN + AdaLN"],
+  film_memory: ["FiLM ← Kontext", ["film_mem"], "Modulation aus dem Mittel der Kontext-Tokens"],
+  film_error: ["FiLM ← Fehlervektor", ["film_err"], "Modulation aus Δ, Arm, Fehlertyp, Lückenstatistik"],
+  film_gapcurve: ["FiLM ← Fehlerkurve", ["film_err"], "Fehlervektor + Verlauf des Vorhersagefehlers"],
+  film_text: ["FiLM ← VLM-Text-Latent", ["film_txt"], "Modulation aus dem Embedding des VLM-Texts"],
+  film_memory_plus_adapterplus: ["FiLM + Adapter+", ["film_mem", "adapterplus"], "beides kombiniert"],
+  prompt_vane: ["Prompt-Tokens", ["prompt"], "gelernte Tokens aus einer Bank"],
+  ttt_wam: ["Fast-Weights", ["ttt"], "ein analytischer Schritt auf den Kontext-Tokens"]};
+const META = "Meta-Training auf 7 anderen Aufgaben, zur Testzeit nur Kontext";
+const UPD = "Adapter-Update nach dem Fehlversuch (150 Schritte)";
+const CAT = [
+  {g: "0", k: "p0_baseline_table/base", n: "Basis-Modell", b: ["LingBot-VA unverändert", "ein Versuch pro Seed"], a: {train: "kein Training"}},
+  {g: "A", k: "p5a_signals/retry_plain", n: "Retry ohne Lernen", ctrl: 1, b: ["Kontrolle: zweiter Versuch, nichts geändert"], a: {train: "kein Training"}},
+  {g: "A", k: "p5a_signals/retry_explore", n: "Retry mit Exploration", ctrl: 1, b: ["Kontrolle: Aktionsrauschen im zweiten Versuch"], a: {train: "kein Training"}},
+  {g: "A", k: "p5a_signals/lff_sig_P", n: "Update: nur Vorhersagefehler", b: ["Adapter lernt aus der Fehl-Episode", "kein Korrektur-Ziel"], a: {mods: ["adapterplus"], train: UPD, sig: "Vorhersagefehler"}},
+  {g: "A", k: "p5a_signals/lff_sig_PR", n: "Update: + Rollout-Infos", b: ["Zeitpunkt und Fehlertyp aus Greifer und Kontakt"], a: {mods: ["adapterplus"], train: UPD, sig: "Vorhersagefehler + Rollout"}},
+  {g: "A", k: "p5a_signals/lff_sig_PI", n: "Update: + Imaginations-Probe", b: ["Korrektur aus vorgestellter gegen echter Pose"], a: {mods: ["adapterplus"], train: UPD, sig: "Vorhersagefehler + Probe"}},
+  {g: "A", k: "p5a_signals/lff_sig_PRI", n: "Update: alles Eigene", b: ["ohne VLM, ohne Orakel"], a: {mods: ["adapterplus"], train: UPD, sig: "P + R + I"}},
+  {g: "A", k: "p5a_signals/lff_sig_O", n: "Update: Orakel", b: ["obere Schranke: Korrektur aus dem Simulator"], a: {mods: ["adapterplus"], train: UPD, sig: "Orakel"}},
+  {g: "A", k: "p5a_signals/lff_sig_OP", n: "Update: Orakel + Vorhersagefehler", b: ["obere Schranke", "Fehler-Frames stärker gewichtet"], a: {mods: ["adapterplus"], train: UPD, sig: "Orakel + Vorhersagefehler"}},
+  {g: "A", k: "p5b_vlm/lff_sig_V", n: "Update: nur VLM", b: ["VLM findet den Fehler selbst"], a: {mods: ["adapterplus"], train: UPD, sig: "VLM"}},
+  {g: "A", k: "p5b_vlm/lff_sig_VP", n: "Update: VLM + Vorhersagefehler", b: ["VLM sieht Rollout + Fehlerkurve"], a: {mods: ["adapterplus"], train: UPD, sig: "VLM + Vorhersagefehler"}},
+  {g: "A", k: "p5b_vlm/lff_sig_PRIV", n: "Update: alles ohne Orakel", b: ["P + R + I + VLM"], a: {mods: ["adapterplus"], train: UPD, sig: "P + R + I + VLM"}},
+  {g: "B", k: "p5f_paper/base", n: "Basis auf den Eval-Seeds", ctrl: 1, b: ["Kontrolle ohne Adaption"], a: {train: "kein Training"}},
+  {g: "B", k: "p5f_paper/paper_P_dual", n: "Dual-Site (paper-treu)", b: ["nur Vorhersagefehler", "innen + außen, 25 + 25 Schritte"], a: {mods: ["adapterplus"], outside: 1, train: "3 Adaptions-Episoden, dann eingefroren", sig: "Vorhersagefehler"}},
+  {g: "B", k: "p5f_paper/paper_P_inside", n: "nur innen", b: ["Adapter+ im Transformer"], a: {mods: ["adapterplus"], train: "3 Adaptions-Episoden, dann eingefroren", sig: "Vorhersagefehler"}},
+  {g: "B", k: "p5f_paper/paper_P_outside", n: "nur außen", b: ["Residual-MLP auf dem vorhergesagten Latent"], a: {outside: 1, train: "3 Adaptions-Episoden, dann eingefroren", sig: "Vorhersagefehler"}},
+  {g: "B", k: "p5f_paper/paper_P_dual_150", n: "Dual-Site, mehr Schritte", b: ["150 + 100 Schritte pro Update"], a: {mods: ["adapterplus"], outside: 1, train: "3 Adaptions-Episoden, dann eingefroren", sig: "Vorhersagefehler"}},
+  {g: "B", k: "p5f_paper/paper_Pw_dual", n: "Dual-Site, Fehler-gewichtet", b: ["Frames mit hohem Vorhersagefehler zählen stärker"], a: {mods: ["adapterplus"], outside: 1, train: "3 Adaptions-Episoden, dann eingefroren", sig: "Vorhersagefehler"}},
+  {g: "B", k: "p5f_paper/paper_P_dual_s10", n: "Dual-Site, 10 + 10 Schritte", b: ["weniger Training pro Update"], a: {mods: ["adapterplus"], outside: 1, train: "3 Adaptions-Episoden, dann eingefroren", sig: "Vorhersagefehler"}},
+  {g: "B", k: "p5f_paper/paper_P_dual_s50", n: "Dual-Site, 50 + 50 Schritte", b: ["zwischen 25 und 150 Schritten"], a: {mods: ["adapterplus"], outside: 1, train: "3 Adaptions-Episoden, dann eingefroren", sig: "Vorhersagefehler"}},
+  {g: "B", k: "p5f_paper/paper_P_dual_video", n: "Dual-Site, nur Video-Loss", b: ["kein Aktions-Loss", "reines Weltmodell-Signal"], a: {mods: ["adapterplus"], outside: 1, train: "3 Adaptions-Episoden, dann eingefroren", sig: "Vorhersagefehler"}},
+  {g: "B", k: "p5f_paper/paper_P_dual_action", n: "Dual-Site, nur Aktions-Loss", b: ["Kontrolle: kein Video-Loss", "imitiert nur die eigenen Aktionen"], a: {mods: ["adapterplus"], outside: 1, train: "3 Adaptions-Episoden, dann eingefroren", sig: "Vorhersagefehler"}},
+  {g: "B", k: "p5f_paper/paper_P_dual_vidtok", n: "Dual-Site, Adapter nur auf Video-Tokens", b: ["Weltmodell angepasst, Aktions-Strom unverändert"], a: {mods: ["adapterplus"], outside: 1, train: "3 Adaptions-Episoden, dann eingefroren", sig: "Vorhersagefehler"}},
+  {g: "B", k: "p5f_paper/paper_P_dual_n1", n: "Dual-Site, 1 Adaptions-Episode", b: ["weniger Daten"], a: {mods: ["adapterplus"], outside: 1, train: "1 Adaptions-Episoden, dann eingefroren", sig: "Vorhersagefehler"}},
+  {g: "B", k: "p5f_paper/paper_P_dual_n1vidtok", n: "Dual-Site, 1 Episode + nur Video-Tokens", b: ["die zwei besten Varianten kombiniert"], a: {mods: ["adapterplus"], outside: 1, train: "1 Adaptions-Episoden, dann eingefroren", sig: "Vorhersagefehler"}},
+  {g: "B", k: "p5f_paper/paper_P_dual_n6", n: "Dual-Site, 6 Adaptions-Episoden", b: ["mehr Daten"], a: {mods: ["adapterplus"], outside: 1, train: "6 Adaptions-Episoden, dann eingefroren", sig: "Vorhersagefehler"}},
+  {g: "B", k: "p5f_paper/paper_P_dual_filt", n: "Dual-Site, nur Frames mit hohem Fehler", b: ["Training auf den 30 % Frames mit dem höchsten Vorhersagefehler"], a: {mods: ["adapterplus"], outside: 1, train: "3 Adaptions-Episoden, dann eingefroren", sig: "Vorhersagefehler"}},
+  {g: "B", k: "p5f_paper/paper_P_dual_lr3", n: "Dual-Site, 3× Lernrate", b: ["größere Schritte statt mehr Schritte"], a: {mods: ["adapterplus"], outside: 1, train: "3 Adaptions-Episoden, dann eingefroren", sig: "Vorhersagefehler"}},
+  {g: "B", k: "p5f_paper/paper_PR_dual", n: "Dual-Site + Rollout-Infos", b: ["Zeitpunkt, Typ, Korrektur-Text"], a: {mods: ["adapterplus"], outside: 1, train: "3 Adaptions-Episoden, dann eingefroren", sig: "Vorhersagefehler + Rollout"}},
+  {g: "B", k: "p5f_paper_vlm/paper_VP_dual", n: "Dual-Site + VLM-Beschreibung", b: ["VLM sagt, was schiefging", "keine Korrekturrichtung"], a: {mods: ["adapterplus"], outside: 1, text: "VLM", train: "3 Adaptions-Episoden, dann eingefroren", sig: "VLM + Vorhersagefehler"}},
+  {g: "B", k: "p5f_paper/paper_OP_dual", n: "Dual-Site + Orakel", b: ["obere Schranke"], a: {mods: ["adapterplus"], outside: 1, train: "3 Adaptions-Episoden, dann eingefroren", sig: "Orakel + Vorhersagefehler"}},
+  {g: "C", k: "p6a_icl_content/retry_plain", n: "Retry ohne Lernen", ctrl: 1, b: ["Kontrolle"], a: {train: "kein Training"}},
+  {g: "C", k: "p6a_icl_content/icl_text_only", n: "nur Korrektur-Text", b: ["Orakel-Text im Prompt"], a: {text: "Orakel", train: "kein Training"}},
+  {g: "C", k: "p6a_icl_content/icl_fail_predobs", n: "Fehlversuch im Kontext", b: ["vorgestellt + echt, + Text"], a: {tok: "vorgestellt + echt", text: "Orakel", train: "kein Training"}},
+  {g: "C", k: "p6a_icl_content/icl_fail_diff", n: "Fehlerkarte im Kontext", b: ["echt − vorgestellt, + Text"], a: {tok: "Fehlerkarte + echt", text: "Orakel", train: "kein Training"}},
+  {g: "C", k: "p6a_icl_content/icl_vs_adapter", n: "dieselbe Info als Update", b: ["Vergleich über Gewichte"], a: {mods: ["adapterplus"], train: UPD, sig: "Orakel + Vorhersagefehler"}},
+  {g: "C", k: "p6v_icl_free_vlm/icl_text_only+VP", n: "VLM-Text als Prompt", b: ["nur Text, keine Rollout-Tokens"], a: {text: "VLM", train: "kein Training"}},
+  {g: "C", k: "p6v_icl_free_vlm/icl_txt_negative+VP", n: "VLM-Text als Negativ-Prompt", b: ["Fehlerbeschreibung als CFG-Negativ", "Fehlversuch im Kontext"], a: {tok: "vorgestellt + echt", text: "VLM (Negativ)", train: "kein Training"}},
+  {g: "C", k: "p6v_icl_free_vlm/icl_txt_corr_neg+VP", n: "VLM-Text: Korrektur + Negativ", b: ["beides zusammen"], a: {tok: "vorgestellt + echt", text: "VLM (beides)", train: "kein Training"}},
+  {g: "C", k: "p6v_icl_free_vlm/icl_txt_note+VP", n: "VLM-Text als Notiz", b: ["„Im letzten Versuch …“ an die Instruktion gehängt"], a: {tok: "vorgestellt + echt", text: "VLM (Notiz)", train: "kein Training"}},
+  {g: "C", k: "p6v_icl_free_vlm/icl_fail_obs+VP", n: "Kontext: nur echter Rollout", b: ["wie RoboRetry: Fehlversuch + Text"], a: {tok: "echt", text: "VLM", train: "kein Training"}},
+  {g: "C", k: "p6v_icl_free_vlm/icl_fail_predobs+VP", n: "Kontext: vorgestellt + echt", b: ["der Vorhersagefehler steckt im Paar"], a: {tok: "vorgestellt + echt", text: "VLM", train: "kein Training"}},
+  {g: "C", k: "p6v_icl_free_vlm/icl_fail_diff+VP", n: "Kontext: Fehlerkarte", b: ["echt − vorgestellt"], a: {tok: "Fehlerkarte + echt", text: "VLM", train: "kein Training"}},
+  {g: "C", k: "p6v_icl_free_vlm/icl_fail_window+VP", n: "Kontext: Fenster um den Fehler", b: ["4 Latents davor, 2 danach"], a: {tok: "Fenster um den Fehler", text: "VLM", train: "kein Training"}},
+  {g: "C", k: "p6v_icl_free_vlm/icl_fail_gapkeys+VP", n: "Kontext: 6 Frames mit höchstem Fehler", b: ["Keyframes nach Vorhersagefehler"], a: {tok: "Frames mit höchstem Fehler", text: "VLM", train: "kein Training"}},
+  {g: "C", k: "p6v_icl_free_vlm/icl_fail_corrected+VP", n: "Kontext: korrigierte Aktionen", b: ["VLM-Δ in die Aktionen des Fehlversuchs geschrieben"], a: {tok: "echt, Aktionen korrigiert", text: "VLM", train: "kein Training"}},
+  {g: "C", k: "p6v_icl_free_vlm/icl_attn2+VP", n: "Kontext doppelt gewichtet", b: ["Attention auf den Kontext × 2"], a: {tok: "vorgestellt + echt, × 2", text: "VLM", train: "kein Training"}},
+  {g: "C", k: "p6v_icl_free_vlm/icl_trigger+VP", n: "Kontext erst bei steigendem Fehler", b: ["wird im zweiten Versuch am Lücken-Trigger eingefügt"], a: {tok: "vorgestellt + echt, am Trigger", text: "VLM", train: "kein Training"}},
+  {g: "C", k: "p6v_icl_free_vlm/icl_fails_3att+VP", n: "bis zu 3 Versuche", b: ["alle Fehlversuche des Seeds im Kontext"], a: {tok: "alle Fehlversuche", text: "VLM", train: "kein Training"}},
+  {g: "C", k: "p6v_icl_free_vlm/icl_manip_noise+VP", n: "Rauschen statt Rollout", ctrl: 1, b: ["Kontrolle: zählt der Inhalt oder nur, dass Kontext da ist?"], a: {tok: "Rauschen", text: "VLM", train: "kein Training"}},
+  {g: "E", k: "p9_related/retry_plain", n: "Retry ohne Lernen", ctrl: 1, b: ["Kontrolle"], a: {train: "kein Training"}},
+  {g: "E", k: "p9_related/reset_on_gap", n: "FARE: Kontext-Reset", b: ["Kontext zurücksetzen, wenn der Vorhersagefehler steigt"], a: {train: "kein Training", sig: "Vorhersagefehler"}},
+  {g: "E", k: "p9_related/lff_ttt_filtered", n: "T³VF: gefiltertes Test-Time-Training", b: ["Update nur auf Frames mit hohem Vorhersagefehler"], a: {mods: ["adapterplus"], train: UPD, sig: "Vorhersagefehler"}},
+  {g: "E", k: "p9_related/lff_adapter_videoonly", n: "WAM-TTT-Stil: nur Video-Loss", b: ["Update nur über die Video-Vorhersage"], a: {mods: ["adapterplus"], train: UPD, sig: "Orakel + Vorhersagefehler"}},
+  {g: "E", k: "p9_related/lff_pref", n: "FAR: Präferenz-Loss", b: ["korrigierte Aktionen bevorzugt gegenüber den gescheiterten"], a: {mods: ["adapterplus"], train: UPD, sig: "Orakel + Vorhersagefehler"}},
+  {g: "E", k: "p9_related/lff_bank", n: "FailBank: Rollout-Bank", b: ["Bank eigener Rollouts über Seeds", "Erfolge als Anker, Guard"], a: {mods: ["lora"], train: "Update nach jedem Fehlversuch, bleibt über Seeds", sig: "Orakel + Vorhersagefehler"}},
+  {g: "D", k: "p8_icl_vlm_meta/retry_plain", n: "Retry ohne Lernen", ctrl: 1, b: ["Kontrolle"], a: {train: "kein Training"}},
+  {g: "D", k: "p8f_finetune/ft_adapterplus", n: "Nur Fine-Tuning auf dem Datensatz", ctrl: 1, b: ["Kontrolle: Adapter+ auf den 7 Trainingsaufgaben trainiert", "nie Kontext, nie VLM-Text"], a: {mods: ["adapterplus"], train: "Fine-Tuning auf 7 anderen Aufgaben, ohne Kontext"}},
+  {g: "D", k: "p8_icl_vlm_meta/icl_fail_predobs_VP", n: "Kontext ohne Meta-Training", ctrl: 1, b: ["Kontrolle: derselbe Kontext, Modell untrainiert"], a: {tok: "vorgestellt + echt", text: "VLM", train: "kein Training"}},
+  ...Object.entries(TYPES).flatMap(([t, [n, mods, d]]) => [
+    {g: "D", k: `p8_icl_vlm_meta/icl_type_${t}_VP`, n, b: [d, "VLM-Text + Fehlversuch im Kontext"], a: {tok: "vorgestellt + echt", text: "VLM", vec: t == "film_error" ? "Δ, Typ, Lücke" : t == "film_gapcurve" ? "+ Fehlerkurve" : null, mods, train: META}},
+    {g: "D", k: `p8_icl_vlm_meta/icl_type_${t}_VP_noctx`, n: n + " · ohne Kontext", ctrl: 1, b: ["Kontrolle: derselbe Adapter, kein Kontext, kein Text"], a: {mods, train: META}}]),
+  {g: "D", k: "p8_icl_vlm_meta/icl_meta_diff_VP", n: "Inhalt: Fehlerkarte", b: ["echt − vorgestellt statt vorgestellt + echt"], a: {tok: "Fehlerkarte + echt", text: "VLM", mods: ["adapterplus"], train: META}},
+  {g: "D", k: "p8_icl_vlm_meta/icl_meta_window_VP", n: "Inhalt: nur Fehler-Fenster", b: ["4 Latents davor, 2 danach"], a: {tok: "Fenster um den Fehler", text: "VLM", mods: ["adapterplus"], train: META}},
+  {g: "D", k: "p8_icl_vlm_meta/icl_meta_gapkeys_VP", n: "Inhalt: 6 Frames mit höchstem Fehler", b: ["Keyframes nach Vorhersagefehler"], a: {tok: "Frames mit höchstem Fehler", text: "VLM", mods: ["adapterplus"], train: META}},
+  {g: "D", k: "p8_icl_vlm_meta/icl_meta_textonly_VP", n: "Inhalt: nur VLM-Text", b: ["keine Rollout-Tokens"], a: {text: "VLM", mods: ["adapterplus"], train: META}},
+  // held-out failure type: meta-trained only on start-posture + camera failures, tested on the lowered table
+  ...["film_memory_plus_adapterplus", "lora_r16_attn", "adapterplus", "ttt_wam"].flatMap(t => [
+    {g: "D", k: `p8d_heldout_type/icl_dist_${t}_VP`, n: "Ungesehener Fehlertyp: " + TYPES[t][0], b: ["trainiert nur auf Startpose- und Kamera-Fehlern, nie Tischhöhe", "VLM-Text + Fehlversuch im Kontext"], a: {tok: "vorgestellt + echt", text: "VLM", mods: TYPES[t][1], train: "Meta-Training auf 7 anderen Aufgaben, nur Startpose/Kamera"}},
+    {g: "D", k: `p8d_heldout_type/icl_dist_${t}_VP_noctx`, n: "Ungesehener Fehlertyp: " + TYPES[t][0] + " · ohne Kontext", ctrl: 1, b: ["Kontrolle: derselbe Adapter, kein Kontext"], a: {mods: TYPES[t][1], train: "Meta-Training auf 7 anderen Aufgaben, nur Startpose/Kamera"}}]),
+  {g: "D", k: "p8d_heldout_type/ft_dist_adapterplus", n: "Ungesehener Fehlertyp: nur Fine-Tuning", ctrl: 1, b: ["Kontrolle: Adapter+ auf denselben Startpose/Kamera-Daten, nie Kontext"], a: {mods: ["adapterplus"], train: "Fine-Tuning auf 7 anderen Aufgaben, nur Startpose/Kamera"}},
+  // 7 failure types (P7b + P7c), same held-out test
+  ...["film_memory_plus_adapterplus", "lora_r16_attn", "adapterplus", "ttt_wam"].flatMap(t => [
+    {g: "D", k: `p8t_heldout_types/icl_types_${t}_VP`, n: "7 Fehlertypen: " + TYPES[t][0], b: ["trainiert auf Startpose, Kamera, Objektlage, Licht, Hintergrund, Clutter; nie Tischhöhe", "VLM-Text + Fehlversuch im Kontext"], a: {tok: "vorgestellt + echt", text: "VLM", mods: TYPES[t][1], train: "Meta-Training auf 7 anderen Aufgaben, 7 Fehlertypen"}},
+    {g: "D", k: `p8t_heldout_types/icl_types_${t}_VP_noctx`, n: "7 Fehlertypen: " + TYPES[t][0] + " · ohne Kontext", ctrl: 1, b: ["Kontrolle: derselbe Adapter, kein Kontext"], a: {mods: TYPES[t][1], train: "Meta-Training auf 7 anderen Aufgaben, 7 Fehlertypen"}}]),
+  {g: "D", k: "p8t_heldout_types/ft_types_adapterplus", n: "7 Fehlertypen: nur Fine-Tuning", ctrl: 1, b: ["Kontrolle: Adapter+ auf denselben Daten, nie Kontext"], a: {mods: ["adapterplus"], train: "Fine-Tuning auf 7 anderen Aufgaben, 7 Fehlertypen"}},
+  // P8s: more failures (P7d), detailed VLM analysis + fix sentence, base model trained or not
+  ...["lora_r16_attn", "film_memory_plus_adapterplus"].flatMap(t => ["", "_base"].flatMap(b => [
+    {g: "D", k: `p8s_strong/icl_strong_${t}${b}_VPD`, n: `Mehr Fehlschläge${b ? " + Basis trainiert" : ""}: ` + TYPES[t][0], b: ["P7b + P7c + P7d, nie Tischhöhe", "VLM-Erklärung mit Fix-Satz im Kontext", b ? "Basismodell mittrainiert (wie WAM-TTT)" : "nur Adapter trainiert"], a: {tok: "vorgestellt + echt", text: "VLM (detail)", mods: TYPES[t][1], train: b ? "Meta-Training inkl. Basismodell" : "Meta-Training, Basis eingefroren"}},
+    {g: "D", k: `p8s_strong/icl_strong_${t}${b}_VPD_noctx`, n: `Mehr Fehlschläge${b ? " + Basis trainiert" : ""}: ` + TYPES[t][0] + " · ohne Kontext", ctrl: 1, b: ["Kontrolle: dieselben Gewichte, kein Kontext"], a: {mods: TYPES[t][1], train: b ? "Meta-Training inkl. Basismodell" : "Meta-Training, Basis eingefroren"}}])),
+  {g: "D", k: "p8s_strong/ft_strong_base", n: "Mehr Fehlschläge: nur Fine-Tuning inkl. Basis", ctrl: 1, b: ["Kontrolle: Basis + Adapter+ auf denselben Daten, nie Kontext"], a: {mods: ["adapterplus"], train: "Fine-Tuning inkl. Basismodell"}},
+  {g: "D", k: "p8_icl_oracle_meta/icl_type_adapterplus", n: "Orakel: Tokens + Adapter+", b: ["obere Schranke"], a: {tok: "vorgestellt + echt", text: "Orakel", mods: ["adapterplus"], train: META}},
+  {g: "D", k: "p8_icl_oracle_meta/icl_type_film_error", n: "Orakel: FiLM ← Fehlervektor", b: ["obere Schranke"], a: {tok: "vorgestellt + echt", text: "Orakel", vec: "Δ, Typ, Lücke", mods: ["film_err"], train: META}},
+  {g: "D", k: "p8_icl_oracle_meta/icl_type_film_gapcurve", n: "Orakel: FiLM ← Fehlerkurve", b: ["obere Schranke"], a: {tok: "vorgestellt + echt", text: "Orakel", vec: "+ Fehlerkurve", mods: ["film_err"], train: META}},
+];
+const GROUPS = {"0": ["Basis", "unverändertes Modell"], A: ["A · Lernen per Adapter-Update", "welches Signal braucht das Update?"],
+  B: ["B · Dual-Site-Adapter", "nur Vorhersagefehler, Paper-Protokoll"], C: ["C · Idee ohne Training", "VLM-Analyse + Kontext, Modell eingefroren"],
+  D: ["D · Idee mit Training", "Modell lernt auf 7 anderen Aufgaben, Kontext zu nutzen"], E: ["E · Verwandte Arbeiten nachgebaut", "deren Mechanismus auf demselben Modell"]};
+
+// ---------------------------------------------------------------- helpers
+const V = k => R.variants[k];
+function rate(c, proto) {
+  if (!c) return null;
+  if (proto == "paper") return {k: c.eval_ok, n: c.eval_n, ci: c.eval_ci, flung: c.flung};
+  if (proto == "single") return {k: c.first_ok, n: c.first_n, ci: c.first_ci, flung: c.flung};
+  return {k: c.fixed, n: c.retried, ci: c.fix_ci, flung: c.flung};
+}
+function bar(r) {
+  if (!r || !r.n) return '<span class="pill">wartet</span>';
+  const p = 100 * r.k / r.n, ci = r.ci && r.ci[0] != null ? `<b style="left:${100 * r.ci[0]}%;width:${100 * (r.ci[1] - r.ci[0])}%"></b>` : "";
+  return `<span class="bar"><i style="width:${p}%"></i>${ci}</span><span class="num">${r.k}/${r.n}</span>${r.flung ? ` <span class="pill bad" title="vom Simulator als Erfolg gezählt, Karte aber vom Tisch geflogen">${r.flung} weggeflogen</span>` : ""}`;
+}
+function verdict(c) {
+  const x = c && c.context;
+  if (!x) return null;
+  if (x.infl_action >= 0.1 && x.shift_mm != null && x.shift_mm <= -3) return ["ja, greift tiefer", "ok"];
+  if (x.infl_action >= 0.05) return ["schwach", "ctx"];
+  return ["nein", "bad"];
+}
+function line(series, opt = {}) {  // series: [{y:[], cls, dash}], shared y scale from 0
+  const W = 300, H = 90, L = 30, B = 16, T = 6, n = Math.max(...series.map(s => s.y.length), 2);
+  const ymax = opt.ymax || Math.max(...series.flatMap(s => s.y.filter(v => v != null)), 0.01) * 1.1;
+  const X = i => L + (W - L - 6) * i / (n - 1), Y = v => T + (H - T - B) * (1 - v / ymax);
+  let s = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(opt.label || "")}"><line x1="${L}" y1="${H - B}" x2="${W - 6}" y2="${H - B}" stroke="var(--line)"/><line x1="${L}" y1="${T}" x2="${L}" y2="${H - B}" stroke="var(--line)"/>`;
+  s += `<text x="${L - 4}" y="${T + 8}" font-size="9" text-anchor="end" fill="var(--muted)">${f2(ymax)}</text><text x="${L - 4}" y="${H - B}" font-size="9" text-anchor="end" fill="var(--muted)">0</text>`;
+  if (opt.mark != null && opt.mark < n) s += `<line x1="${X(opt.mark)}" y1="${T}" x2="${X(opt.mark)}" y2="${H - B}" stroke="var(--bad)" stroke-dasharray="3 3"/><text x="${X(opt.mark) + 3}" y="${T + 8}" font-size="9" fill="var(--bad)">Griff</text>`;
+  if (opt.ref != null) s += `<line x1="${L}" y1="${Y(opt.ref)}" x2="${W - 6}" y2="${Y(opt.ref)}" stroke="var(--muted)" stroke-dasharray="2 3"/>`;
+  for (const q of series) s += `<polyline fill="none" stroke="${q.c}" stroke-width="1.8" ${q.dash ? 'stroke-dasharray="4 3"' : ""} points="${q.y.map((v, i) => v == null ? "" : X(i) + "," + Y(Math.min(v, ymax))).join(" ")}"/>`;
+  s += `<text x="${(L + W) / 2}" y="${H - 3}" font-size="9" text-anchor="middle" fill="var(--muted)">${esc(opt.x || "")}</text></svg>`;
+  return s;
+}
+const legend = items => `<div class="cap">${items.map(([c, t, d]) => `<span><svg width="18" height="6"><line x1="0" y1="3" x2="18" y2="3" stroke="${c}" stroke-width="2" ${d ? 'stroke-dasharray="4 3"' : ""}/></svg> ${t}</span>`).join("")}</div>`;
+
+// ---------------------------------------------------------------- what each variant tests
+const Q = {
+  "p0_baseline_table/base": "Wie stark bricht das unveränderte Modell ein, wenn der Tisch tiefer steht?",
+  "p5f_paper/base": "Referenz: Erfolgsrate ohne Adaption auf denselben Eval-Seeds.",
+  "p8_icl_vlm_meta/icl_fail_predobs_VP": "Bringt das Meta-Training etwas, oder reicht derselbe Kontext im untrainierten Modell?",
+  "p8_icl_oracle_meta/icl_type_adapterplus": "Obere Schranke: was ginge mit perfekter Analyse statt VLM?",
+  "p8_icl_oracle_meta/icl_type_film_error": "Obere Schranke: was ginge mit perfektem Fehlervektor?",
+  "p8_icl_oracle_meta/icl_type_film_gapcurve": "Obere Schranke: perfekter Fehlervektor plus Fehlerkurve.",
+  ft_adapterplus: "Reicht gewöhnliches Fine-Tuning auf dem Datensatz, ganz ohne Fehlerkontext?",
+  retry_plain: "Wie viel bringt ein zweiter Versuch allein, ohne irgendetwas zu ändern?",
+  retry_explore: "Reicht Zufall (Aktionsrauschen), um tiefer zu greifen?",
+  lff_sig_P: "Reicht der eigene Vorhersagefehler als Lernsignal, ohne dass jemand die Korrektur vorgibt?",
+  lff_sig_PR: "Hilft es, Zeitpunkt und Fehlertyp aus Greifer und Kontakt zu kennen?",
+  lff_sig_PI: "Lässt sich die Korrektur aus der eigenen Vorstellung ablesen?",
+  lff_sig_PRI: "Wie weit kommt man mit allem, was der Roboter selbst messen kann?",
+  lff_sig_O: "Kann das Modell eine richtige Korrektur überhaupt umsetzen?",
+  lff_sig_OP: "Bringt die Gewichtung nach Vorhersagefehler zusätzlich zur Orakel-Korrektur etwas?",
+  lff_sig_V: "Liefert das VLM allein eine Korrektur, die so gut wirkt wie das Orakel?",
+  lff_sig_VP: "Wird das VLM besser, wenn es Fehlerkurve und Vorstellung sieht?",
+  lff_sig_PRIV: "Was geht maximal ohne Simulator-Wissen?",
+  paper_P_dual: "Überträgt sich der Dual-Site-Adapter (nur Vorhersagefehler) von einem JEPA-Weltmodell auf ein WAM?",
+  paper_Pw_dual: "Hilft es, Frames mit hohem Vorhersagefehler stärker zu gewichten?",
+  paper_P_dual_s10: "Reichen noch weniger Schritte pro Update?",
+  paper_P_dual_s50: "Liegt das Optimum zwischen 25 und 150 Schritten?",
+  paper_P_dual_video: "Kommt der Gewinn aus der Video-Vorhersage allein?",
+  paper_P_dual_action: "Kontrolle: bringt das Nachahmen der eigenen Aktionen allein etwas?",
+  paper_P_dual_vidtok: "Reicht es, nur das Weltmodell anzupassen und die Aktions-Tokens unberührt zu lassen?",
+  paper_P_dual_n1: "Reicht eine einzige Adaptions-Episode?",
+  paper_P_dual_n1vidtok: "Addieren sich die zwei besten Varianten (1 Episode, Adapter nur auf Video-Tokens)?",
+  paper_P_dual_n6: "Helfen mehr Adaptions-Episoden, vor allem bei −10 cm?",
+  paper_P_dual_filt: "Ist das Update besser, wenn es nur auf Frames mit hohem Vorhersagefehler lernt?",
+  paper_P_dual_lr3: "Hilft eine höhere Lernrate bei gleicher Schrittzahl?",
+  paper_P_inside: "Reicht der Adapter im Transformer allein?",
+  paper_P_outside: "Reicht die Korrektur auf dem vorhergesagten Latent allein?",
+  paper_P_dual_150: "Waren 25 + 25 Schritte nur zu wenig Training?",
+  paper_VP_dual: "Hilft es dem Dual-Site-Adapter, wenn das VLM zusätzlich sagt, was schiefging?",
+  paper_PR_dual: "Braucht ein WAM Fehlerinformation zusätzlich zum Vorhersagefehler?",
+  paper_OP_dual: "Was wäre im selben Protokoll mit richtiger Korrektur möglich?",
+  icl_text_only: "Reicht Sprache allein, ohne den Fehlversuch zu zeigen?",
+  icl_fail_predobs: "Nutzt das eingefrorene Modell den Kontrast Vorstellung gegen Realität von sich aus?",
+  icl_fail_diff: "Hilft es, den Vorhersagefehler explizit als Token zu geben?",
+  icl_vs_adapter: "Dieselbe Information über Gewichte statt über Kontext: wie groß ist der Abstand?",
+  icl_txt_negative: "Wirkt die Fehlerbeschreibung besser als Negativ-Prompt, also weg vom Fehler?",
+  icl_txt_corr_neg: "Addieren sich Korrektur-Prompt und Negativ-Prompt?",
+  icl_txt_note: "Wirkt eine Notiz über den letzten Versuch besser als eine umformulierte Instruktion?",
+  icl_fail_obs: "Reicht der echte Rollout ohne die Vorstellung, wie bei RoboRetry?",
+  icl_fail_window: "Ganze Episode oder nur der entscheidende Moment?",
+  icl_fail_gapkeys: "Reichen die Frames, an denen die Vorhersage am stärksten danebenlag?",
+  icl_fail_corrected: "Hilft eine kontrafaktische Erinnerung: was hätte ich tun sollen?",
+  icl_attn2: "Wird der Kontext nur zu wenig beachtet?",
+  icl_trigger: "Ist Kontext nützlicher, wenn er erst beim Fehlerverdacht kommt?",
+  icl_fails_3att: "Wächst der Nutzen mit mehr Fehlversuchen im Kontext?",
+  icl_manip_noise: "Zählt der Inhalt des Kontexts oder nur seine Anwesenheit?",
+  reset_on_gap: "Hilft es schon, bei steigendem Vorhersagefehler den Kontext zu leeren?",
+  lff_ttt_filtered: "Ist das Update besser, wenn es nur auf Frames mit hohem Vorhersagefehler lernt?",
+  lff_adapter_videoonly: "Reicht Lernen über die Video-Vorhersage, ohne Aktions-Loss?",
+  lff_pref: "Ist „korrigiert besser als gescheitert“ ein besseres Ziel als die Korrektur zu imitieren?",
+  lff_bank: "Bleibt das Gelernte über Seeds erhalten, ohne dass Erfolge verlernt werden?",
+  icl_meta_diff_VP: "Lernt das Modell die Fehlerkarte besser zu nutzen als das Paar vorgestellt + echt?",
+  icl_meta_window_VP: "Reicht nach Meta-Training das Fenster um den Fehler?",
+  icl_meta_gapkeys_VP: "Reichen nach Meta-Training die Frames mit dem höchsten Vorhersagefehler?",
+  icl_meta_textonly_VP: "Braucht es die Rollout-Tokens überhaupt, oder reicht der VLM-Text?"};
+const QT = {adapterplus: "Lernt das Modell mit Adapter+, den Fehlversuch im Kontext zu lesen?",
+  lora_r16_attn: "Reicht LoRA auf der Self-Attention, also genau dort, wo der Kontext gelesen wird?",
+  adaln: "Reicht eine statische Verschiebung der Normalisierung? Sie kann den Kontext nicht lesen.",
+  ia3_adaln: "Reicht reines Umskalieren von Keys, Values und FFN?",
+  film_memory: "Kann der Kontext global als Modulation wirken statt Token für Token?",
+  film_error: "Reicht eine strukturierte Fehlerbeschreibung aus 16 Zahlen als Steuersignal?",
+  film_gapcurve: "Hilft der Verlauf des Vorhersagefehlers zusätzlich zum Fehlervektor?",
+  film_text: "Kann die VLM-Ausgabe als Latent wirken statt nur als Prompt?",
+  film_memory_plus_adapterplus: "Ergänzen sich globale Modulation und Lesen der Tokens?",
+  prompt_vane: "Reichen gelernte Prompt-Tokens, ausgewählt von einem Router?",
+  ttt_wam: "Funktioniert ein Fast-Weight-Schritt auf dem Kontext, wie bei WAM-TTT?"};
+const mname = e => e.k.split("/")[1];
+function qOf(e) {
+  const m = mname(e), t = (m.match(/^icl_type_(.+?)_VP/) || [])[1];
+  if (Q[e.k]) return Q[e.k];
+  if (m.endsWith("_noctx")) return "Kommt der Gewinn vom Kontext oder nur vom Meta-Training?";
+  return (t && QT[t]) || Q[m] || Q[m.replace("+VP", "")] || "";
+}
+const VS = {A: "Retry ohne Lernen auf denselben Seeds", B: "Basis auf denselben Eval-Seeds", C: "Retry ohne Lernen und Rauschen statt Rollout",
+  D: "Retry ohne Lernen, derselbe Kontext ohne Meta-Training, derselbe Adapter ohne Kontext", E: "Retry ohne Lernen auf denselben Seeds"};
+const MODN = {adapterplus: "Adapter+ (Bottleneck 128) nach der Self-Attention und nach dem Block, in allen 30 Blöcken, getrennt für Video- und Aktions-Tokens",
+  lora: "LoRA Rang 16 auf q, k, v, o der Self-Attention", adaln: "Offset der Modulations-Tabelle je Block",
+  ia3: "(IA)³: Skalierung von Keys, Values und FFN-Aktivierung", film_mem: "FiLM-Kopf je Block (Low-Rank-MLP, Rang 64, startet bei null)",
+  film_err: "FiLM-Kopf je Block (Low-Rank-MLP, Rang 64, startet bei null)", film_txt: "FiLM-Kopf je Block (Low-Rank-MLP, Rang 64, startet bei null)",
+  prompt: "Prompt-Bank: 8 Prompts, ein Router wählt 2", ttt: "Fast-Weight-Zweig im Video-Strom, ein innerer Schritt auf den Kontext-Tokens"};
+
+// ---------------------------------------------------------------- procedure of one variant (ordered steps)
+function flow(e) {
+  const a = e.a || {}, m = mname(e), sig = a.sig || "", src = a.text || "";
+  const has = {P: /Vorhersagefehler|P \+/.test(sig) || /VP/.test(m), R: /Rollout|R \+/.test(sig), I: /Probe|\+ I/.test(sig), V: /VLM/.test(sig + src), O: /Orakel/.test(sig + src)};
+  const upd = /^(Adapter-)?Update/.test(a.train || ""), meta = a.train == META, ctx = a.tok || a.text || a.vec;
+  if (m == "base") return [["Ein Versuch je Seed", ["LingBot-VA unverändert", e.g == "B" ? "dieselben Eval-Seeds wie die Dual-Site-Varianten" : "Tisch bei 0, −5 und −10 cm", "Messgröße: Erfolgsrate"]]];
+  const ana = [has.P && "Vorhersagefehler: Distanz vorgestellt ↔ echt je Latent → Zeitpunkt, Loss-Gewichte",
+    has.R && "Rollout-Infos: Greifer und Kontakt → Fehlertyp, Zeitpunkt, Arm",
+    has.I && "Imaginations-Probe: vorgestellte − echte Greiferposition → Δ",
+    has.V && `VLM (Qwen3-VL): Keyframes${has.P ? " + Fehlerkurve + Vorstellung" : ""} → Fehlertyp, Text, Δz`,
+    has.O && "Orakel (Simulator): Fehlertyp, Zeitpunkt, Δz"].filter(Boolean);
+  const sigl = [has.P && "Vorhersagefehler", has.R && "Rollout-Infos", has.I && "Imaginations-Probe", has.V && "VLM", has.O && "Orakel"].filter(Boolean).join(" + ");
+  if (e.g == "B") {
+    const sm = m.match(/_s(\d+)$/), n = m.endsWith("_150") ? [150, 100] : sm ? [+sm[1], +sm[1]] : [25, 25], na = parseInt(a.train) || 3, ins = (a.mods || []).includes("adapterplus");
+    return [[na + (na == 1 ? " Adaptions-Episode" : " Adaptions-Episoden"), ["Tisch −5 oder −10 cm", "eigene Episoden, Erfolg oder Fehlschlag", "Signal: " + sigl]],
+      ["Update nach jeder Episode", [ins && `innen: Adapter+, ${n[0]} Schritte Flow-Loss`, a.outside && `außen: Residual-MLP, ${n[1]} Schritte L1 auf neu berechneten Vorhersagen`,
+        has.O ? "Aktions-Ziel um das Orakel-Δ korrigiert" : "kein Korrektur-Ziel für die Aktionen"].filter(Boolean), "trn"],
+      ["Einfrieren", ["keine weiteren Updates"]], [(20 - na) + " Eval-Episoden", ["neue Seeds", "Messgröße: Erfolgsrate gegen die Basis"]]];
+  }
+  const st = [];
+  if (meta) st.push(["Vorab, einmal", ["Meta-Training der orangen Module", "7 andere Aufgaben, zufällige Tischhöhe", "Sequenz: Fehlerkontext | Experten-Lösung", "Loss nur auf der Lösung"], "trn"]);
+  st.push(["Versuch 1", ["LingBot-VA unverändert", "scheitert: Greifer schließt zu hoch", "gespeichert: echte und vorgestellte Latents, Aktionen"]]);
+  if (ana.length && (upd || ctx)) st.push(["Analyse des Fehlversuchs", ana]);
+  if (upd) {
+    const extra = {lff_ttt_filtered: ["nur Frames im oberen 30 % des Vorhersagefehlers"], lff_adapter_videoonly: ["nur Video-Loss, kein Aktions-Loss"],
+      lff_pref: ["Präferenz-Loss: korrigierte Aktionen besser als die ausgeführten"], lff_bank: ["LoRA, bleibt über Seeds erhalten", "eigene Erfolge als Anker, Guard gegen Verschlechterung"]}[m] || [];
+    st.push(["Adapter-Update", ["150 Schritte Flow-Matching-Loss auf der Fehl-Episode",
+      has.O || has.V || has.I ? "Aktions-Ziel: Aktionen vor dem Fehler um Δ korrigiert" : has.R ? "Korrektur nur als Text, Aktionen bleiben" : "kein Korrektur-Ziel, Aktionen bleiben",
+      "Video-Ziel: das beobachtete Video", has.P && "Frames mit hohem Vorhersagefehler zählen stärker", ...extra].filter(Boolean), "trn"]);
+  } else if (ctx) st.push(["Kontext für Versuch 2", [a.tok && `KV-Cache: Fehlversuch (${a.tok})`, a.text && `Prompt: Instruktion + Text vom ${a.text}`,
+    a.vec && "FiLM: Fehlervektor aus der Analyse", "kein Gradientenschritt"].filter(Boolean), "ctx"]);
+  else if (meta) st.push(["Kein Kontext", ["derselbe Meta-Adapter", "leerer Cache, nur die Instruktion"]]);
+  st.push(["Versuch 2", ["selber Seed", m == "retry_explore" ? "Aktionsrauschen auf den Aktionen" : m == "reset_on_gap" ? "steigt der Vorhersagefehler, wird der KV-Cache geleert" : !upd && !ctx ? "nichts geändert" : null,
+    "Messgröße: Anteil gelöster Fehlversuche"].filter(Boolean)]);
+  return st;
+}
+const steps = e => `<ol class="steps">${flow(e).map(([t, l, c]) => `<li class="${c || ""}"><div class="t">${esc(t)}</div><ul>${l.map(x => `<li>${esc(x)}</li>`).join("")}</ul></li>`).join("")}</ol>`;
+
+// ---------------------------------------------------------------- architecture diagram: only what this variant uses
+function arch(e) {
+  const a = e.a || {}, mods = new Set(a.mods || []), m = mname(e);
+  const C = {ctx: ["var(--ctx-bg)", "var(--ctx)"], trn: ["var(--trn-bg)", "var(--trn)"], frz: ["var(--panel)", "currentColor"]};
+  const box = (x, y, w, h, t, s, cls = "frz", fs = 12) => `<rect x="${x}" y="${y}" width="${w}" height="${h}" rx="4" fill="${C[cls][0]}" stroke="${C[cls][1]}" stroke-width="${cls == "frz" ? 1.1 : 1.6}"/><text x="${x + w / 2}" y="${y + h / 2 + (s ? -3 : 4)}" text-anchor="middle" font-size="${fs}" font-weight="600" fill="currentColor">${esc(t)}</text>${s ? `<text x="${x + w / 2}" y="${y + h / 2 + 11}" text-anchor="middle" font-size="10" fill="currentColor">${esc(s)}</text>` : ""}`;
+  const arr = (d, cls, lab, lx, ly, anc = "middle") => `<path d="${d}" fill="none" stroke="${cls ? C[cls][1] : "currentColor"}" stroke-width="1.4" marker-end="url(#a${cls ? cls[0] : "n"})"/>${lab ? `<text x="${lx}" y="${ly}" text-anchor="${anc}" font-size="10" fill="${cls ? C[cls][1] : "var(--muted)"}">${esc(lab)}</text>` : ""}`;
+  const note = (x, y, t, col = "var(--muted)", anc = "start") => `<text x="${x}" y="${y}" text-anchor="${anc}" font-size="10" fill="${col}">${esc(t)}</text>`;
+  const hd = (x, t) => `<text x="${x}" y="16" font-size="10.5" font-weight="600" letter-spacing=".05em" fill="var(--muted)">${t}</text>`;
+  const mk = (id, col) => `<marker id="${id}" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="${col}"/></marker>`;
+  const film = mods.has("film_mem") ? "mem" : mods.has("film_err") ? "err" : mods.has("film_txt") ? "txt" : null;
+  let s = `<defs>${mk("ac", "var(--ctx)")}${mk("at", "var(--trn)")}${mk("an", "currentColor")}</defs>` + hd(10, "EINGABEN") + hd(250, "ENCODER UND SPEICHER") + hd(736, "AUSGABE · JE CHUNK ZWEI DURCHLÄUFE");
+  s += `<rect x="430" y="62" width="282" height="366" rx="6" fill="none" stroke="currentColor" stroke-width="1" stroke-dasharray="4 4"/><text x="571" y="444" text-anchor="middle" font-size="10.5" font-weight="600" letter-spacing=".05em" fill="var(--muted)">LINGBOT-VA · 30 BLÖCKE · EINGEFROREN</text>`;
+  s += `<rect x="736" y="62" width="254" height="366" rx="6" fill="none" stroke="currentColor" stroke-width="1" stroke-dasharray="4 4"/>`;
+  // inputs (left) and what encodes or stores them
+  if (a.vec) s += box(10, 80, 170, 40, "Fehlervektor", a.vec[0] == "+" ? "Δ, Typ, Lücke " + a.vec : a.vec, "ctx") + arr("M180 100 H248", "ctx", "Bedingung", 215, 94);
+  if (a.tok) s += box(10, 138, 170, 40, "Fehlversuch als Tokens", a.tok, "ctx") + arr("M180 158 H248", "ctx", "Prefill", 215, 152);
+  s += box(10, 184, 170, 40, "3 Kameras → VAE", "Kopf, 2 Handgelenke") + arr("M180 204 H248", null, "Latents", 215, 198);
+  s += box(10, 250, 170, 40, a.text ? "Instruktion + Analyse" : "Instruktion", a.text ? "Text vom " + a.text : "Aufgabe in Worten", a.text ? "ctx" : "frz") + arr("M180 270 H248", a.text ? "ctx" : null, "Prompt", 215, 264);
+  const row = (y, t, cls) => `<rect x="258" y="${y}" width="124" height="20" rx="3" fill="${cls == "ctx" ? C.ctx[0] : "var(--bg)"}" stroke="${C[cls][1]}" stroke-width="1"/><text x="320" y="${y + 14}" text-anchor="middle" font-size="10" fill="currentColor">${t}</text>`;
+  s += `<rect x="250" y="134" width="140" height="92" rx="4" fill="var(--panel)" stroke="currentColor" stroke-width="1.1"/><text x="320" y="151" text-anchor="middle" font-size="12" font-weight="600" fill="currentColor">KV-Cache</text>`;
+  s += (a.tok ? row(158, "Fehlversuch", "ctx") + row(181, "laufende Episode", "frz") : row(168, "laufende Episode", "frz")) + note(320, a.tok ? 218 : 208, "bis 72 Latent-Frames", "var(--muted)", "middle");
+  s += arr("M390 180 H444", a.tok ? "ctx" : null, "K, V", 418, 174);
+  s += box(250, 250, 140, 40, "UMT5", "Text-Encoder") + arr("M390 270 H444", a.text ? "ctx" : null, "Text", 418, 264);
+  if (film) {
+    s += box(250, 80, 140, 40, "FiLM-Kopf", "Low-Rank-MLP je Block", "trn") + arr("M390 100 H444", "trn", "Offset", 418, 94);
+    if (film == "mem") s += arr("M320 134 V122", "ctx") + note(250, 72, "aus gemittelten Kontext-Tokens", C.ctx[1]);
+    if (film == "txt") s += arr("M400 270 V127 H330 V122", "ctx") + note(250, 72, "aus gemitteltem Text-Embedding", C.ctx[1]);
+  }
+  // one transformer block, top to bottom
+  s += box(430, 10, 282, 40, "Tokens des aktuellen Chunks, verrauscht", "je Frame 120 Video- oder 16 Aktions-Tokens") + arr("M526 50 V78");
+  s += box(446, 80, 160, 40, "Norm-Modulation", "scale, shift, gate aus t") + arr("M526 120 V158") + box(446, 160, 160, 40, "Self-Attention", "Tokens + KV-Cache");
+  const s1 = [mods.has("adapterplus") && "Adapter+", mods.has("prompt") && "Prompt-Tokens", mods.has("ttt") && "Fast-Weights"].filter(Boolean);
+  s += s1.length ? arr("M526 200 V211") + box(446, 213, 160, 24, s1.join(" · "), null, "trn", 11) + arr("M526 237 V248") : arr("M526 200 V248");
+  s += box(446, 250, 160, 40, "Cross-Attention", "auf den Text") + arr("M526 290 V312") + box(446, 314, 160, 40, "FFN", "Feed-Forward");
+  if (mods.has("adapterplus")) s += arr("M526 354 V365") + box(446, 367, 160, 24, "Adapter+", null, "trn", 11);
+  s += note(526, 412, "30 Blöcke nacheinander", "var(--muted)", "middle");
+  const chip = (y, t) => `<path d="M606 ${y + 12} H616" fill="none" stroke="var(--trn)" stroke-width="1.4"/>` + box(616, y, 86, 24, t, null, "trn", 10.5);
+  if (mods.has("adaln")) s += chip(88, "AdaLN-Offset");
+  if (mods.has("lora")) s += chip(168, "LoRA q,k,v,o");
+  if (mods.has("ia3")) s += chip(168, "(IA)³ k, v") + chip(322, "(IA)³");
+  // outputs (right): the two passes of one chunk
+  s += arr("M712 245 H734") + box(748, 80, 230, 40, "1 · Video-Durchlauf", "25 Schritte → 2 vorgestellte Frames");
+  s += a.outside ? arr("M863 120 V148") + box(748, 150, 230, 40, "Latent-Korrektur (außen)", "Residual-MLP, vor dem Cache", "trn") + arr("M863 190 V218") : arr("M863 120 V218", null, "in den KV-Cache", 870, 173, "start");
+  s += box(748, 220, 230, 40, "2 · Aktions-Durchlauf", "50 Schritte → 32 Aktionen, 2 Arme") + arr("M863 260 V312", null, m == "retry_explore" ? "+ Aktionsrauschen" : "an den Roboter", 870, 290, "start");
+  s += box(748, 314, 230, 40, "Roboter führt aus", "echte Latents ersetzen die Vorstellung") + note(748, 380, "Vorhersagefehler = Distanz zwischen") + note(748, 394, "Vorstellung und echtem Latent, je Frame");
+  const used = [a.tok && "Fehlversuch im KV-Cache", a.text && "Analyse-Text im Prompt", a.vec && "Fehlervektor über FiLM", ...(a.mods || []).map(k => MODN[k].split(/[ (:]/)[0]), a.outside && "Latent-Korrektur außen"].filter(Boolean);
+  return `<svg class="arch" viewBox="0 0 1000 452" role="img" aria-label="Datenfluss eines Chunks in LingBot-VA für diese Variante. ${esc(used.length ? "Zusätzlich zum Basismodell: " + used.join(", ") + "." : "Unverändertes Basismodell.")}">${s}</svg>`;
+}
+
+// ---------------------------------------------------------------- findings so far, computed from the data
+function findings() {
+  const g = (k, s) => { const v = V(k); return v && v.settings[s]; }, fr = c => c && c.retried ? `${c.fixed}/${c.retried}` : "–", L = [];
+  const b0 = g("p0_baseline_table/base", "table_h_z00"), b5 = g("p0_baseline_table/base", S[0]), b10 = g("p0_baseline_table/base", S[1]);
+  if (b5 && b10) L.push(`<b>Basis bricht ein.</b> ${b0 ? `${b0.first_ok}/${b0.first_n} bei 0 cm, ` : ""}${b5.first_ok}/${b5.first_n} bei −5 cm, ${b10.first_ok}/${b10.first_n} bei −10 cm. Der Greifer schließt ${f1(b5.above1_mm)} bzw. ${f1(b10.above1_mm)} mm zu hoch.`);
+  const A = "p5a_signals/", o5 = g(A + "lff_sig_O", S[0]), o10 = g(A + "lff_sig_O", S[1]), r5 = g(A + "retry_plain", S[0]), r10 = g(A + "retry_plain", S[1]);
+  if (o5 && o10 && r5 && r10) L.push(`<b>Eine richtige Korrektur kann das Modell umsetzen.</b> Orakel-Update löst ${fr(o5)} (−5 cm) und ${fr(o10)} (−10 cm) der Fehlversuche, Retry ohne Lernen ${fr(r5)} und ${fr(r10)}. Greifhöhe bei −10 cm: ${f1(o10.above1_mm)} → ${f1(o10.above2_mm)} mm über dem Griff.`);
+  const own = ["lff_sig_P", "lff_sig_PR", "lff_sig_PI", "lff_sig_PRI"].map(m => [g(A + m, S[0]), g(A + m, S[1])]).filter(x => x[0] && x[1]);
+  if (own.length) {
+    const sum = (i, f) => own.reduce((t, x) => t + (x[i][f] || 0), 0), avg = f => own.reduce((t, x) => t + x[1][f], 0) / own.length;
+    L.push(`<b>Eigene Signale ohne Korrektur-Ziel reichen bisher nicht.</b> ${own.length} Varianten zusammen: ${sum(0, "fixed")}/${sum(0, "retried")} bei −5 cm, ${sum(1, "fixed")}/${sum(1, "retried")} bei −10 cm. Bei −10 cm bleibt die Greifhöhe gleich (${f1(avg("above1_mm"))} → ${f1(avg("above2_mm"))} mm), obwohl der Vorhersagefehler sinkt (${f2(avg("gap1"))} → ${f2(avg("gap2"))}): das Weltmodell lernt den Fehler vorherzusagen, die Aktion ändert sich nicht.`);
+  }
+  const B = "p5f_paper/", ev = c => c && c.eval_n ? `${c.eval_ok}/${c.eval_n}` : "–", pv = c => c && c.vs_control && c.vs_control.p != null ? ` (p ${c.vs_control.p < 0.01 ? "&lt; 0,01" : "= " + f2(c.vs_control.p)})` : "";
+  const bb5 = g(B + "base", S[0]), bb10 = g(B + "base", S[1]), d5 = g(B + "paper_P_dual", S[0]), d10 = g(B + "paper_P_dual", S[1]);
+  if (bb5 && d5) {
+    const i5 = g(B + "paper_P_inside", S[0]), i10 = g(B + "paper_P_inside", S[1]), u5 = g(B + "paper_P_outside", S[0]), x5 = g(B + "paper_OP_dual", S[0]), x10 = g(B + "paper_OP_dual", S[1]), l5 = g(B + "paper_P_dual_150", S[0]);
+    L.push(`<b>Dual-Site nur mit Vorhersagefehler hilft bei −5 cm, bei −10 cm kaum.</b> Nach 3 Adaptions-Episoden: ${ev(d5)} gegen Basis ${ev(bb5)} bei −5 cm${pv(d5)}, ${ev(d10)} gegen ${ev(bb10)} bei −10 cm${pv(d10)}. Die Greifhöhe sinkt bei −5 cm von ${f1(bb5.above_eval_mm)} auf ${f1(d5.above_eval_mm)} mm über dem Griff${d10 && bb10 ? `, bei −10 cm nur von ${f1(bb10.above_eval_mm)} auf ${f1(d10.above_eval_mm)} mm` : ""}.` +
+      (i5 && u5 ? ` Der Gewinn kommt von innen: nur innen ${ev(i5)}${i10 ? ` / ${ev(i10)}` : ""}, nur außen ${ev(u5)} (wie Basis).` : "") +
+      (l5 ? ` Mehr Schritte (150 + 100) machen es schlechter: ${ev(l5)}.` : "") +
+      (x5 && x10 ? ` Mit Orakel-Korrektur: ${ev(x5)} und ${ev(x10)}; nur sie bewegt −10 cm deutlich.` : ""));
+  }
+  const C = "p6a_icl_content/", t5 = g(C + "icl_text_only", S[0]), c5 = g(C + "retry_plain", S[0]);
+  if (t5 && c5) L.push(`<b>Korrektur-Text allein ändert ohne Training nichts.</b> Orakel-Text im Prompt löst ${fr(t5)} bei −5 cm, Retry ohne Lernen ${fr(c5)}. Die Greifhöhe bleibt gleich (${f1(t5.above1_mm)} → ${f1(t5.above2_mm)} mm). Die Varianten mit Rollout im Kontext warten noch.`);
+  const v5 = (R.vlm_vs_oracle || {})["table_h_m05|rollout|test"], v10 = (R.vlm_vs_oracle || {})["table_h_m10|rollout|test"];
+  if (v5 && v10) L.push(`<b>Das VLM liefert noch keine Korrektur.</b> Fehlertyp richtig in ${pct(v5.type_agree, 1)} (−5 cm) und ${pct(v10.type_agree, 1)} (−10 cm), Richtung richtig in ${pct(v5.sign_agree, 1)} und ${pct(v10.sign_agree, 1)}, Δz im Median ${f1(v5.vlm_dz_cm)} cm statt ${f1(v5.oracle_dz_cm)} und ${f1(v10.oracle_dz_cm)} cm.`);
+  const f5 = Object.entries(R.variants).filter(([k, v]) => k.startsWith(A) && v.settings[S[0]]).map(([, v]) => v.settings[S[0]].first_ok);
+  if (f5.length > 1) L.push(`<b>Vorsicht bei −5 cm.</b> Schon der erste Versuch gelingt je nach Lauf in ${Math.min(...f5)} bis ${Math.max(...f5)} von ${g(A + "retry_plain", S[0]).first_n} Seeds. Unterschiede von wenigen Episoden sind dort Rauschen; belastbar ist −10 cm.`);
+  const wait = Object.keys(GROUPS).filter(x => x != "0" && !CAT.some(e => e.g == x && V(e.k) && mname(e) != "base" && !e.ctrl)).map(x => GROUPS[x][0].split(" · ")[0]);
+  if (wait.length) L.push(`<b>Noch ohne Ergebnis:</b> Block ${wait.join(", ")}. Die Jobs warten in der Cluster-Queue.`);
+  document.getElementById("find").innerHTML = L.map(x => `<li>${x}</li>`).join("") || "<li>Noch keine Daten.</li>";
+}
+findings();
+
+// ---------------------------------------------------------------- status: queue, blockers, chain to block D
+function stand() {
+  const st = R.status, sec = document.getElementById("stand");
+  if (!st || !st.jobs) { sec.hidden = true; return; }
+  const J = st.jobs, D = st.done_48h || {}, n = (o, ...ks) => ks.reduce((t, k) => t + ((o || {})[k] || 0), 0);
+  const names = [...new Set([...Object.keys(J), ...Object.keys(D)])].filter(k => !k.includes("cron")).sort();
+  const run = names.reduce((t, k) => t + n(J[k], "RUNNING"), 0), pend = names.reduce((t, k) => t + n(J[k], "PENDING"), 0);
+  const hrs = s => s ? (new Date(R.generated.replace(" ", "T")) - new Date(s.replace(" ", "T"))) / 36e5 : null;
+  const idle = hrs(st.last_end), cronAge = hrs((st.cron || {}).pipeline), dd = s => s ? s.slice(8, 10) + "." + s.slice(5, 7) + ". " + s.slice(11) : "–";
+  document.getElementById("stiles").innerHTML = tile("Jobs laufen", run, run ? "auf dem Cluster" : "Queue steht") + tile("Jobs warten", pend, "Grund: Priorität (nur Wartezeit zählt)") +
+    tile("Letzter Job fertig", dd(st.last_end), idle != null ? `vor ${f1(idle)} h` : "") + tile("Nächster Start laut SLURM", dd(st.next_start), "Schätzung, kann sich verschieben");
+  const Bk = [];
+  if (!run && pend) Bk.push(`<b>Kein Job läuft.</b> ${pend} warten${idle != null ? `, seit ${f1(idle)} h ist nichts mehr gestartet` : ""}.`);
+  if (cronAge != null && cronAge > 1.5) Bk.push(`<b>Pipeline-Tick hängt.</b> Letzter Lauf ${dd(st.cron.pipeline)} (vor ${f1(cronAge)} h). Solange reicht die Pipeline keine neuen Stufen ein.`);
+  if (n(J.p7_analysis, "PENDING")) Bk.push(`<b>P7-Analyse wartet auf der CPU-Partition.</b> Ohne sie startet kein Meta-Training.`);
+  if (!(st.gates || []).includes("vlm_setup")) Bk.push(`<b>VLM-Zweig gesperrt</b> (Gate <span class="num">vlm_setup</span> zu): Modell und Eingabe-Variante sind noch nicht gewählt${n(J.vlm_bench_8b, "PENDING") + n(J.vlm_bench_32b, "PENDING") ? ", der VLM-Benchmark wartet" : ""}.`);
+  const bad = names.reduce((t, k) => t + n(D[k], "FAILED", "TIMEOUT"), 0);
+  if (bad) Bk.push(`${bad} Jobs in den letzten 48 h abgebrochen (Fehler oder Zeitlimit).`);
+  document.getElementById("sblock").innerHTML = Bk.map(x => `<li>${x}</li>`).join("") || "<li>Nichts, die Queue läuft.</li>";
+  const sd = st.stages || {}, tr = Object.values(R.training || {}), p8 = Object.keys(R.variants).some(k => k.startsWith("p8_"));
+  const step = (ok, t, d) => `<li><span class="pill ${ok == 1 ? "ok" : ""}">${ok == 1 ? "fertig" : ok == 2 ? "wartet" : "offen"}</span> ${t}${d ? ` <span style="color:var(--muted)">· ${d}</span>` : ""}</li>`;
+  document.getElementById("schain").innerHTML =
+    step(sd.p7 ? 1 : 0, "P7-Daten: Fehlversuch + Experten-Lösung auf 7 Aufgaben") +
+    step(sd.p7_analysis ? (n(J.p7_analysis, "PENDING", "RUNNING") ? 2 : 1) : 0, "Analyse der P7-Fehlversuche (Orakel, VLM)", n(J.p7_analysis, "PENDING") ? "in der Queue" : "") +
+    step(tr.some(x => x.done) && sd.meta_oracle ? 1 : sd.meta_oracle ? 2 : 0, "Meta-Training der Kontext-Adapter", sd.meta_oracle ? "" : "startet nach der Analyse") +
+    step(p8 ? 1 : 0, "Auswertung auf der Testaufgabe (D)", p8 ? "" : "startet nach dem Meta-Training");
+  const cell = (o, ...ks) => { const x = n(o, ...ks); return `<td class="num">${x || "–"}</td>`; };
+  document.getElementById("sjobs").innerHTML = names.map(k => `<tr><td class="num">${esc(k)}</td>${cell(J[k], "RUNNING")}${cell(J[k], "PENDING")}${cell(D[k], "COMPLETED")}${cell(D[k], "FAILED", "TIMEOUT")}</tr>`).join("");
+}
+
+// ---------------------------------------------------------------- overview
+document.getElementById("stamp").textContent = `Stand der Daten: ${R.generated} · Testaufgabe ${R.test_task || "move_playingcard_away"}`;
+const hasData = e => !!V(e.k);
+document.getElementById("blocks").innerHTML = Object.entries(GROUPS).filter(([g]) => g != "0").map(([g, [t, d]]) => {
+  const es = CAT.filter(e => e.g == g), n = es.filter(hasData).length;
+  return `<div class="card"><h3>${esc(t.split(" · ")[0])}</h3><div style="font-weight:600">${esc(t.split(" · ")[1])}</div><div class="sub">${esc(d)}</div><div style="margin-top:8px"><span class="pill ${n ? "ok" : ""}">${n} von ${es.length} mit Daten</span></div></div>`;
+}).join("");
+let sel = (CAT.find(e => e.k == "p5a_signals/lff_sig_OP" && hasData(e)) || CAT.find(hasData) || CAT[0]).k, setting = S[0];
+const open = new Set();
+function rows() {
+  let h = "", g0 = null;
+  for (const e of CAT) {
+    if (e.g != g0) {
+      g0 = e.g;
+      const w = CAT.filter(x => x.g == g0 && !V(x.k)).length;
+      h += `<tr class="grp"><td colspan="4">${esc(GROUPS[e.g][0])} <span style="font-weight:400;color:var(--muted)">· ${esc(GROUPS[e.g][1])}</span>${w ? ` <button type="button" class="more" data-g="${g0}">${open.has(g0) ? "wartende ausblenden" : w + " wartende Varianten zeigen"}</button>` : ""}</td></tr>`;
+    }
+    if (!V(e.k) && !open.has(e.g)) continue;
+    const v = V(e.k), ver = v && (verdict(v.settings[S[0]]) || verdict(v.settings[S[1]]));
+    h += `<tr class="v ${v ? "" : "wait"}" data-k="${e.k}" tabindex="0"><td>${esc(e.n)}${e.ctrl ? ' <span class="pill">Kontrolle</span>' : ""}<div class="q">${esc(qOf(e))}</div></td>` +
+      S.map(s => `<td>${bar(v && rate(v.settings[s], v.protocol))}</td>`).join("") +
+      `<td>${ver ? `<span class="pill ${ver[1]}">${ver[0]}</span>` : v ? '<span class="pill">kein Kontext</span>' : ""}</td></tr>`;
+  }
+  document.getElementById("rows").innerHTML = h;
+}
+const slug = k => k.replace(/[^A-Za-z0-9]+/g, "-");
+const BY = Object.fromEntries(CAT.map(e => [slug(e.k), e]));
+const pick = k => { location.hash = "v-" + slug(k); };
+function route() {
+  const h = (location.hash || "#uebersicht").slice(1), isV = h.startsWith("v-") && BY[h.slice(2)];
+  const show = isV ? "variante" : ["training", "paper", "log"].includes(h) ? h : "uebersicht";
+  for (const v of ["uebersicht", "variante", "training", "paper", "log"]) document.getElementById("view-" + v).hidden = v != show;
+  if (isV) { sel = BY[h.slice(2)].k; detail(); window.scrollTo(0, 0); } else rows();
+}
+window.addEventListener("hashchange", route);
+function heat(m, lab) {  // rows = chunks, columns = blocks; opacity = attention relative to the token share
+  const cw = 9, ch = 12, L = 46, T = 6, vmax = Math.max(1.5, ...m.flat());
+  let g = "";
+  m.forEach((row, i) => row.forEach((v, j) => { g += `<rect x="${L + j * cw}" y="${T + i * ch}" width="${cw - 1}" height="${ch - 1}" fill="var(--ctx)" fill-opacity="${Math.min(1, v / vmax).toFixed(2)}"/>`; }));
+  const W = L + 30 * cw + 6, H = T + m.length * ch + 18;
+  return `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(lab)}">${g}<text x="${L - 4}" y="${T + 9}" font-size="9" text-anchor="end" fill="var(--muted)">Chunk 1</text><text x="${L - 4}" y="${T + m.length * ch - 3}" font-size="9" text-anchor="end" fill="var(--muted)">${m.length}</text><text x="${L}" y="${H - 5}" font-size="9" fill="var(--muted)">Block 1</text><text x="${W - 6}" y="${H - 5}" font-size="9" text-anchor="end" fill="var(--muted)">30</text><text x="${(L + W) / 2}" y="${H - 5}" font-size="9" text-anchor="middle" fill="var(--muted)">voll = ${f1(vmax)} × Token-Anteil</text></svg>`;
+}
+document.getElementById("rows").addEventListener("click", ev => {
+  const b = ev.target.closest("button.more");
+  if (b) { open.has(b.dataset.g) ? open.delete(b.dataset.g) : open.add(b.dataset.g); rows(); return; }
+  const tr = ev.target.closest("tr.v"); if (tr) pick(tr.dataset.k); });
+document.getElementById("rows").addEventListener("keydown", ev => { const tr = ev.target.closest("tr.v"); if (tr && (ev.key == "Enter" || ev.key == " ")) { ev.preventDefault(); pick(tr.dataset.k); } });
+
+// ---------------------------------------------------------------- detail
+function tile(k, n, d) { return `<div class="tile"><div class="k">${k}</div><div class="n">${n}</div><div class="d">${d || ""}</div></div>`; }
+function detail() {
+  const e = CAT.find(x => x.k == sel), v = V(sel), c = v && v.settings[setting], P = v && v.protocol;
+  document.getElementById("dname").textContent = `${GROUPS[e.g][0].split(" · ")[0]} · ${e.n}`;
+  const i = CAT.indexOf(e), pv = CAT[i - 1], nx = CAT[i + 1];
+  document.getElementById("dnav").innerHTML = `<a href="#uebersicht">← alle Varianten</a>` + (pv ? `<a href="#v-${slug(pv.k)}">‹ ${esc(pv.n)}</a>` : "") + (nx ? `<a href="#v-${slug(nx.k)}">${esc(nx.n)} ›</a>` : "");
+  const tr = [...(e.a.mods || []).map(k => MODN[k]), e.a.outside && "Residual-MLP (1024 breit) auf 2×2-Patches des vorhergesagten Latents"].filter(Boolean);
+  let h = `<figure><div class="fig">${arch(e)}</div><figcaption>Ein Chunk im ${e.g == "B" ? "Eval-Versuch" : mname(e) == "base" ? "Versuch" : "zweiten Versuch"}: Er läuft erst als Video, dann als Aktion durch dieselben 30 Blöcke. <span class="pill ctx">Petrol</span> kommt aus dem Fehlversuch, <span class="pill trn">Orange</span> wird trainiert, alles andere ist eingefrorenes LingBot-VA.</figcaption></figure>`;
+  h += `<div><h3>Ablauf</h3>${steps(e)}</div>`;
+  h += `<div class="card"><h3>Was getestet wird</h3><ul>${qOf(e) ? `<li><b>Frage:</b> ${esc(qOf(e))}</li>` : ""}${e.b.map(x => `<li>${esc(x)}</li>`).join("")}` +
+    `<li><b>Trainiert:</b> ${tr.length ? esc([...new Set(tr)].join("; ")) : "nichts"}</li>${VS[e.g] && !e.ctrl ? `<li><b>Verglichen mit:</b> ${esc(VS[e.g])}</li>` : ""}</ul></div>`;
+  h += `<div class="seg" role="group" aria-label="Tischhöhe">${S.map(s => `<button type="button" id="set-${s}" data-s="${s}" aria-pressed="${s == setting}">${SN[s]}</button>`).join("")}</div>`;
+  if (!c) { h += `<div class="empty">Noch keine Daten für ${SN[setting]}. Sobald Läufe fertig sind, erscheinen hier: Ergebnis, Greifhöhe, Kontext-Nutzung mit Attention-Heatmap, Analyse gegen Orakel und Rollouts mit echten und vorgestellten Bildern.</div>`; }
+  else {
+    // outcome
+    const r = rate(c, P), vc = c.vs_control;
+    let t = tile(P == "paper" ? "Erfolg nach Adaption" : P == "single" ? "Erfolg" : "Fehlversuche gelöst", r.n ? `${r.k}/${r.n}` : "–", r.n ? pct(r.k, r.n) + (r.ci && r.ci[0] != null ? ` · 95 %: ${Math.round(100 * r.ci[0])}–${Math.round(100 * r.ci[1])} %` : "") : "");
+    if (c.flung) t += tile("Weggeflogen", String(c.flung), "vom Simulator als Erfolg gezählt, hier als Fehlschlag");
+    if (P == "retry") t += tile("Erster Versuch", `${c.first_ok}/${c.first_n}`, "unverändertes Modell");
+    if (P == "paper") t += tile("Adaptions-Episoden", `${c.adapt_ok}/${c.adapt_n}`, "Erfolg während der Adaption");
+    if (vc && vc.n) t += tile("Gegen Kontrolle", `+${vc.better} / −${vc.worse}`, `${vc.n} gemeinsame Seeds${vc.p != null ? " · p " + (vc.p < 0.01 ? "&lt; 0,01" : "= " + f2(vc.p)) : ""}`);
+    const a1 = P == "paper" ? c.above_adapt_mm : c.above1_mm, a2 = P == "paper" ? c.above_eval_mm : c.above2_mm;
+    if (a1 != null) t += tile("Greifer über Griffhöhe", P == "single" ? `${f1(a1)} mm` : `${f1(a1)} → ${f1(a2)} mm`, P == "single" ? "beim ersten Schließen" : "Versuch 1 → 2, 0 = richtig");
+    const g1 = P == "paper" ? c.gap_adapt : c.gap1, g2 = P == "paper" ? c.gap_eval : c.gap2;
+    if (g1 != null) t += tile("Vorhersagefehler am Griff", P == "single" ? f2(g1) : `${f2(g1)} → ${f2(g2)}`, "Kosinus-Distanz, Handgelenk");
+    h += `<div><h3>Ergebnis</h3><div class="tiles">${t}</div></div>`;
+    // context
+    const x = c.context;
+    if (x) {
+      const ver = verdict(c);
+      h += `<div><h3>Wird der Kontext benutzt? <span class="pill ${ver[1]}">${ver[0]}</span></h3><div class="tiles">` +
+        tile("Attention auf Kontext", f2(x.attn_action), "1 = wie jedes andere Token") +
+        tile("Einfluss auf die Aktion", pct(x.infl_action, 1), "Änderung, wenn der Kontext versteckt wird") +
+        tile("Verschiebung der Aktion", `${f1(x.shift_mm)} mm`, "Höhe des Greifarms, negativ = tiefer") +
+        tile("Einfluss: Erfolg / Fehlschlag", `${pct(x.infl_action_success, 1)} / ${pct(x.infl_action_fail, 1)}`, `${x.n} Versuche · ${x.tokens} Kontext-Tokens`) + `</div>`;
+      h += `<div class="grid g2" style="margin-top:10px"><div class="card mini"><div class="k sub" style="margin:0 0 4px">Attention auf den Kontext je Block</div>${line([{y: x.layer_action, c: "var(--ctx)"}].concat(x.layer_video ? [{y: x.layer_video, c: "var(--muted)", dash: 1}] : []), {ref: 1, x: "Block 1 … 30", label: "Attention je Block"})}${legend([["var(--ctx)", "Aktions-Tokens"], ["var(--muted)", "Video-Tokens", 1]])}</div>`;
+      const pk = Object.entries(x.parts || {});
+      if (x.heat) h += `<div class="card mini" style="grid-column:1/-1"><div class="sub" style="margin:0 0 4px">Attention-Heatmap: Aktions-Tokens auf den Kontext, über Zeit und Tiefe</div>${heat(x.heat, "Attention auf den Kontext je Chunk und Block")}</div>`;
+      h += `<div class="card"><div class="sub" style="margin:0 0 6px">Worauf im Kontext geschaut wird</div><ul>${pk.map(([k, val]) => `<li>${esc(k.replace("failure:", "Fehlversuch ").replace("pred", "vorgestellt").replace("obs", "echt"))}: <span class="num">${f2(val)}</span> × Token-Anteil</li>`).join("") || "<li>keine Aufschlüsselung</li>"}${x.window_frac != null ? `<li>Fenster um den Fehler: <span class="num">${pct(x.window_frac, 1)}</span> der Kontext-Attention</li>` : ""}</ul></div></div></div>`;
+    } else if (P == "retry") h += `<div><h3>Wird der Kontext benutzt?</h3><div class="empty">Diese Variante gibt dem Modell keinen Kontext${(e.a.mods || []).length ? " (die Information geht über ein Gewichts-Update ein)" : ""}.</div></div>`;
+    // analysis
+    const an = c.analysis;
+    if (an) h += `<div><h3>Fehleranalyse für den zweiten Versuch</h3><div class="tiles">` + tile("Quelle", esc(an.source || "–"), `${an.n} Analysen`) +
+      tile("Korrektur Δz", `${f1(an.dz_cm)} cm`, `Orakel: ${f1(an.oracle_dz_cm)} cm`) +
+      (an.type_agree != null ? tile("Fehlertyp wie Orakel", pct(an.type_agree, 1), Object.entries(an.types).map(([k, n]) => `${k}: ${n}`).join(", ")) : "") +
+      (an.sign_agree != null ? tile("Richtung wie Orakel", pct(an.sign_agree, 1), `Abweichung im Median ${f1(an.abs_err_cm)} cm`) : "") + `</div>` +
+      (an.examples || []).slice(0, 2).map(q => `<div class="quote" style="margin-top:8px">${esc(q)}</div>`).join("") + `</div>`;
+    // rollouts
+    const ss = c.samples || [];
+    h += `<div><h3>Rollouts</h3>${ss.length ? `<div class="sub" style="margin:-4px 0 8px">Je Video: oben echt (Kopf, Handgelenk), unten was das Modell sich vorgestellt hat</div><div class="grid g2">` + ss.map(s => {
+      const series = [{y: s.gap, c: "var(--ink)"}].concat(s.gap_first ? [{y: s.gap_first, c: "var(--muted)", dash: 1}] : []);
+      return `<div class="card vid"><video controls muted loop playsinline preload="metadata" src="${s.video}"></video>
+        <div class="cap"><span class="pill ${s.success ? "ok" : "bad"}">${s.success ? "Erfolg" : s.flung ? "weggeflogen (zählt nicht)" : "Fehlschlag"}</span><span class="num">Seed ${s.seed}${s.attempt > 1 ? " · Versuch " + s.attempt : ""}</span>${s.above_mm != null ? `<span class="num">${s.above_first_mm != null ? f1(s.above_first_mm) + " → " : ""}${f1(s.above_mm)} mm über Griffhöhe</span>` : ""}</div>
+        ${s.cause ? `<div class="quote">Analyse: ${esc(s.cause)}</div>` : ""}
+        <div class="mini">${line(series, {mark: s.grasp_latent != null ? s.grasp_latent - 1 : null, x: "Zeit (Latents)", label: "Vorhersagefehler über die Episode", ymax: 1})}${legend([["var(--ink)", "Vorhersagefehler"]].concat(s.gap_first ? [["var(--muted)", "im ersten Versuch", 1]] : []))}</div>
+        ${s.att_video ? `<div class="sub" style="margin:0">Wohin die Aktions-Tokens im Bild schauen</div><video controls muted loop playsinline preload="metadata" src="${s.att_video}"></video>` : ""}
+        ${s.heat ? `<div class="mini">${heat(s.heat, "Attention auf den Kontext in diesem Rollout")}</div>` : ""}
+        ${s.infl ? `<div class="mini">${line([{y: s.infl, c: "var(--ctx)"}, {y: s.attn, c: "var(--trn)", dash: 1}], {x: "Aktions-Chunk", label: "Kontext-Nutzung über die Episode"})}${legend([["var(--ctx)", "Einfluss des Kontexts"], ["var(--trn)", "Attention auf Kontext", 1]])}</div>` : ""}</div>`;
+    }).join("") + `</div>` : `<div class="empty">Noch keine passenden Rollouts.</div>`}</div>`;
+  }
+  document.getElementById("dbody").innerHTML = h;
+  document.querySelectorAll(".seg button").forEach(b => b.onclick = () => { setting = b.dataset.s; detail(); });
+}
+
+// ---------------------------------------------------------------- training and VLM
+(function () {
+  const tr = Object.entries(R.training || {}).filter(([, t]) => t.steps && t.steps.length);
+  document.getElementById("train").innerHTML = tr.length ? `<div class="grid g2">` + tr.map(([n, t]) => `<div class="card mini"><div class="sub" style="margin:0 0 4px">${esc(n.replace("failfix_", "").replace("type_", ""))} ${t.done ? "" : '<span class="pill">läuft</span>'}</div>${line([{y: t.val, c: "var(--ctx)"}, {y: t.val_noctx, c: "var(--muted)", dash: 1}], {x: `Schritt ${t.steps[0]} … ${t.steps[t.steps.length - 1]}`, label: "Validierungs-Loss"})}</div>`).join("") + `</div>` + legend([["var(--ctx)", "mit Kontext"], ["var(--muted)", "ohne Kontext", 1]]) + `<div class="sub">Lebenszeichen: die Kurve mit Kontext liegt unter der ohne.</div>`
+    : `<div class="empty">Noch kein Meta-Training gelaufen. Es startet, sobald die Trainingsdaten (P7) und die VLM-Analyse fertig sind.</div>`;
+  const vv = Object.entries(R.vlm_vs_oracle || {});
+  document.getElementById("vlm").innerHTML = vv.length ? `<div class="tw"><table><thead><tr><th>Tisch</th><th>VLM sieht</th><th>Aufgaben</th><th>n</th><th>Typ richtig</th><th>Richtung richtig</th><th>Δz-Fehler</th></tr></thead><tbody>` +
+    vv.map(([k, x]) => { const [s, m, sc] = k.split("|"); return `<tr><td>${SN[s]}</td><td>${m == "rollout" ? "Rollout + Fehlerkurve" : "nur Fehlermoment"}</td><td>${sc == "test" ? "Testaufgabe" : "alle"}</td><td class="num">${x.n}</td><td class="num">${pct(x.type_agree, 1)}</td><td class="num">${pct(x.sign_agree, 1)}</td><td class="num">${f1(x.abs_err_cm)} cm</td></tr>`; }).join("") + `</tbody></table></div>`
+    : `<div class="empty">Der Vergleich läuft noch: Qwen3-VL analysiert 889 Fehlversuche der Basis, einmal mit dem ganzen Rollout und einmal nur mit dem Fehlermoment.</div>`;
+})();
+// ---------------------------------------------------------------- problems, analyses, running work
+(function () {
+  const J = R.journal || {}, st = x => `<span class="pill ${/erledigt/.test(x) ? "ok" : ""}">${esc(x)}</span>`;
+  document.getElementById("jstamp").textContent = J.updated ? `Stand: ${J.updated}` : "";
+  document.getElementById("jrun").innerHTML = (J.running || []).map(r => `<tr><td>${esc(r.s)}</td><td>${st(r.st)}</td></tr>`).join("") || `<tr><td colspan="2">–</td></tr>`;
+  document.getElementById("jana").innerHTML = (J.analyses || []).map(a => `<div class="card"><h3>${esc(a.t)}</h3><ul>${a.b.map(x => `<li>${esc(x)}</li>`).join("")}</ul></div>`).join("");
+  document.getElementById("jprob").innerHTML = (J.problems || []).map(p => `<tr><td><b>${esc(p.p)}</b></td><td>${esc(p.why)}</td><td>${esc(p.fix)}</td><td>${st(p.status)}</td></tr>`).join("");
+  const MN = {"Qwen_Qwen3-VL-8B-Instruct": "Qwen3-VL-8B", "Qwen_Qwen3-VL-32B-Instruct": "Qwen3-VL-32B", "sii-rhos-ai_ViFailback-8B": "ViFailback-8B",
+    "MINT-SJTU_RoboFAC-7B": "RoboFAC-7B", "nvidia_Cosmos-Reason1-7B": "Cosmos-Reason1-7B"};
+  const PN = {open: "offen (JSON)", checklist: "Checkliste", detail: "detail (neu)", two_stage: "erst Zeitpunkt, dann Fix", native_vifailback: "ViFailback-Format", native_robofac: "RoboFAC-Format"};
+  const rows = (R.vlm_bench || []).filter(r => PN[r.variant] && MN[r.model]);
+  const p = x => x == null ? "–" : Math.round(100 * x) + " %";
+  document.getElementById("jvlm").innerHTML = rows.map(r => `<tr><td>${esc(MN[r.model])}</td><td>${esc(PN[r.variant])}</td><td class="num">${r.n}</td><td class="num">${r.errors || "–"}</td><td class="num">${p(r.type)}</td><td class="num">${p(r.lower)}</td><td class="num">${p(r.lower_false)}</td></tr>`).join("") || `<tr><td colspan="7">Noch keine Daten.</td></tr>`;
+})();
+stand();
+route();
+</script>

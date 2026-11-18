@@ -11,11 +11,20 @@ set -uo pipefail
 # sbatch runs a copy of this script from the spool dir: locate the repo via FAWAM_ROOT (exported by submit_sweep.py)
 source "${FAWAM_ROOT:-${SLURM_SUBMIT_DIR:-$(dirname "${BASH_SOURCE[0]}")/..}}/cluster/env.sh"
 : "${TASK:?}" "${CONFIG:?}" "${OUT:?}"
+# Model offloading costs ~30 % throughput (benchmark 2026-11-09: 3 policy pairs, 13 -> 18 episodes / 45 min without
+# it). Without offload 3 pairs of expert replay / pair driver run out of memory on an H100 (94 GB), so it is only
+# switched off on GPUs with > 120 GB (H200, B200) and never where an adapter learner + replay share the GPU.
+GPU_MIB=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1)
+case "${METHOD:-base}" in
+    *lff_*|*paper_*|*_adapter*) OFFLOAD=${OFFLOAD:-1} ;;
+    *) [ "${GPU_MIB:-0}" -gt 120000 ] && OFFLOAD=${OFFLOAD:-0} || OFFLOAD=${OFFLOAD:-1} ;;
+esac
 METHOD=${METHOD:-base}; NUM=${NUM:-10}; SEED0=${SEED0:-0}; N_PAR=${N_PAR:-2}; DRIVER=${DRIVER:-policy}
 JOB=${SLURM_JOB_ID:-local$$}
 LOGDIR=$OUT/logs/$JOB
 mkdir -p "$LOGDIR"
-BASE_PORT=$(( 20000 + (${SLURM_JOB_ID:-$$} % 400) * 20 ))
+BASE_PORT=${BASE_PORT:-$(( 20000 + (${SLURM_JOB_ID:-$$} % 400) * 20 ))}  # override when several run on one node
+export FAWAM_VLM_PORT=${FAWAM_VLM_PORT:-8001}
 echo "[$(date)] job $JOB on $(hostname): $TASK $CONFIG method=$METHOD driver=$DRIVER num=$NUM seeds=$SEED0..$((SEED0+N_PAR-1)) out=$OUT"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 
@@ -25,8 +34,12 @@ trap cleanup EXIT
 
 if [ "${VLM:-0}" = 1 ]; then
     "$PY_VLLM" -m vllm.entrypoints.openai.api_server --model "${VLM_MODEL:-Qwen/Qwen2.5-VL-7B-Instruct}" \
-        --port 8001 --gpu-memory-utilization 0.22 --max-model-len 16384 > "$LOGDIR/vllm.log" 2>&1 &
+        --port "$FAWAM_VLM_PORT" --gpu-memory-utilization "$([ "${GPU_MIB:-0}" -gt 120000 ] && echo 0.24 || echo 0.38)" --max-model-len 12288 > "$LOGDIR/vllm.log" 2>&1 &
     pids+=($!)
+    # wait for vLLM BEFORE the WAM servers load: vLLM sizes its KV cache from the free GPU memory at start-up, so
+    # servers that load first (warm page cache) leave it a negative budget ("No available memory for the cache blocks")
+    until grep -q "Uvicorn running\|Application startup complete\|Traceback" "$LOGDIR/vllm.log" 2>/dev/null; do sleep 5; done
+    grep -q Traceback "$LOGDIR/vllm.log" && { echo "vLLM failed to start"; tail -20 "$LOGDIR/vllm.log"; exit 1; }
 fi
 
 cd "$FAWAM_ROOT/lingbot-va" || exit 1
@@ -34,7 +47,7 @@ for i in $(seq 0 $((N_PAR - 1))); do
     port=$((BASE_PORT + 2 * i))
     "$PY_LB" -m torch.distributed.run --nproc_per_node 1 --master_port $((port + 1)) -m fawam.server \
         --config-name robotwin --port "$port" --save_root "$LOGDIR/vis" \
-        --model_path "${MODEL_PATH:-checkpoints/lingbot-va-posttrain-robotwin}" --enable_offload \
+        --model_path "${MODEL_PATH:-checkpoints/lingbot-va-posttrain-robotwin}" $([ "$OFFLOAD" = 1 ] && echo --enable_offload) \
         > "$LOGDIR/server_$i.log" 2>&1 &
     pids+=($!)
 done
@@ -42,9 +55,6 @@ for i in $(seq 0 $((N_PAR - 1))); do
     until grep -q "server listening\|Traceback" "$LOGDIR/server_$i.log" 2>/dev/null; do sleep 10; done
     grep -q Traceback "$LOGDIR/server_$i.log" && { echo "server $i failed"; tail -30 "$LOGDIR/server_$i.log"; exit 1; }
 done
-if [ "${VLM:-0}" = 1 ]; then
-    until grep -q "Uvicorn running\|Application startup complete\|Traceback" "$LOGDIR/vllm.log"; do sleep 10; done
-fi
 
 export ROBOTWIN_ROOT="$FAWAM_ROOT/RoboTwin" PYTHONWARNINGS=ignore::UserWarning
 cpids=()

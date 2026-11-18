@@ -5,6 +5,7 @@ A method is given as: a preset name ("ig2"), several presets joined with "+" ("i
 a JSON string, or a dict. Later parts override earlier ones; dict values are merged one level deep.
 The experiment IDs (A1, B3, ...) refer to docs/EXPERIMENTS.md.
 """
+import os
 import copy
 import json
 from dataclasses import asdict, dataclass, field, fields
@@ -42,6 +43,7 @@ class Method:
     # --- adaptation (server, D) -------------------------------------------------------------------------------------
     adapter_path: str = None           # fawam.train_adapter output dir
     adapter_use: str = "all"           # all | inside | outside
+    hid_residual: dict = None          # M3 (fawam/train_hid.py): {"path": head dir, "ctx_ep": failed episode or None}
 
     # --- in-context (server + client, E) --------------------------------------------------------------------------
     prefill: dict = None               # {"bank": dir, "k": 1, "select": nearest|random|same_task, "gap": 1}
@@ -105,10 +107,16 @@ LEARN_DEFAULTS = dict(
     max_attempts=2,          # attempts per seed (attempt 1 + max_attempts-1 updates)
     persist=False,           # keep the adapter / memory across seeds (lifelong: the next seed starts adapted)
     memory="all",            # adapter training data: all | last failed episode(s) of the memory
+    kind=None,               # learner adapter kind: None = dual (Adapter+ inside) | inside | lora
+    inside_streams=None,     # None = video + action tokens | ["video"] | ["action"]
+    lr=None,                 # inside learning rate (None = train_adapter default 4.3e-4)
     steps=150, gap_beta=2.0, relabel=True, video_in_window="skip", lambda_video=1.0, lambda_action=1.0,
     include_pred=True,       # icl: imagined + observed failed attempt in the context
     prompt="correction",     # next attempt's prompt: correction (analysis) | instruction
     negative=False,          # next attempt's CFG negative = analysis.negative_prompt
+    hid_head=None,           # mode hidres: M3 head dir (fawam/train_hid.py output/<config>)
+    hid_ctx="own",           # mode hidres: own (the failed attempt) | shuf (a failure of another seed) | none
+    hid_shuf_root="results/sweeps/p10_hid_data/base/hid_trans",  # failures for hid_ctx shuf (other seeds, other o)
     meta_adapter=None,       # icl/both: adapter meta-trained to use failures in context (FailFix training)
     icl=None,                # in-context memory for the next attempt, see ICL_DEFAULTS (docs/ICL.md)
     keep_successes=True,     # persist: successful attempts join the memory (trained without relabel)
@@ -240,6 +248,20 @@ PRESETS = {
     "paper_P_dual_150": dict(learn=dict(mode="adapter", signals=["gap"], relabel=False, every_episode=True,
                                         persist=True, max_attempts=1, adapt_episodes=3, outside="sequential",
                                         steps=150, outside_steps=100, gap_beta=0.0)),
+    # Dual-site variants, prediction error only (no oracle, no VLM): what matters in the recipe? (2026-11-12)
+    **{f"paper_P_dual_{k}": dict(learn=dict(mode="adapter", signals=["gap"], relabel=False, every_episode=True,
+                                            persist=True, max_attempts=1, outside="sequential",
+                                            **{**dict(adapt_episodes=3, steps=25, outside_steps=25, gap_beta=0.0), **v}))
+       for k, v in dict(
+           s10=dict(steps=10, outside_steps=10), s50=dict(steps=50, outside_steps=50),   # between 25 and 150
+           video=dict(lambda_action=0.0),        # video-prediction loss only (the pure world-model signal)
+           action=dict(lambda_video=0.0),        # control: action loss only (imitating the own executed actions)
+           vidtok=dict(inside_streams=["video"]),  # adapter on the video tokens only (world model adapted, policy not)
+           n1=dict(adapt_episodes=1), n6=dict(adapt_episodes=6),   # fewer / more adaptation episodes
+           filt=dict(gap_filter=0.7),            # train only on the 30 % frames with the highest prediction error
+           lr3=dict(lr=1.3e-3),                  # 3x learning rate
+           n1vidtok=dict(adapt_episodes=1, inside_streams=["video"]),  # best two of 2026-11-13 combined
+       ).items()},
     "paper_Pw_dual": dict(learn=dict(mode="adapter", signals=["gap"], relabel=False, every_episode=True, persist=True,
                                      max_attempts=1, adapt_episodes=3, outside="sequential", steps=25,
                                      outside_steps=25)),                                  # + prediction-error weights
@@ -327,7 +349,7 @@ PRESETS = {
     "icl_meta_demo": dict(learn=dict(mode="icl", signals=["oracle", "gap"], meta_adapter="artifacts/adapters/democtx_meta",
                                      icl=dict(content=["demo_same_seed"]))),
     # meta-training ablations (same test format pred+obs): only own-failure samples / no text / fewer steps /
-    # an unseen task (stack_blocks_two was held out of meta-training)
+    # an unseen task (move_can_pot was held out of meta-training)
     "icl_meta_ownonly": dict(learn=dict(mode="icl", signals=["oracle", "gap"],
                                         meta_adapter="artifacts/adapters/failfix_predobs_ownonly")),
     "icl_meta_trained_notext": dict(learn=dict(mode="icl", signals=["oracle", "gap"],
@@ -369,7 +391,7 @@ PRESETS["icl_manip_otherseed"] = dict(learn=dict(mode="icl", signals=["oracle", 
 PRESETS["icl_meta_manip_otherseed"] = dict(learn=dict(mode="icl", signals=["oracle", "gap"],
                                                       meta_adapter="artifacts/adapters/failfix_predobs",
                                                       icl=dict(content=["fail_other_seed"])))
-META_TYPES += ["film_memory", "film_error", "film_memory_plus_adapterplus"]
+META_TYPES += ["film_memory", "film_error", "film_gapcurve", "film_text", "film_memory_plus_adapterplus"]
 for _t in META_TYPES:
     PRESETS[f"icl_type_{_t}"] = dict(learn=dict(mode="icl", signals=["oracle", "gap"],
                                                 meta_adapter=f"artifacts/adapters/failfix_type_{_t}",
@@ -377,6 +399,90 @@ for _t in META_TYPES:
     PRESETS[f"icl_type_{_t}_noctx"] = dict(learn=dict(mode="icl", signals=["oracle", "gap"],
                                                       meta_adapter=f"artifacts/adapters/failfix_type_{_t}",
                                                       icl=dict(content=[])))
+
+# meta-ICL with the VLM analysis at test time (adapters meta-trained on analysis_gap+vlm.json without the test
+# task, cluster/adapter_grid.py). <name>_noctx = the same adapter without memory and without the analysis text:
+# what the adapter does on its own (fine-tuning effect), the control every memory variant is compared to.
+_VLM = dict(endpoint="http://127.0.0.1:8001/v1", model="Qwen/Qwen3-VL-8B-Instruct", pred_frames=True)
+VLM_META_TYPES = ["adapterplus", "lora_r16_attn", "adaln", "ia3_adaln", "film_memory", "film_error", "film_gapcurve",
+                  "film_text", "film_memory_plus_adapterplus", "prompt_vane", "ttt_wam"]
+# "<any icl/lff preset>+VP": the same method with the VLM analysis (rollout + prediction-error curve) instead of the oracle
+PRESETS["VP"] = dict(learn=dict(signals=["vlm", "gap"]), vlm=_VLM)
+PRESETS["icl_fail_gapkeys"] = dict(learn=dict(mode="icl", signals=["oracle", "gap"],
+                                              icl=dict(groups=["pred", "obs"], segment="gaptop")))
+PRESETS["icl_meta_gapkeys_VP"] = dict(learn=dict(mode="icl", signals=["vlm", "gap"],
+                                                 meta_adapter="artifacts/adapters/failfix_gapkeys_vlm",
+                                                 icl=dict(groups=["pred", "obs"], segment="gaptop")), vlm=_VLM)
+for _t in VLM_META_TYPES:
+    _ad = f"artifacts/adapters/failfix_type_{_t}_vlm"
+    PRESETS[f"icl_type_{_t}_VP"] = dict(learn=dict(mode="icl", signals=["vlm", "gap"], meta_adapter=_ad,
+                                                   icl=dict(groups=["pred", "obs"])), vlm=_VLM)
+    PRESETS[f"icl_type_{_t}_VP_noctx"] = dict(learn=dict(mode="icl", signals=["vlm", "gap"], meta_adapter=_ad,
+                                                         icl=dict(content=[], text="instruction")), vlm=_VLM)
+# plain fine-tuning baseline: Adapter+ trained on the 7 training tasks without memory or analysis text
+# (cluster/adapter_grid.py failfix_ft_adapterplus); retry of the failed seed with that adapter, nothing in context
+PRESETS["ft_adapterplus"] = dict(learn=dict(mode="icl", signals=["gap"],
+                                            meta_adapter="artifacts/adapters/failfix_ft_adapterplus",
+                                            icl=dict(content=[], text="instruction")))
+# held-out failure type (cluster/adapter_grid.py failfix_dist_*): meta-trained on start-posture + camera failures only
+for _t in ["film_memory_plus_adapterplus", "lora_r16_attn", "adapterplus", "ttt_wam"]:
+    _ad = f"artifacts/adapters/failfix_dist_{_t}_vlm"
+    PRESETS[f"icl_dist_{_t}_VP"] = dict(learn=dict(mode="icl", signals=["vlm", "gap"], meta_adapter=_ad,
+                                                   icl=dict(groups=["pred", "obs"])), vlm=_VLM)
+    PRESETS[f"icl_dist_{_t}_VP_noctx"] = dict(learn=dict(mode="icl", signals=["vlm", "gap"], meta_adapter=_ad,
+                                                         icl=dict(content=[], text="instruction")), vlm=_VLM)
+for _t in ["film_memory_plus_adapterplus", "lora_r16_attn", "adapterplus", "ttt_wam"]:  # 7 failure types (P7b+P7c)
+    _ad = f"artifacts/adapters/failfix_types_{_t}_vlm"
+    PRESETS[f"icl_types_{_t}_VP"] = dict(learn=dict(mode="icl", signals=["vlm", "gap"], meta_adapter=_ad,
+                                                    icl=dict(groups=["pred", "obs"])), vlm=_VLM)
+    PRESETS[f"icl_types_{_t}_VP_noctx"] = dict(learn=dict(mode="icl", signals=["vlm", "gap"], meta_adapter=_ad,
+                                                          icl=dict(content=[], text="instruction")), vlm=_VLM)
+PRESETS["ft_types_adapterplus"] = dict(learn=dict(mode="icl", signals=["gap"],
+                                                  meta_adapter="artifacts/adapters/failfix_types_ft_adapterplus",
+                                                  icl=dict(content=[], text="instruction")))
+PRESETS["ft_dist_adapterplus"] = dict(learn=dict(mode="icl", signals=["gap"],
+                                                 meta_adapter="artifacts/adapters/failfix_dist_ft_adapterplus",
+                                                 icl=dict(content=[], text="instruction")))
+# P8s (user 2026-11-18): adapters on P7b+c+d with the detailed VLM analysis (+ fix sentence); _base = the base model
+# was trained too (its weights are swapped in with the adapter, fawam/base_train.py)
+_VLMD = dict(_VLM, detail=True)
+for _t in ["lora_r16_attn", "film_memory_plus_adapterplus"]:
+    for _b in ("", "_base"):
+        _ad = f"artifacts/adapters/failfix_strong_{_t}_vlmd{_b}"
+        PRESETS[f"icl_strong_{_t}{_b}_VPD"] = dict(learn=dict(mode="icl", signals=["vlm", "gap"], meta_adapter=_ad,
+                                                              icl=dict(groups=["pred", "obs"])), vlm=_VLMD)
+        PRESETS[f"icl_strong_{_t}{_b}_VPD_noctx"] = dict(learn=dict(mode="icl", signals=["vlm", "gap"], meta_adapter=_ad,
+                                                                    icl=dict(content=[], text="instruction")), vlm=_VLMD)
+PRESETS["ft_strong_base"] = dict(learn=dict(mode="icl", signals=["gap"],
+                                            meta_adapter="artifacts/adapters/failfix_strong_ft_base",
+                                            icl=dict(content=[], text="instruction")))
+# p12 hid eval (plan 2026-11-18): C1 x M1 trained on hidden offsets; real signals only (memory = imagined + real
+# failed attempt, instruction as text). ctx / noctx / shuf (memory = a failure of another seed, other offset)
+_HIDL = "artifacts/adapters/failfix_hid_lora"
+PRESETS["icl_hid_lora"] = dict(learn=dict(mode="icl", signals=["gap"], meta_adapter=_HIDL,
+                                          icl=dict(groups=["pred", "obs"], text="instruction")))
+PRESETS["icl_hid_lora_noctx"] = dict(learn=dict(mode="icl", signals=["gap"], meta_adapter=_HIDL,
+                                                icl=dict(content=[], text="instruction")))
+PRESETS["icl_hid_lora_shuf"] = dict(learn=dict(mode="icl", signals=["gap"], meta_adapter=_HIDL,
+                                               icl=dict(groups=["pred", "obs"], text="instruction",
+                                                        content=["fail_other_seed"],
+                                                        fail_bank="artifacts/fail_bank/hid_trans_eval")))
+# p12 hid eval, M3 residual head (fawam/train_hid.py): context = real signals of the failed attempt (C2-C5)
+for _c in ("C2", "C3", "C4", "C5"):
+    for _x in ("", "_aux0.3"):
+        _h = f"artifacts/hid_m3/{_c}_M3{_x}"
+        for _mode, _suf in (("own", ""), ("none", "_noctx"), ("shuf", "_shuf")):
+            PRESETS[f"hidm3_{_c}{_x.replace('.', '')}{_suf}"] = dict(learn=dict(mode="hidres", signals=["gap"],
+                                                                               hid_head=_h, hid_ctx=_mode))
+PRESETS["icl_meta_diff_VP"] =dict(learn=dict(mode="icl", signals=["vlm", "gap"],
+                                              meta_adapter="artifacts/adapters/failfix_diff_vlm",
+                                              icl=dict(groups=["diff", "obs"])), vlm=_VLM)
+PRESETS["icl_meta_window_VP"] = dict(learn=dict(mode="icl", signals=["vlm", "gap"],
+                                                meta_adapter="artifacts/adapters/failfix_window_vlm",
+                                                icl=dict(groups=["pred", "obs"], segment="window")), vlm=_VLM)
+PRESETS["icl_meta_textonly_VP"] = dict(learn=dict(mode="icl", signals=["vlm", "gap"],
+                                                  meta_adapter="artifacts/adapters/failfix_textonly_vlm",
+                                                  icl=dict(content=[])), vlm=_VLM)
 
 
 def _merge(base: dict, over: dict):
@@ -436,6 +542,9 @@ def resolve(spec=None, root=None) -> Method:
     unknown = set(merged) - {f.name for f in fields(Method)}
     if unknown:
         raise KeyError(f"unknown method fields {sorted(unknown)}")
+    _port = os.environ.get("FAWAM_VLM_PORT")  # several eval jobs on one node (cluster/dev_runner.sh): one vLLM port each
+    if _port and isinstance(merged.get("vlm"), dict) and merged["vlm"].get("endpoint"):
+        merged["vlm"] = dict(merged["vlm"], endpoint=merged["vlm"]["endpoint"].replace(":8001", f":{_port}"))
     m = Method(**merged)
     if root is not None:
         root = Path(root)

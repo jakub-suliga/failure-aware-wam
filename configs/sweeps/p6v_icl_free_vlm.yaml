@@ -1,0 +1,16 @@
+# P6v: the idea WITHOUT any training (docs/PLAN.md, C). After a failure the frozen WAM gets the VLM analysis and/or its
+# failed attempt as context and retries. Varied: how the VLM output enters (prompt, CFG negative, note, corrected
+# actions), what else is in the context (observed, imagined + observed, error map, window, highest-error keyframes),
+# how it is inserted (attention weight, at the gap trigger, several attempts). icl_manip_noise = memory slot with
+# noise instead of the rollout (does the content matter or only the presence of a memory?).
+name: p6v_icl_free_vlm
+out: results/sweeps/p6v_icl_free_vlm
+episodes: 30
+per_job: 10
+n_par: 2
+time: "05:00:00"
+vlm: true
+extra_env: {VLM_MODEL: Qwen/Qwen3-VL-8B-Instruct, HF_HUB_OFFLINE: 1}
+tasks: [move_playingcard_away]
+configs: [table_h_m05, table_h_m10]
+methods: [retry_plain, icl_text_only+VP, icl_txt_negative+VP, icl_txt_corr_neg+VP, icl_txt_note+VP, icl_fail_obs+VP, icl_fail_predobs+VP, icl_fail_diff+VP, icl_fail_window+VP, icl_fail_gapkeys+VP, icl_fail_corrected+VP, icl_attn2+VP, icl_trigger+VP, icl_fails_3att+VP, icl_manip_noise+VP]

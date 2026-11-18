@@ -15,6 +15,7 @@ KIND=${KIND:-dual}; STREAMS=${STREAMS:-video action}; STEPS=${STEPS:-400}; OUTSI
 SEL=(--episodes $EPISODES --success "${SUCCESS:-any}")
 [ -n "${LIMIT:-}" ] && SEL+=(--limit "$LIMIT")
 [ -n "${LIMIT_PER_TASK:-}" ] && SEL+=(--limit_per_task "$LIMIT_PER_TASK")
+[ -n "${LIMIT_PER_CELL:-}" ] && SEL+=(--limit_per_cell "$LIMIT_PER_CELL")
 [ -n "${SETTINGS:-}" ] && SEL+=(--settings $SETTINGS)
 [ -n "${TASKS:-}" ] && SEL+=(--tasks $TASKS)
 [ -n "${DRIVERS:-}" ] && SEL+=(--drivers $DRIVERS)

@@ -1,5 +1,8 @@
 # Experimentplan: Fehler von LingBot-VA erkennen und beheben
 
+> **Stand 2026-11-10: Ziel und aktueller Umfang stehen in [GOAL.md](GOAL.md) und [PLAN.md](PLAN.md).** Dieses Dokument
+> beschreibt den Methodenkatalog im Code; der hier skizzierte Sweep-Umfang ist durch PLAN.md ersetzt.
+
 > **Stand 2026-11-04: Der Kern der Arbeit ist jetzt Learn-from-Failure, siehe [METHOD.md](METHOD.md).** Das Modell
 > lernt aus seinen eigenen Fehlversuchen: Vorhersagefehler plus VLM- bzw. Orakel-Analyse, gegeben über Adapter,
 > Kontext oder beides. A, B und C unten sind Baselines oder Bausteine: A5 Negativ-Prompt, B1 Lücken-Detektor,

@@ -1,0 +1,31 @@
+# P8 (main question, docs/GOAL.md): after a failure the WAM gets, in context, its own failed attempt (imagined +
+# observed = prediction error) and the VLM failure analysis (Qwen3-VL-8B on the real rollout + prediction-error curve),
+# and retries the same seed. The adapters were meta-trained to use this context on the OTHER 7 tasks (P7), never on
+# the test task. Variants = how the context enters the model (tokens + Adapter+/LoRA, AdaLN, (IA)^3+AdaLN, FiLM from
+# the memory / failure vector / prediction-error curve, prompt tokens, TTT fast weights) and what it contains
+# (pred+obs, error map, window around the failure, text only).
+# Controls: retry_plain (no learning), icl_fail_predobs_VP (same context, no meta-training), <type>_noctx (meta adapter
+# without memory and text = fine-tuning effect alone; only at -5 cm).
+name: p8_icl_vlm_meta
+out: results/sweeps/p8_icl_vlm_meta
+episodes: 30
+per_job: 10
+n_par: 2
+time: "05:00:00"
+vlm: true
+extra_env: {VLM_MODEL: Qwen/Qwen3-VL-8B-Instruct, HF_HUB_OFFLINE: 1}
+tasks: [move_playingcard_away]
+configs: [table_h_m05, table_h_m10]
+methods: [retry_plain, icl_fail_predobs_VP, icl_meta_textonly_VP, icl_meta_diff_VP, icl_meta_window_VP, icl_meta_gapkeys_VP, icl_type_adapterplus_VP, icl_type_lora_r16_attn_VP, icl_type_adaln_VP, icl_type_ia3_adaln_VP, icl_type_film_memory_VP, icl_type_film_error_VP, icl_type_film_gapcurve_VP, icl_type_film_text_VP, icl_type_film_memory_plus_adapterplus_VP, icl_type_prompt_vane_VP, icl_type_ttt_wam_VP, icl_type_adapterplus_VP_noctx, icl_type_lora_r16_attn_VP_noctx, icl_type_adaln_VP_noctx, icl_type_ia3_adaln_VP_noctx, icl_type_film_memory_VP_noctx, icl_type_film_error_VP_noctx, icl_type_film_gapcurve_VP_noctx, icl_type_film_text_VP_noctx, icl_type_film_memory_plus_adapterplus_VP_noctx, icl_type_prompt_vane_VP_noctx, icl_type_ttt_wam_VP_noctx]
+method_overrides:
+  icl_type_adapterplus_VP_noctx: {configs: [table_h_m05]}
+  icl_type_lora_r16_attn_VP_noctx: {configs: [table_h_m05]}
+  icl_type_adaln_VP_noctx: {configs: [table_h_m05]}
+  icl_type_ia3_adaln_VP_noctx: {configs: [table_h_m05]}
+  icl_type_film_memory_VP_noctx: {configs: [table_h_m05]}
+  icl_type_film_error_VP_noctx: {configs: [table_h_m05]}
+  icl_type_film_gapcurve_VP_noctx: {configs: [table_h_m05]}
+  icl_type_film_text_VP_noctx: {configs: [table_h_m05]}
+  icl_type_film_memory_plus_adapterplus_VP_noctx: {configs: [table_h_m05]}
+  icl_type_prompt_vane_VP_noctx: {configs: [table_h_m05]}
+  icl_type_ttt_wam_VP_noctx: {configs: [table_h_m05]}

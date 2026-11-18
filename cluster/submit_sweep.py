@@ -13,6 +13,7 @@ driver (policy | expert_replay), vlm (bool), extra_env (dict), seed_offset (int,
 method_overrides: {method: {configs: [...], tasks: [...]}} to restrict a method to a subset.
 """
 import argparse
+import json
 import math
 import os
 import re
@@ -94,7 +95,10 @@ def main():
                 cmd.append(f"--partition={part}")
             cmd.append(str(ROOT / "cluster" / "eval_job.sh"))
             n_jobs += 1
-            if a.submit:
+            if a.submit and os.environ.get("FAWAM_QUEUE"):  # cluster/pipeline.py feeds the queue (submit limit)
+                with open(os.environ["FAWAM_QUEUE"], "a") as q:
+                    q.write(json.dumps(dict(argv=cmd, env={}, label=f"{sw['name']} {name} {cfg} {task} job {j}")) + "\n")
+            elif a.submit:
                 r = subprocess.run(cmd, capture_output=True, text=True)
                 print(r.stdout.strip() or r.stderr.strip(), f"<- {name} {cfg} {task} job {j}")
             else:

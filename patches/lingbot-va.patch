@@ -1,5 +1,5 @@
 diff --git a/evaluation/robotwin/eval_polict_client_openpi.py b/evaluation/robotwin/eval_polict_client_openpi.py
-index 7ed5265..bfc1618 100644
+index 7ed5265..41be082 100644
 --- a/evaluation/robotwin/eval_polict_client_openpi.py
 +++ b/evaluation/robotwin/eval_polict_client_openpi.py
 @@ -1,12 +1,14 @@
@@ -179,7 +179,15 @@ index 7ed5265..bfc1618 100644
  def class_decorator(task_name):
      envs_module = importlib.import_module(f"envs.{task_name}")
      try:
-@@ -317,6 +463,8 @@ def main(usr_args):
+@@ -313,10 +459,16 @@ def main(usr_args):
+     with open(f"./task_config/{task_config}.yml", "r", encoding="utf-8") as f:
+         args = yaml.load(f.read(), Loader=yaml.FullLoader)
+ 
++    from fawam.sim_disturb import install as _install_disturbance  # dist_*.yml keys outside RoboTwin's own options
++    _install_disturbance(args)
++    from fawam.hid_offset import install as _install_hid  # hidden calibration offsets (dataset hid)
++    _install_hid(args)
+     args['task_name'] = task_name
      args["task_config"] = task_config
      args["ckpt_setting"] = ckpt_setting
      args["save_root"] = save_root
@@ -188,7 +196,7 @@ index 7ed5265..bfc1618 100644
  
      embodiment_type = args.get("embodiment")
      embodiment_config_path = os.path.join(CONFIGS_PATH, "_embodiment_config.yml")
-@@ -455,28 +603,42 @@ def eval_policy(task_name,
+@@ -455,28 +607,42 @@ def eval_policy(task_name,
      print(f"\033[34mTask Name: {args['task_name']}\033[0m")
      print(f"\033[34mPolicy Name: {args['policy_name']}\033[0m")
  
@@ -233,7 +241,7 @@ index 7ed5265..bfc1618 100644
                  TASK_ENV.close_env()
              except UnStableError as e:
                  TASK_ENV.close_env()
-@@ -484,12 +646,17 @@ def eval_policy(task_name,
+@@ -484,12 +650,17 @@ def eval_policy(task_name,
                  args["render_freq"] = render_freq
                  continue
              except Exception as e:
@@ -252,7 +260,7 @@ index 7ed5265..bfc1618 100644
  
          if (not expert_check) or (TASK_ENV.plan_success and TASK_ENV.check_success()):
              succ_seed += 1
-@@ -501,137 +668,69 @@ def eval_policy(task_name,
+@@ -501,137 +672,70 @@ def eval_policy(task_name,
  
          args["render_freq"] = render_freq
  
@@ -393,7 +401,8 @@ index 7ed5265..bfc1618 100644
 +                                                lff_info=dict(phase=phase, adapter=m1.adapter_path) if lff else None)
 +        # driver "pair" (meta-training data, docs/ICL.md): a failed policy rollout is followed by the expert replay of
 +        # the SAME seed (= the fix), recorded through the same pipeline; pairs match on (task, task_config, seed)
-+        if driver == "pair" and not succ:
++        # hid data: the fix is recorded for every seed (o = 0 seeds: context = success, target = no change)
++        if driver == "pair" and (not succ or args.get("hid_offset")):
 +            TASK_ENV.close_env()
 +            fixed, _, _ = run_episode(TASK_ENV, args, model, task_name, now_id, now_seed, instruction, video_size,
 +                                      save_visualization, video_guidance_scale, action_guidance_scale, method,
@@ -443,7 +452,7 @@ index 7ed5265..bfc1618 100644
          now_id += 1
          TASK_ENV.close_env(clear_cache=((succ_seed + 1) % clear_cache_freq == 0))
  
-@@ -647,10 +746,13 @@ def eval_policy(task_name,
+@@ -647,10 +751,13 @@ def eval_policy(task_name,
            "succ_num": float(TASK_ENV.suc),
            "total_num": float(TASK_ENV.test_num),
            "succ_rate": float(TASK_ENV.suc / TASK_ENV.test_num),
@@ -459,7 +468,7 @@ index 7ed5265..bfc1618 100644
              f"Success rate: \033[96m{TASK_ENV.suc}/{TASK_ENV.test_num}\033[0m => \033[95m{round(TASK_ENV.suc/TASK_ENV.test_num*100, 1)}%\033[0m, current seed: \033[90m{now_seed}\033[0m\n"
          )
          now_seed += 1
-@@ -658,6 +760,192 @@ def eval_policy(task_name,
+@@ -658,6 +765,197 @@ def eval_policy(task_name,
      return now_seed, TASK_ENV.suc
  
  
@@ -514,6 +523,10 @@ index 7ed5265..bfc1618 100644
 +    initial_formatted_obs = format_obs(initial_obs, prompt)
 +    recorder.add_frame(initial_formatted_obs, TASK_ENV.take_action_cnt)
 +    expert_actions = expert.relative_actions(inint_eef_pose) if expert is not None else None
++    if expert_actions is not None and getattr(TASK_ENV, "_hid", None):
++        # hid: the expert's true targets -> the believed actions that land there under the hidden offset
++        from fawam.hid_offset import compensate as _hid_compensate
++        expert_actions = _hid_compensate(TASK_ENV, expert_actions, inint_eef_pose)
 +    expert_step = 0
 +    hold_steps = 32  # expert replay: keep holding the last pose this long after the trajectory ends
 +    last_obs = initial_formatted_obs
@@ -625,6 +638,7 @@ index 7ed5265..bfc1618 100644
 +        "interventions": orchestrator.log if orchestrator is not None else [],
 +        "prefill_paths": prefill_paths if isinstance(prefill_paths, dict) else (prefill_paths or []),
 +        "lff": lff_info or {},
++        "hid": getattr(TASK_ENV, "_hid", None),  # hidden offset: training label / analysis only, never an input
 +    }
 +    with h5py.File(running_dir / 'episode.h5', 'a') as h5:
 +        recorder.save(running_dir, h5)

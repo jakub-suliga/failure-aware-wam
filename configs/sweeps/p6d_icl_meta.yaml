@@ -2,17 +2,17 @@
 # failfix_obs / _predobs / _diff / _window, democtx_meta). Kontrollen: gleiches Format ohne Meta-Training (p6a),
 # Meta-Adapter ohne Erinnerung (icl_meta_noctx), falsches Format (icl_meta_mismatch). Vergleich: Adapter-Update und
 # beides (icl_plus_adapter). Meta-Training-Ablationen: nur eigene Fehler, ohne Text, weniger Schritte, ungesehener
-# Task (nur auf stack_blocks_two ausgewertet). Meta-Daten: P7 (configs/sweeps/p7_meta_data.yaml).
+# Task (nur auf move_can_pot ausgewertet). Meta-Daten: P7 (configs/sweeps/p7_meta_data.yaml).
 name: p6d_icl_meta
 out: results/sweeps/p6d_icl_meta
 episodes: 30
 per_job: 10
 n_par: 2
 time: "16:00:00"
-tasks: [move_playingcard_away, place_mouse_pad, pick_diverse_bottles, stack_blocks_two]
+tasks: [move_playingcard_away, place_mouse_pad, move_can_pot, handover_block]  # mid success at -5 cm in P0 (TABLE4 had floor/ceiling tasks)
 configs: [table_h_m05, table_h_m10, table_h_m075]
 methods: [icl_meta_obs, icl_meta_predobs, icl_meta_diff, icl_meta_window, icl_meta_predobs_notext,
           icl_meta_predobs_PR, icl_meta_mismatch, icl_meta_demo, icl_meta_noctx, icl_vs_adapter, icl_plus_adapter,
           icl_meta_ownonly, icl_meta_trained_notext, icl_meta_small, icl_meta_holdtask]
 method_overrides:
-  icl_meta_holdtask: {tasks: [stack_blocks_two]}
+  icl_meta_holdtask: {tasks: [move_can_pot]}

@@ -39,6 +39,7 @@ def main():
     ap.add_argument("--outside", default="none", choices=["none", "parallel", "sequential"])
     ap.add_argument("--outside_steps", type=int, default=100)
     ap.add_argument("--pref_beta", type=float, default=0.0)
+    ap.add_argument("--lr", type=float, help="inside learning rate (default: train_adapter's)")
     ap.add_argument("--guard_episodes", nargs="*", default=[])
     ap.add_argument("--guard_tau", type=float, default=1.1)
     ap.add_argument("--model_path", default=str(LINGBOT / "checkpoints" / "lingbot-va-posttrain-robotwin"))
@@ -67,6 +68,8 @@ def main():
     if a.init:
         sys.argv += ["--init", a.init]
     sys.argv += ["--gap_filter", str(a.gap_filter), "--pref_beta", str(a.pref_beta)]
+    if a.lr:
+        sys.argv += ["--lr", str(a.lr)]
     if a.guard_episodes:
         sys.argv += ["--guard_episodes", *a.guard_episodes, "--guard_tau", str(a.guard_tau)]
     if a.steps > 0:

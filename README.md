@@ -4,6 +4,8 @@ Testbed for a failure-aware world-action model: LingBot-VA (policy server) evalu
 with per-episode recording of latents, hidden states, actions and sim state, offline analysis, and (`fawam/`)
 test-time methods, few-shot adapters and in-context learning on top of the frozen model.
 
+- **Goal and current plan: [docs/GOAL.md](docs/GOAL.md), [docs/PLAN.md](docs/PLAN.md)** (2026-11-10; they replace the scope of the
+  older experiment plans below)
 - Findings so far: [docs/FINDINGS.md](docs/FINDINGS.md) (the imagination-execution gap)
 - Experiment plan, methods, data generation, training, cluster workflow: [docs/EXPERIMENTS.md](docs/EXPERIMENTS.md)
 

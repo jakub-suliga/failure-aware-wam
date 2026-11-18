@@ -19,6 +19,15 @@ export TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-$_cache/triton}
 export TORCHINDUCTOR_CACHE_DIR=${TORCHINDUCTOR_CACHE_DIR:-$_cache/inductor}
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export TOKENIZERS_PARALLELISM=false
+# the eval client pipes frames into `ffmpeg`; compute nodes have none, fall back to imageio-ffmpeg's static binary
+if ! command -v ffmpeg >/dev/null 2>&1; then
+    if [ ! -x "$_cache/bin/ffmpeg" ]; then
+        mkdir -p "$_cache/bin"
+        ln -sf "$(ls "$(dirname "$PY_RT")"/../lib/python3*/site-packages/imageio_ffmpeg/binaries/ffmpeg-* | head -1)" \
+            "$_cache/bin/ffmpeg"
+    fi
+    export PATH=$_cache/bin:$PATH
+fi
 CLUSTER=${CLUSTER:-$(scontrol show config 2>/dev/null | awk '$1 == "ClusterName" {print $3}')}
 _profile=$FAWAM_ROOT/cluster/clusters/${CLUSTER}.sh
 if [ -n "$CLUSTER" ] && [ -f "$_profile" ]; then

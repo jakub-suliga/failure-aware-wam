@@ -135,7 +135,97 @@ def oracle(ep_dir, f, task):
     return out
 
 
-def vlm(ep_dir, f, cfg, latent):
+def vlm_rollout(ep_dir, f, cfg, latent, gap, n=6):
+    """VLM analysis of the whole real rollout: n keyframes in time order (head | left wrist | right wrist), the world
+    model's predicted views at the moment its prediction error peaks, and the prediction-error curve as text. The
+    failure time comes from the prediction error (`latent`); the VLM says what went wrong and how to correct it."""
+    import imageio.v3 as iio
+    import urllib.request
+    from fawam.robotwin_hooks import _jpeg_b64
+    cams = ("cam_high", "cam_left_wrist", "cam_right_wrist")
+    real = {c: iio.imread(Path(ep_dir) / f"real_{c}.mp4") for c in cams}
+    T = min(len(v) for v in real.values())
+    fi = min(4 * int(latent), T - 1)
+    idx = sorted(set(np.linspace(4, T - 1, n - 1).astype(int).tolist()) | {fi})
+    k_fail = idx.index(fi) + 1
+    imgs = [np.concatenate([real[c][i] for c in cams], axis=1) for i in idx]
+    note = ""
+    if cfg.get("pred_frames", True):
+        pred = [iio.imread(Path(ep_dir) / f"pred_{c}.mp4", index=min(fi, iio.improps(Path(ep_dir) / f"pred_{c}.mp4").shape[0] - 1))
+                for c in cams]
+        hmax = max(im.shape[0] for im in pred)  # predicted wrist views are smaller than the head view
+        imgs.append(np.concatenate([np.pad(im, ((0, hmax - im.shape[0]), (0, 0), (0, 0))) for im in pred], axis=1))
+        note = (f" Image {len(idx) + 1}: what the robot's own world model predicted the three views would look like "
+                f"at keyframe {k_fail}.")
+    curve = ", ".join(f"t{k}:{gap[k]:.2f}" for k in sorted(gap))
+    instr = str(f.attrs["instruction"])
+    text = (f'A bimanual robot tried: "{instr}" and failed. Images 1-{len(idx)}: keyframes of the real rollout in time '
+            f'order (each: head, left wrist, right wrist camera), at time steps '
+            f'{", ".join("t%d" % (i // 4) for i in idx)}.{note}\n'
+            f'Prediction error of the robot\'s world model per time step (0 = the world behaved as it expected, higher = '
+            f'reality differed from its expectation): {curve}. Around the failure it is highest at t{int(latent)} '
+            f'(keyframe {k_fail}).\n'
+            + ('Look closely at the keyframe where the prediction error peaks and the ones just before it. Answer with '
+               'JSON only: {"failure_type": "missed_grasp|dropped|misplaced|collision", "arm": "left|right", '
+               '"phase": "approach|grasp|lift|transport|place|release", '
+               '"what_happened": "<two concrete sentences: where exactly the gripper was relative to the object when it '
+               'closed or let go (above / beside / in front of / behind it, touching it or not), and what the object did '
+               '(stayed, slipped, tipped over, fell, ended at the wrong place)>", '
+               '"fix": "<one imperative sentence: what the robot must do differently in the next attempt, concrete '
+               'about the gripper and the object>"}'
+               if cfg.get("detail", False) else
+               'Describe what went wrong. Do not give advice. Answer with JSON only: '
+               '{"failure_type": "missed_grasp|dropped|misplaced|collision", "arm": "left|right", '
+               '"what_happened": "<one short sentence: what the robot did and why the task failed>"}'
+               if not cfg.get("direction", False) else
+            'Explain what went wrong and how the robot must act differently. Answer with JSON only: '
+            '{"failure_type": "missed_grasp|dropped|misplaced|collision", "arm": "left|right", '
+            '"cause": "<one sentence, concrete, with directions/distances>", '
+            '"delta_cm": {"x": <forward +>, "y": <left +>, "z": <up +>}  (how far the gripper should have been moved), '
+            '"correction": "<one imperative instruction for the next attempt>", '
+            '"negative_prompt": "<one sentence describing the failure to avoid>"}'))
+    content = [{"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{_jpeg_b64(im)}"}} for im in imgs]
+    content.append({"type": "text", "text": text})
+    body = json.dumps(dict(model=cfg.get("model"), messages=[{"role": "user", "content": content}], temperature=0.0,
+                           max_tokens=400)).encode()
+    req = urllib.request.Request(cfg["endpoint"].rstrip("/") + "/chat/completions", data=body,
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=180) as r:
+        out = json.loads(r.read())["choices"][0]["message"]["content"]
+    try:
+        a = json.loads(out[out.index("{"):out.rindex("}") + 1])
+    except ValueError:
+        a = dict(raw=out)
+    if cfg.get("detail", False):
+        # 2026-11-18 (user): a more precise explanation than "missed grasp" plus how to fix it (no distances/directions
+        # asked; whatever the VLM says is used as it is)
+        what, fix = str(a.get("what_happened") or "").strip(), str(a.get("fix") or "").strip()
+        corr = " ".join(x for x in (f"In the last attempt this went wrong: {what}" if what else "",
+                                    f"Next time: {fix}" if fix else "") if x)
+        return dict(failure_type=a.get("failure_type", "unknown"), phase=a.get("phase"),
+                    arm=a.get("arm") if a.get("arm") in ("left", "right") else None, step=None, cause=what or None,
+                    fix=fix or None, correction=f"{instr} {corr}" if corr else None, negative_prompt=what or None,
+                    delta_m=[0.0, 0.0, 0.0], vlm_raw=a)
+    if not cfg.get("direction", False):
+        # 2026-11-13 (user): take the VLM as it is. It recognises WHAT failed (type, arm) but not the direction or size
+        # of the correction (fawam/vlm_bench.py), so neither is asked for or used: no delta, no instruction how to fix.
+        what = str(a.get("what_happened") or "").strip()
+        return dict(failure_type=a.get("failure_type", "unknown"),
+                    arm=a.get("arm") if a.get("arm") in ("left", "right") else None, step=None, cause=what or None,
+                    correction=f"{instr} In the last attempt this went wrong: {what}" if what else None,
+                    negative_prompt=what or None, delta_m=[0.0, 0.0, 0.0], vlm_raw=a)
+    d = a.get("delta_cm") or {}
+    return dict(failure_type=a.get("failure_type", "unknown"), arm=a.get("arm") if a.get("arm") in ("left", "right") else None,
+                step=None, cause=a.get("cause"), correction=f"{instr} {a['correction']}" if a.get("correction") else None,
+                negative_prompt=a.get("negative_prompt"),
+                delta_m=[float(d.get(k, 0) or 0) / 100 for k in ("x", "y", "z")], vlm_raw=a)
+
+
+def vlm(ep_dir, f, cfg, latent, gap=None):
+    """cfg["mode"]: rollout (default: keyframes of the whole rollout + prediction-error curve) | frame (only the
+    views at the failure moment)."""
+    if cfg.get("mode", "rollout") == "rollout":
+        return vlm_rollout(ep_dir, f, cfg, latent, gap or gap_curve(f))
     import imageio.v3 as iio
     from fawam.robotwin_hooks import vlm_analysis
     idx = 4 * latent
@@ -191,7 +281,7 @@ def build_grasp_ref(roots):
     for e in find_episodes(roots, success=True):
         with h5py.File(e / "episode.h5", "r") as f:
             step, arm = first_close(f)
-            if step is None:
+            if step is None or f["sim/object_pose"].shape[1] == 0:  # lift_pot: no object poses recorded
                 continue
             ee, obj = geometry_at(f, step, arm)
             t = str(f.attrs["task_name"])
@@ -298,7 +388,9 @@ def analyze_signals(ep_dir, signals, vlm_cfg=None, window=3, after=1, force=Fals
     signals = LEGACY.get(signals, signals) if isinstance(signals, str) else list(signals)
     tag = "+".join(s for s in SIGNALS if s in signals)
     ep_dir = Path(ep_dir)
-    out_path = ep_dir / f"analysis_{tag}.json"
+    frame = "vlm" in signals and (vlm_cfg or {}).get("mode") == "frame"
+    detail = "vlm" in signals and (vlm_cfg or {}).get("detail", False)
+    out_path = ep_dir / f"analysis_{tag}{'_frame' if frame else ''}{'_detail' if detail else ''}.json"
     if out_path.exists() and not force:
         return json.loads(out_path.read_text())
     with h5py.File(ep_dir / "episode.h5", "r") as f:
@@ -337,7 +429,7 @@ def analyze_signals(ep_dir, signals, vlm_cfg=None, window=3, after=1, force=Fals
             if "vlm" in signals:
                 try:
                     if res["latent"] is not None:
-                        v = vlm(ep_dir, f, vlm_cfg or {}, res["latent"])
+                        v = vlm(ep_dir, f, vlm_cfg or {}, res["latent"], gap)
                     else:
                         v = vlm_keyframes(ep_dir, f, vlm_cfg or {})
                         v["delta_m"] = [float((v.get("delta_cm") or {}).get(k, 0) or 0) / 100 for k in "xyz"]
@@ -390,15 +482,24 @@ def main():
     ap.add_argument("--endpoint", default="http://127.0.0.1:8001/v1")
     ap.add_argument("--model", default="Qwen/Qwen2.5-VL-7B-Instruct")
     ap.add_argument("--force", action="store_true")
+    ap.add_argument("--vlm_mode", default="rollout", choices=["rollout", "frame"],
+                    help="rollout: keyframes of the whole rollout + prediction-error curve; frame: failure moment only")
+    ap.add_argument("--vlm_detail", action="store_true",
+                    help="detailed explanation (phase, where the gripper was, what the object did) + a fix sentence; "
+                         "written as analysis_<signals>_detail.json")
     ap.add_argument("--grasp_ref", nargs="*", help="build artifacts/grasp_ref.json from these roots first")
     a = ap.parse_args()
     if a.grasp_ref:
         print("grasp ref:", build_grasp_ref(a.grasp_ref))
     from fawam.latent_data import find_episodes
     for e in find_episodes(a.roots, success=False):
-        cfg = dict(endpoint=a.endpoint, model=a.model)
-        r = analyze_signals(e, a.signals.split("+"), cfg, force=a.force) if a.signals else \
-            analyze_episode(e, a.analyzer, cfg, force=a.force)
+        cfg = dict(endpoint=a.endpoint, model=a.model, mode=a.vlm_mode, detail=a.vlm_detail)
+        try:
+            r = analyze_signals(e, a.signals.split("+"), cfg, force=a.force) if a.signals else \
+                analyze_episode(e, a.analyzer, cfg, force=a.force)
+        except ValueError as err:  # e.g. no object poses recorded (lift_pot)
+            print(f"{e.parent.name}/{e.name}: skipped ({err})")
+            continue
         if a.as_main and a.signals:
             (e / "analysis.json").write_text(json.dumps(r, indent=1, default=float))
         print(f"{e.parent.name}/{e.name}: {r.get('failure_type')} arm={r.get('arm')} latent={r.get('latent')} "

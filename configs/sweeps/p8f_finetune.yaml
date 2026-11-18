@@ -1,0 +1,12 @@
+# Plain fine-tuning baseline for P8 (user 2026-11-15): Adapter+ fine-tuned on the 7 training tasks (same data and
+# steps as the meta-training, no failure memory, no VLM text), then the failed seed of the held-out test task is
+# retried with it. Compare with p8_icl_vlm_meta: icl_type_adapterplus_VP (with context) and ..._VP_noctx.
+name: p8f_finetune
+out: results/sweeps/p8f_finetune
+episodes: 30
+per_job: 10
+n_par: 2
+time: "04:00:00"
+tasks: [move_playingcard_away]
+configs: [table_h_m05, table_h_m10]
+methods: [ft_adapterplus]

@@ -13,3 +13,11 @@ def add_lingbot_to_path():
     p = str(LINGBOT / "wan_va")
     if p not in sys.path:
         sys.path.insert(0, p)
+
+
+def free_port() -> int:
+    """A TCP port that is free right now (fixed pid-based ports collided between jobs sharing a node)."""
+    import socket
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]

@@ -116,7 +116,8 @@ def train_inside(a):
     device = torch.device("cuda")
     cfg = VA_CONFIGS["robotwin_train"]
     eps = find_episodes(a.episodes, success=a.success, tasks=a.tasks, settings=a.settings, limit=a.limit,
-                        seed=a.seed, drivers=a.drivers, limit_per_task=a.limit_per_task)
+                        seed=a.seed, drivers=a.drivers, limit_per_task=a.limit_per_task,
+                        limit_per_cell=a.limit_per_cell)
     if not eps:
         raise SystemExit("no episodes found")
     ctx_pool = find_episodes(a.context_pool, success=True, tasks=a.tasks) if a.context_pool else None
@@ -129,7 +130,8 @@ def train_inside(a):
                             p_text=a.p_text, max_frames=a.max_frames, seed=a.seed, cfg_prob=a.cfg_prob,
                             context_groups=a.context_groups,
                             window=dict(before=a.window_before, after=a.window_after) if a.context_window else None,
-                            p_cross=a.p_cross, p_success=a.p_success, p_noctx=a.p_noctx)
+                            p_cross=a.p_cross, p_success=a.p_success, p_noctx=a.p_noctx, analysis_name=a.analysis_name,
+                            text_only=a.text_only, keyframes=a.context_keyframes)
         from fawam.latent_data import split_pairs_by_seed
         tr, va = split_pairs_by_seed(ds, a.val_frac, a.seed) if a.val_frac > 0 else (ds.pairs, [])
         val_ds = None
@@ -162,7 +164,7 @@ def train_inside(a):
                                 ttt_dim=a.ttt_dim, ttt_eta=a.ttt_eta, ttt_streams=a.ttt_streams,
                                 svf_blocks=a.svf_blocks, svf_targets=a.svf_targets, dense_blocks=a.dense_blocks,
                                 dense_targets=a.dense_targets, outside_type=a.outside_type,
-                                film_source=a.film_source, film_rank=a.film_rank)
+                                film_source=a.film_source, film_rank=a.film_rank, error_dim=a.error_dim)
         aset = fa.AdapterSet(acfg).to(device)
     fa.attach(tf, aset)
     params = aset.inside_parameters()
@@ -170,6 +172,10 @@ def train_inside(a):
         p.requires_grad_(True)
     print(f"trainable inside params: {sum(p.numel() for p in params) / 1e6:.1f}M")
     opt = torch.optim.AdamW(params, lr=a.lr, betas=(0.9, 0.95), weight_decay=a.weight_decay)
+    base = None
+    if a.train_base:  # also train the base WAM (WAM-TTT style meta-training; fawam/base_train.py)
+        from fawam.base_train import BaseTrainer
+        base = BaseTrainer(tf, lr=a.base_lr, weight_decay=a.weight_decay, blocks=a.base_blocks)
     sched_v = FlowMatchScheduler(shift=cfg.snr_shift, sigma_min=0.0, extra_one_step=True)
     sched_v.set_timesteps(1000, training=True)
     sched_a = FlowMatchScheduler(shift=cfg.action_snr_shift, sigma_min=0.0, extra_one_step=True)
@@ -223,12 +229,15 @@ def train_inside(a):
             margin = (e(input_dict, pred) - e(input_dict, ref_pos)) - (e(in_neg, pred_neg) - e(in_neg, ref_neg))
             lp = -torch.nn.functional.logsigmoid(-a.pref_beta * margin)
             loss = loss + a.lambda_pref * lp
-        (loss / a.grad_accum).backward()
+        if loss.requires_grad:  # FiLM-only variants: a sample without context/error input touches no trainable param
+            (loss / a.grad_accum).backward()
         gn = torch.tensor(0.0)
         if step % a.grad_accum == 0:
             gn = torch.nn.utils.clip_grad_norm_(params, 1.0)
             opt.step()
             opt.zero_grad(set_to_none=True)
+            if base is not None:
+                base.step(lr_scale=min(1.0, (step // a.grad_accum) / max(1, a.base_warmup)))
         if val_ds is not None and a.val_every and step % a.val_every == 0:
             vl = validate(tf, val_ds, a, sched_v, sched_a, patch, device)
             print(json.dumps(dict(step=step, val_action=vl[1], val_video=vl[0], val_action_noctx=vl[2])), flush=True)
@@ -242,12 +251,18 @@ def train_inside(a):
             log.flush()
         if a.save_every and step % a.save_every == 0:
             aset.save(out / f"step{step}")
+        if a.max_hours and time.time() - t0 > a.max_hours * 3600:  # short SLURM limits start sooner: stop in time, save
+            print(f"time budget of {a.max_hours} h reached at step {step}/{a.steps}", flush=True)
+            (out / "stopped_early.json").write_text(json.dumps(dict(step=step, steps=a.steps)))
+            break
     if a.guard_episodes:
         ratio = guard_ratio(tf, aset, a, cfg, sched_v, sched_a, patch, device)
         ok = ratio <= a.guard_tau
         (out / "guard.json").write_text(json.dumps(dict(loss_ratio=ratio, tau=a.guard_tau, accepted=ok)))
         print(f"guard: anchor loss ratio {ratio:.3f} (tau {a.guard_tau}) -> {'accepted' if ok else 'REJECTED'}")
     aset.save(out)
+    if base is not None:
+        base.save(out)
     (out / "train_args_inside.json").write_text(json.dumps({**vars(a), "episodes_used": [str(e) for e in eps]},
                                                            indent=2, default=str))
     print(f"saved {out}")
@@ -318,7 +333,8 @@ def train_outside(a):
         P, O = d["pred"], d["obs"]
     else:
         eps = find_episodes(a.episodes, success=a.success, tasks=a.tasks, settings=a.settings, limit=a.limit,
-                            seed=a.seed, drivers=a.drivers, limit_per_task=a.limit_per_task)
+                            seed=a.seed, drivers=a.drivers, limit_per_task=a.limit_per_task,
+                        limit_per_cell=a.limit_per_cell)
         P, O = build_pairs(eps)
     print(f"{P.shape[1]} (pred, obs) latent frames")
     P = torch.from_numpy(P).float().permute(1, 0, 2, 3)  # N, C, 24, 20
@@ -365,6 +381,7 @@ def main():
     ap.add_argument("--settings", nargs="*", help="task_config names to keep, e.g. table_h_m05")
     ap.add_argument("--drivers", nargs="*", help="policy | expert_replay")
     ap.add_argument("--limit_per_task", type=int, help="few-shot n per task (applied before --limit)")
+    ap.add_argument("--limit_per_cell", type=int, help="at most n episodes per (task, task_config)")
     ap.add_argument("--limit", type=int, help="number of episodes (few-shot n)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--model_path", default=str(DEFAULT_MODEL))
@@ -392,14 +409,23 @@ def main():
     ap.add_argument("--dense_blocks", type=int, nargs="*", help="full fine-tuning (dense deltas) of these blocks")
     ap.add_argument("--dense_targets", nargs="+", default=["attn"])
     ap.add_argument("--outside_type", default="mlp", choices=["mlp", "channel"])
-    ap.add_argument("--film_source", default="none", choices=["none", "memory", "error"])
+    ap.add_argument("--film_source", default="none", choices=["none", "memory", "error", "text"])
     ap.add_argument("--film_rank", type=int, default=64)
+    ap.add_argument("--error_dim", type=int, default=16, help="FiLM-error input: 16 = failure vector, 32 = + gap curve")
+    ap.add_argument("--text_only", action="store_true", help="meta-ICL: analysis text only, no rollout in the context")
+    ap.add_argument("--context_keyframes", type=int, default=0,
+                    help="meta-ICL: only the k latents with the highest prediction error as memory (0 = off)")
     ap.add_argument("--inside_streams", nargs="+", default=["video", "action"])
     ap.add_argument("--blocks", type=int, nargs="*", help="block indices with adapters (default: all 30)")
     ap.add_argument("--bottleneck", type=int, default=128)
     ap.add_argument("--lora_rank", type=int, default=16)
     ap.add_argument("--steps", type=int, default=400)
     ap.add_argument("--lr", type=float, default=4.343e-4)
+    ap.add_argument("--train_base", action="store_true",
+                    help="also train the base transformer (fp32 master weights on the GPU: needs an H200)")
+    ap.add_argument("--base_lr", type=float, default=1e-5)
+    ap.add_argument("--base_warmup", type=int, default=200, help="optimizer steps of linear base-lr warmup")
+    ap.add_argument("--base_blocks", type=int, nargs="*", help="only these blocks of the base (default: everything)")
     ap.add_argument("--weight_decay", type=float, default=0.0)
     ap.add_argument("--lambda_video", type=float, default=1.0)
     ap.add_argument("--lambda_action", type=float, default=1.0)
@@ -420,6 +446,8 @@ def main():
     ap.add_argument("--guard_episodes", nargs="*", help="FailBank guard: anchor episodes for the acceptance test")
     ap.add_argument("--guard_tau", type=float, default=1.1)
     ap.add_argument("--fixes", nargs="*", help="meta-ICL: successful episodes on the same seeds as --episodes")
+    ap.add_argument("--analysis_name", default="analysis.json",
+                    help="meta-ICL: failure analysis per episode (analysis.json = oracle, analysis_gap+vlm.json = VLM)")
     ap.add_argument("--include_pred", action="store_true", help="meta-ICL: imagined segment in the context")
     ap.add_argument("--context_groups", nargs="*", help="meta-ICL memory format: obs | pred | diff (overrides include_pred)")
     ap.add_argument("--context_window", action="store_true", help="meta-ICL: only the latents around the failure")
@@ -438,6 +466,7 @@ def main():
     ap.add_argument("--pairs", help="npz with pred/obs canvases from fawam.replay")
     ap.add_argument("--log_every", type=int, default=10)
     ap.add_argument("--save_every", type=int, default=0)
+    ap.add_argument("--max_hours", type=float, default=0, help="stop the inside training after this time and save")
     a = ap.parse_args()
     if a.stage == "inside":
         train_inside(a)

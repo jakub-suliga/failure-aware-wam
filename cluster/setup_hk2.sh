@@ -47,7 +47,7 @@ envs)
     ;;
 curobo)
     source "$CONDA/etc/profile.d/conda.sh"
-    conda activate robotwin
+    set +u; conda activate robotwin; set -u  # conda activate.d scripts use unset vars
     cd RoboTwin/envs
     [ -d curobo ] || git clone https://github.com/NVlabs/curobo.git && (cd curobo && git checkout v0.7.8 2>/dev/null || true)
     cd curobo
@@ -59,12 +59,12 @@ curobo)
     ;;
 assets)
     source "$CONDA/etc/profile.d/conda.sh"
-    conda activate lingbot
+    set +u; conda activate lingbot; set -u  # conda activate.d scripts use unset vars
     huggingface-cli download robbyant/lingbot-va-posttrain-robotwin \
         --local-dir lingbot-va/checkpoints/lingbot-va-posttrain-robotwin
     # the server needs attn_mode torch (inference), training loads with flex itself
     sed -i 's/"attn_mode": *"flex"/"attn_mode": "torch"/' lingbot-va/checkpoints/lingbot-va-posttrain-robotwin/transformer/config.json
-    conda activate robotwin
+    set +u; conda activate robotwin; set -u  # conda activate.d scripts use unset vars
     (cd RoboTwin && bash script/_download_assets.sh)
     ;;
 check)

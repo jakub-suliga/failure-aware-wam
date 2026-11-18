@@ -1,0 +1,20 @@
+# P8d: held-out FAILURE TYPE (user 2026-11-17). The adapters were meta-trained only on start-posture (dist_robot10) and
+# camera (dist_cam05) failures of the 7 training tasks (P7b, failfix_dist_*), never on a changed table height and never
+# on the test task. Here they get the lowered table on the test task: a failure type that was not in the data.
+# Per adapter: with context (failed attempt + VLM analysis) vs. _noctx (same adapter, nothing in context);
+# ft_dist_adapterplus = plain fine-tuning on the same data. Control without learning: retry_plain in p8_icl_vlm_meta.
+name: p8d_heldout_type
+out: results/sweeps/p8d_heldout_type
+episodes: 30
+per_job: 10
+n_par: 2
+time: "05:00:00"
+vlm: true
+extra_env: {VLM_MODEL: Qwen/Qwen3-VL-8B-Instruct, HF_HUB_OFFLINE: 1}
+tasks: [move_playingcard_away]
+configs: [table_h_m05, table_h_m10]
+methods: [icl_dist_film_memory_plus_adapterplus_VP, icl_dist_film_memory_plus_adapterplus_VP_noctx,
+          icl_dist_lora_r16_attn_VP, icl_dist_lora_r16_attn_VP_noctx,
+          icl_dist_adapterplus_VP, icl_dist_adapterplus_VP_noctx,
+          icl_dist_ttt_wam_VP, icl_dist_ttt_wam_VP_noctx,
+          ft_dist_adapterplus]

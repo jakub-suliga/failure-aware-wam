@@ -1,0 +1,18 @@
+# P7d (user 2026-11-18): more failures per failure type. P7c gave only 1-10 % failures (27 in total), so the "many
+# types" data was 86 % P7b. Stronger / new disturbances: object position 10 cm, yaw +-90 deg, heavy objects (slip/drop),
+# weak grippers (slip). Same pair driver (failed policy rollout + expert fix on the same seed; seeds the expert cannot
+# solve are skipped by the client), the 7 training tasks, never the test task, never a changed table height.
+# 24 episodes per (task, type) so that a 30 % failure rate gives ~7-8 failures per cell, plus P7b/P7c.
+name: p7d_meta_data_strong
+out: results/sweeps/p7d_meta_data_strong
+driver: pair
+episodes: 36
+per_job: 12
+n_par: 3
+time: "02:30:00"
+seed_offset: 2000
+tasks: [place_mouse_pad, pick_diverse_bottles, stack_blocks_two, place_shoe, move_can_pot, lift_pot, handover_block]
+# first pass (12 per cell, 2026-11-18): objxy10 36 / objyaw90 17 failures, heavy 2, gripweak 4 -> the simulator grasp is
+# robust to mass and grip stiffness; top-up only for object position/yaw, to 36 per cell
+configs: [dist_objxy10, dist_objyaw90]
+methods: [base]

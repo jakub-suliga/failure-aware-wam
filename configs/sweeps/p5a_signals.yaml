@@ -6,7 +6,7 @@ out: results/sweeps/p5a_signals
 episodes: 30
 per_job: 10
 n_par: 2
-time: "16:00:00"
-tasks: [move_playingcard_away, place_mouse_pad, pick_diverse_bottles, stack_blocks_two]
+time: "04:00:00"
+tasks: [move_playingcard_away, place_mouse_pad, move_can_pot, handover_block]  # mid success at -5 cm in P0 (TABLE4 had floor/ceiling tasks)
 configs: [table_h_m05, table_h_m10, demo_randomized]
 methods: [retry_plain, retry_explore, lff_sig_P, lff_sig_PR, lff_sig_PI, lff_sig_PRI, lff_sig_OP, lff_sig_O]

@@ -31,6 +31,7 @@ import torch.nn.functional as F
 from einops import rearrange
 
 from fawam import adapters as fa
+from fawam.base_train import BASE_FILE, BaseSwapper
 from fawam.methods import Method, resolve
 from fawam.paths import CAMS, ROOT, add_lingbot_to_path
 
@@ -70,6 +71,7 @@ class FawamServer(VA_Server):
         self.holder = fa.install(self.transformer)
         self.method = Method()
         self.adapter_cache = {}
+        self.base_swap = None
         self.steer_cache = {}
         self.probe = None
         self.ep_frame0 = 0
@@ -252,6 +254,13 @@ class FawamServer(VA_Server):
                 self.adapter_cache[m.adapter_path] = fa.AdapterSet.load(m.adapter_path, device=self.device).eval()
             aset = self.adapter_cache[m.adapter_path]
         fa.attach(self.transformer, aset)
+        # adapters meta-trained together with the base model (fawam/base_train.py): their base weights are active
+        # whenever the adapter is; everything else (first attempts, plain methods) runs the original weights
+        if self.base_swap is not None or (aset is not None and (Path(m.adapter_path) / BASE_FILE).exists()):
+            if self.base_swap is None:
+                self.base_swap = BaseSwapper(self.transformer)
+            self.base_swap.use(m.adapter_path if aset is not None and m.adapter_use in ("all", "inside") else None)
+        self._set_hid_residual(m)
         self.use_inside = aset is not None and m.adapter_use in ("all", "inside")
         self.holder.ctx.enabled = self.use_inside
         self.use_outside = aset is not None and aset.outside is not None and m.adapter_use in ("all", "outside")
@@ -271,6 +280,30 @@ class FawamServer(VA_Server):
             self.probe = {k: torch.from_numpy(np.asarray(v)).float().to(self.device) if np.asarray(v).dtype != object
                           else v for k, v in np.load(m.probe_path, allow_pickle=True).items()}
         return m
+
+    def _set_hid_residual(self, m):
+        """M3 (fawam/train_hid.py): constant velocity offset on the action output, computed once from the failed
+        attempt's real signals; removed again for methods without it (first attempts)."""
+        if getattr(self, "_hid_hook", None) is not None:
+            self._hid_hook.remove()
+            self._hid_hook = None
+        hr = m.hid_residual
+        if not hr:
+            return
+        import json as _json
+        from fawam import hid_ctx
+        from fawam.train_hid import HidM3, ctx_tensor
+        path = Path(hr["path"]) if Path(hr["path"]).is_absolute() else ROOT / hr["path"]
+        cfg = _json.loads((path / "config.json").read_text())
+        net = HidM3(cfg["kind"], cfg["K"]).to(self.device)
+        net.load_state_dict(torch.load(path / "hid_m3.pt", map_location=self.device))
+        net.eval()
+        with torch.no_grad():
+            c = ctx_tensor(hid_ctx.extract(hr["ctx_ep"]), cfg["kind"], self.device) if hr.get("ctx_ep") else None
+            dv = net.delta(c)[0].detach()
+        logger.info(f"hid residual {path.name} ctx={hr.get('ctx')} |dv|={float(dv.abs().mean()):.4f}")
+        self._hid_hook = self.transformer.action_proj_out.register_forward_hook(
+            lambda mod, inp, out: out + dv.to(out.dtype).view(*([1] * (out.dim() - 1)), -1))
 
     def _encode_negative(self, text):
         if not self.use_cfg:
@@ -457,6 +490,9 @@ class FawamServer(VA_Server):
     def _segment_rows(self, li, item, ana):
         """Rows of an episode to write: all, or a window around the analysed failure ({"before": b, "after": a})."""
         seg = item.get("segment", "full")
+        if isinstance(seg, dict) and seg.get("gaptop") and ana and ana.get("gap"):  # highest prediction error
+            top = sorted(ana["gap"], key=ana["gap"].get, reverse=True)[:int(seg["gaptop"])]
+            return np.where(np.isin(li, [int(k) for k in top]))[0]
         if seg == "full" or not ana or ana.get("latent") is None:
             return np.arange(len(li))
         b, a = (seg.get("before", 4), seg.get("after", 2)) if isinstance(seg, dict) else (4, 2)

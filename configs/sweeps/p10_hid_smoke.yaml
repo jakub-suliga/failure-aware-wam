@@ -1,0 +1,14 @@
+# p10 smoke (plan 2026-11-18, checklist 2-3): hidden offsets work in the simulator? pair driver on 2 training tasks:
+# policy failure rate under o, success of the compensated expert fix (goal >= 90 %), executed = commanded + o (from
+# the recorded sim poses). 6 seeds per (task, type), 1 h jobs.
+name: p10_hid_smoke
+out: results/sweeps/p10_hid_smoke
+driver: pair
+episodes: 6
+per_job: 6
+n_par: 3
+time: "01:00:00"
+seed_offset: 3000
+tasks: [place_shoe, move_can_pot]
+configs: [hid_trans, hid_gain, hid_yaw]
+methods: [base]

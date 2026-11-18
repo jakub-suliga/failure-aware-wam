@@ -1,0 +1,15 @@
+# p10 hid data (plan 2026-11-18, minimal path before the cluster outage on 2026-11-20): hidden translation offset only,
+# pair driver (policy attempt under o + compensated expert fix on the same seed, recorded for every seed), the 7
+# training tasks, 90 seeds per task. Held-out tasks for T1: move_playingcard_away, place_object_scale,
+# move_pillbottle_pad (never trained on).
+name: p10_hid_data
+out: results/sweeps/p10_hid_data
+driver: pair
+episodes: 90
+per_job: 18
+n_par: 3
+time: "02:30:00"
+seed_offset: 4000
+tasks: [place_mouse_pad, pick_diverse_bottles, stack_blocks_two, place_shoe, move_can_pot, lift_pot, handover_block]
+configs: [hid_trans]
+methods: [base]

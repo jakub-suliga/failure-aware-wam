@@ -1,0 +1,17 @@
+# P7c (user 2026-11-17): MANY different failure types with FEW episodes each, instead of one type with many episodes
+# (cf. Chan et al. 2022: in-context learning needs many rare "classes"; Yin et al. 2020: if one correction solves all
+# meta-training tasks the context is ignored). Same driver as P7/P7b (failed policy rollout + expert fix on the same
+# seed), the 7 training tasks, never the test task, never a changed table height (= the held-out test failure type).
+# Types here: object position, object yaw, clutter, light, background. Together with P7b (start posture, camera) = 7
+# types; the training caps every (task, type) cell with LIMIT_PER_CELL so no type dominates.
+name: p7c_meta_data_types
+out: results/sweeps/p7c_meta_data_types
+driver: pair
+episodes: 12
+per_job: 12
+n_par: 3
+time: "02:30:00"
+seed_offset: 1000
+tasks: [place_mouse_pad, pick_diverse_bottles, stack_blocks_two, place_shoe, move_can_pot, lift_pot, handover_block]
+configs: [dist_objxy, dist_objyaw, dist_clutter, dist_light, dist_bg]
+methods: [base]

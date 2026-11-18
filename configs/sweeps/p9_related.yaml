@@ -1,0 +1,13 @@
+# P9: mechanisms of closely related work, rebuilt on LingBot-VA with the same failure analysis (oracle + prediction
+# error), as comparison points (docs/PLAN.md, E). FARE: context reset at the prediction gap. T3VF: test-time training
+# only on high-gap frames. WAM-TTT style: update through the video prediction loss only. FAR: failure-contrastive
+# preference loss. FailBank: persistent bank of own rollouts with anchors and a guard.
+name: p9_related
+out: results/sweeps/p9_related
+episodes: 30
+per_job: 10
+n_par: 2
+time: "04:00:00"
+tasks: [move_playingcard_away]
+configs: [table_h_m05, table_h_m10]
+methods: [retry_plain, reset_on_gap, lff_ttt_filtered, lff_adapter_videoonly, lff_pref, lff_bank]

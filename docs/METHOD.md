@@ -1,5 +1,8 @@
 # Learn-from-Failure (LfF): LingBot-VA lernt aus seinen eigenen Fehlern
 
+> **Stand 2026-11-10: Ziel und aktueller Umfang stehen in [GOAL.md](GOAL.md) und [PLAN.md](PLAN.md).** Dieses Dokument
+> beschreibt den Methodenkatalog im Code; der hier skizzierte Sweep-Umfang ist durch PLAN.md ersetzt.
+
 > **Schwerpunkt seit 2026-11-04: In-Context-Learning, siehe [ICL.md](ICL.md).** Die Adapter-Varianten in diesem
 > Dokument bleiben unverändert und dienen als Vergleich (dieselbe Fehlerinformation über Gewichte statt über Kontext).
 

@@ -1,0 +1,17 @@
+#SCRON --partition=cpu
+#SCRON --time=00:15:00
+#SCRON --cpus-per-task=1
+#SCRON --mem=8G
+#SCRON --account=hk-project-p0029595
+#SCRON --job-name=fawam_pipeline_cron
+#SCRON --output=/hfs2/work/workspace/scratch/ka_uhtfz-failure-aware-wam/failure-aware-wam/pipeline/cron_slurm.out
+*/20 * * * * /hfs2/work/workspace/scratch/ka_uhtfz-failure-aware-wam/failure-aware-wam/cluster/pipeline_cron.sh
+
+#SCRON --partition=cpu
+#SCRON --time=00:40:00
+#SCRON --cpus-per-task=1
+#SCRON --mem=8G
+#SCRON --account=hk-project-p0029595
+#SCRON --job-name=fawam_report_cron
+#SCRON --output=/hfs2/work/workspace/scratch/ka_uhtfz-failure-aware-wam/failure-aware-wam/pipeline/report_slurm.out
+35 * * * * /hfs2/work/workspace/scratch/ka_uhtfz-failure-aware-wam/failure-aware-wam/cluster/report_cron.sh

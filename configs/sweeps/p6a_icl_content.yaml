@@ -6,8 +6,8 @@ out: results/sweeps/p6a_icl_content
 episodes: 30
 per_job: 10
 n_par: 2
-time: "16:00:00"
-tasks: [move_playingcard_away, place_mouse_pad, pick_diverse_bottles, stack_blocks_two]
+time: "04:00:00"
+tasks: [move_playingcard_away, place_mouse_pad, move_can_pot, handover_block]  # mid success at -5 cm in P0 (TABLE4 had floor/ceiling tasks)
 configs: [table_h_m05, table_h_m10, demo_randomized]
 methods: [retry_plain, icl_text_only, icl_fail_obs, icl_fail_pred, icl_fail_predobs, icl_fail_diff, icl_fail_window,
           icl_fail_corrected, icl_demo_same, icl_demo_nearest, icl_fail_demo, icl_demo_fail, icl_fails_3att,

@@ -1,0 +1,17 @@
+# P7b: more diverse meta-training data (user 2026-11-15/16): the P7 pairs (failed policy rollout + expert fix on the
+# same seed) under disturbances OTHER than the table height, on the 7 training tasks (never the test task):
+#   dist_robot10 = noisy start posture of both arms (std 0.1 rad), dist_cam05 = head camera moved by up to 5 cm.
+# In RoboTwin 2.0-Plus (arXiv 2603.22078) these two are what makes LingBot-VA fail (36 % / 29 % success).
+# Seeds from index 1000 as in P7: disjoint from all evaluation sweeps. Yield per cell is unknown until the screening
+# (p0s_task_screen) has run; 150 episodes per cell is a first pass.
+name: p7b_meta_data_dist
+out: results/sweeps/p7b_meta_data_dist
+driver: pair
+episodes: 150
+per_job: 30
+n_par: 3
+time: "04:30:00"
+seed_offset: 1000
+tasks: [place_mouse_pad, pick_diverse_bottles, stack_blocks_two, place_shoe, move_can_pot, lift_pot, handover_block]
+configs: [dist_robot10, dist_cam05]
+methods: [base]

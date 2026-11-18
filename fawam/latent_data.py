@@ -178,7 +178,7 @@ def load_episode(path, norm: ActionNorm, relabel=False, gap_beta=0.0, video_in_w
 
 
 def find_episodes(roots, success=None, tasks=None, settings=None, limit=None, seed=0, drivers=None,
-                  limit_per_task=None):
+                  limit_per_task=None, limit_per_cell=None):
     """Episode dirs under <root>/episodes/{success,fail}/<task>/<ep>/ (or roots that are episode dirs)."""
     eps = []
     for root in roots:
@@ -205,6 +205,16 @@ def find_episodes(roots, success=None, tasks=None, settings=None, limit=None, se
                     continue
         out.append(e)
     rng = random.Random(seed)
+    if limit_per_cell is not None:  # at most n per (task, task_config): many failure types with few episodes each
+        by_cell = {}
+        for e in out:
+            with h5py.File(e / "episode.h5", "r") as f:
+                by_cell.setdefault((str(f.attrs.get("task_name")), str(f.attrs.get("task_config"))), []).append(e)
+        out = []
+        for k in sorted(by_cell):
+            rng.shuffle(by_cell[k])
+            out += by_cell[k][:limit_per_cell]
+        out = sorted(out)
     if limit_per_task is not None:
         by_task = {}
         for e in out:
@@ -289,13 +299,18 @@ class FailFixDataset(EpisodeDataset):
 
     def __init__(self, fails, fixes, norm, text_cache, include_pred=True, p_text=0.5, max_frames=24, seed=0,
                  cfg_prob=0.1, context_groups=None, window=None, p_cross=0.0, p_success=0.0, p_noctx=0.0,
-                 cache_size=256):
+                 cache_size=256, analysis_name="analysis.json", text_only=False,
+                 keyframes=0):
         from functools import lru_cache
         self.norm, self.text_cache, self.max_frames, self.p_start0 = norm, text_cache, max_frames, 1.0
         self.rng, self.cfg_prob, self.p_text = random.Random(seed), cfg_prob, p_text
         self.groups = context_groups or (["pred", "obs"] if include_pred else ["obs"])
         self.window, self.p_cross, self.p_success, self.p_noctx = window, p_cross, p_success, p_noctx
-        self._load = lru_cache(maxsize=cache_size)(lambda path, group: load_episode(path, norm, group=group))
+        self.analysis_name = analysis_name  # which failure analysis feeds text and FiLM-error (oracle / VLM)
+        self.text_only = text_only  # no rollout tokens in the context: only the analysis text (and FiLM-error)
+        self.keyframes = keyframes  # > 0: only the k latents with the highest prediction error
+        self._load = lru_cache(maxsize=cache_size)(
+            lambda path, group: load_episode(path, norm, group=group, analysis_name=analysis_name))
         key = lambda e: self._key(e)
         fix_by_key = {}
         for e in fixes:
@@ -321,9 +336,19 @@ class FailFixDataset(EpisodeDataset):
         return cls._keys[e]
 
     def _memory(self, fail_path):
+        if self.text_only:
+            return []
         parts = [self._load(fail_path, g) for g in self.groups]
+        if self.keyframes:
+            ana_p = Path(fail_path) / self.analysis_name
+            gap = (json.loads(ana_p.read_text()).get("gap") or {}) if ana_p.exists() else {}
+            top = sorted(gap, key=gap.get, reverse=True)[:self.keyframes]
+            if top:
+                top = np.array([int(k) for k in top])
+                parts = [{k: (v[:, np.isin(p["latent_index"][0], top)] if isinstance(v, np.ndarray) else v)
+                          for k, v in p.items()} for p in parts]
         if self.window:
-            ana_p = Path(fail_path) / "analysis.json"
+            ana_p = Path(fail_path) / self.analysis_name
             ana = json.loads(ana_p.read_text()) if ana_p.exists() else None
             if ana and ana.get("latent") is not None:
                 L, b, a = int(ana["latent"]), self.window.get("before", 4), self.window.get("after", 2)
@@ -336,6 +361,7 @@ class FailFixDataset(EpisodeDataset):
         fix = self._load(fix_path, "obs")
         ts = self._key(fail_path)[:2]
         r = self.rng.random()
+        mem_path = fail_path  # the failure whose memory is in the context (its analysis drives FiLM-error)
         if r < self.p_noctx:
             parts, kind = [], "noctx"
         elif r < self.p_noctx + self.p_success:
@@ -343,7 +369,8 @@ class FailFixDataset(EpisodeDataset):
             parts, kind = ([self._load(self.rng.choice(others), "obs")] if others else []), "success"
         elif r < self.p_noctx + self.p_success + self.p_cross:
             others = [f_ for f_ in self.fails_by_ts[ts] if f_ != fail_path]
-            parts, kind = (self._memory(self.rng.choice(others)) if others else self._memory(fail_path)), "cross"
+            mem_path = self.rng.choice(others) if others else fail_path
+            parts, kind = self._memory(mem_path), "cross"
         else:
             parts, kind = self._memory(fail_path), "own"
         tgt = self._window(fix, self.max_frames)
@@ -353,8 +380,7 @@ class FailFixDataset(EpisodeDataset):
                                                                          "weight_video", "weight_action")}
         fail_ep = self._load(fail_path, "obs")
         from fawam.adapters import error_vector
-        mem_path = fail_path if kind == "own" else None
-        ana_p = Path(fail_path) / "analysis.json"
+        ana_p = Path(mem_path) / self.analysis_name
         err = error_vector(json.loads(ana_p.read_text())) if (kind in ("own", "cross") and ana_p.exists()) else None
         use_corr = kind in ("own",) and self.rng.random() < self.p_text
         text = fail_ep["correction"] if use_corr else fail_ep["text"]
@@ -365,7 +391,7 @@ class FailFixDataset(EpisodeDataset):
                     weight_action=torch.from_numpy(cat["weight_action"][0]),
                     actions_neg=torch.from_numpy(cat["actions"]), window_mask=torch.zeros(cat["latents"].shape[1]),
                     relabeled=torch.tensor(False), kind=kind,
-                    error_vec=torch.from_numpy(err if err is not None else np.zeros(16, np.float32)),
+                    error_vec=torch.from_numpy(err if err is not None else np.zeros(32, np.float32)),
                     has_error=torch.tensor(err is not None))
 
 

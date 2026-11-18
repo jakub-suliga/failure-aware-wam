@@ -1,0 +1,21 @@
+# P8s (user 2026-11-18): held-out failure type (lowered table, test task never trained) with
+#  - more failures per training type (P7b + P7c + P7d: start posture, camera, object position/yaw, clutter, light,
+#    background, strong object position/yaw, heavy objects, weak grippers; at most 12 failures per task and type),
+#  - the detailed VLM analysis (what exactly happened + one fix sentence; analysis_gap+vlm_detail.json),
+#  - adapters trained alone vs. together with the base model (_base, as in WAM-TTT meta-training).
+# _noctx = same weights without memory/analysis: does the model read the context?
+name: p8s_strong
+out: results/sweeps/p8s_strong
+episodes: 30
+per_job: 10
+n_par: 2
+time: "05:00:00"
+vlm: true
+extra_env: {VLM_MODEL: Qwen/Qwen3-VL-8B-Instruct, HF_HUB_OFFLINE: 1}
+tasks: [move_playingcard_away]
+configs: [table_h_m05, table_h_m10]
+methods: [icl_strong_lora_r16_attn_VPD, icl_strong_lora_r16_attn_VPD_noctx,
+          icl_strong_lora_r16_attn_base_VPD, icl_strong_lora_r16_attn_base_VPD_noctx,
+          icl_strong_film_memory_plus_adapterplus_VPD, icl_strong_film_memory_plus_adapterplus_VPD_noctx,
+          icl_strong_film_memory_plus_adapterplus_base_VPD, icl_strong_film_memory_plus_adapterplus_base_VPD_noctx,
+          ft_strong_base]

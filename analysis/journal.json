@@ -1,0 +1,59 @@
+{
+ "updated": "2026-11-18 16:30",
+ "problems": [
+  {"p": "P7c-Störungen erzeugen kaum Fehlschläge", "why": "Licht, Hintergrund, Clutter, Objektposition 5 cm und Drehung ±60° geben nur 1–10 % Fehlschläge (27 insgesamt). Das Basismodell ist darauf schon randomisiert trainiert.", "fix": "Das Training mit „7 Typen“ bestand zu 86 % aus P7b-Daten. Neuer Datensatz P7d mit stärkeren Störungen.", "status": "in Arbeit"},
+  {"p": "Schwere Objekte und schwacher Greifer wirken nicht", "why": "Masse ×10–40: 2 Fehlschläge, Greifkraft ×0,15: 4 Fehlschläge (je ~84 Episoden). Die Patches greifen laut Log, aber der Griff in der Simulation bleibt stabil.", "fix": "Beide Störungen gestrichen; Objektposition ±10 cm und Drehung ±90° werden auf 36 Episoden pro Aufgabe aufgefüllt.", "status": "in Arbeit"},
+  {"p": "VLM-Text ist fast immer gleich", "why": "„The left arm failed to grasp the box“: kein Hinweis, dass der Greifer zu hoch ist, kein Fix. Für das Modell ist der Kontext damit fast konstant.", "fix": "Neuer VLM-Modus „detail“ (Phase, wo der Greifer beim Schließen war, was das Objekt tat, ein Fix-Satz). Dazu Test fein-getunter Fehler-VLMs.", "status": "in Arbeit"},
+  {"p": "Kontext wird oft nicht genutzt", "why": "Mit und ohne Kontext gleich gut: Der Adapter lernt die Korrektur selbst, ohne den Kontext zu lesen.", "fix": "Mehr verschiedene Fehlertypen (P7d) und Basismodell mittrainieren (wie WAM-TTT, Option --train_base).", "status": "in Arbeit"},
+  {"p": "VLM-Benchmark: Anfragen an den falschen Server", "why": "Mehrere Jobs auf einem Knoten nutzten alle Port 8001, 40–58 von 105 Anfragen bekamen 404. Gültige Antworten sind korrekt (Modellname muss passen).", "fix": "Port pro Job (auch im VLM-Analyse-Job), fehlgeschlagene Anfragen werden wiederholt.", "status": "in Arbeit"},
+  {"p": "Pipeline tickt nicht automatisch", "why": "Die scrontab wurde beim VS-Code-Start deaktiviert (#DISABLED).", "fix": "Einmal im Repo „scrontab cluster/pipeline.scrontab“ ausführen. Bis dahin tickt Claude von Hand.", "status": "offen (Nutzer)"},
+  {"p": "Job-Limit 100 pro Account", "why": "21 angehaltene p0s_task_screen-Jobs belegen Plätze.", "fix": "Abbrechen, wenn nicht mehr gebraucht.", "status": "offen (Nutzer)"},
+  {"p": "Cosmos-Reason2 nicht ladbar", "why": "Das Modell ist auf Hugging Face zugangsbeschränkt.", "fix": "Lizenz auf huggingface.co/nvidia/Cosmos-Reason2-8B akzeptieren und auf dem Cluster „hf auth login“ ausführen. Getestet wird vorerst Cosmos-Reason1-7B.", "status": "offen (Nutzer)"},
+  {"p": "Weggeflogene Box zählt als Erfolg", "why": "RoboTwin prüft nur |x| > 0,23 m mit offenen Greifern.", "fix": "Erfolg nur, wenn das Objekt auf Starthöhe ±5 cm und innerhalb von 0,6 m bleibt; Spalte „weggeflogen“.", "status": "erledigt"}
+ ],
+ "analyses": [
+  {"t": "Ungesehener Fehlertyp, 2 Trainingstypen (p8d)", "b": [
+    "Training nur auf Startpose- und Kamera-Fehlern, Test auf abgesenktem Tisch.",
+    "Bestes Ergebnis: FiLM-memory + Adapter+ mit 16/26 gelöst bei −5 cm. Bei −10 cm löst keine Variante mehr als 1/30.",
+    "Mit und ohne Kontext gleich: Der Kontext wird nicht genutzt."]},
+  {"t": "Ungesehener Fehlertyp, „7 Typen“ (p8t)", "b": [
+    "LoRA: 11/25 mit Kontext gegen 2/29 ohne bei −5 cm (Fisher p = 0,003). Das ist das erste Zeichen, dass ein Modell den Kontext nutzt.",
+    "TTT umgekehrt: 0/24 mit gegen 9/25 ohne Kontext (p = 0,002). Hier schadet der Kontext.",
+    "FiLM-memory + Adapter+ 3/25 gegen 2/27, Adapter+ 0/21 gegen 1/26, Fine-Tuning 4/25.",
+    "Bei −10 cm bleibt alles bei 0/30.",
+    "Einschränkung: Die Daten waren wegen P7c fast nur P7b, also kaum mehr Typen als in p8d."]},
+  {"t": "Zum Vergleich: Training mit Tischhöhe (p8)", "b": [
+    "Wenn der Testtyp im Training vorkommt: 28/30 gelöst auf beiden Höhen.",
+    "Aber auch ohne Kontext ähnlich: Der Adapter lernt „tiefer greifen“ einfach auswendig."]},
+  {"t": "Was das VLM auf der Testaufgabe sagt", "b": [
+    "In rund 80 % der Fälle „missed grasp“, das stimmt: Der Greifer schließt 3 cm (−5) bzw. 8 cm (−10) zu hoch.",
+    "Rund 20 % sind falsch („grasped but failed to lift“), obwohl nie gegriffen wurde.",
+    "Die Texte sind fast identisch und sagen weder „zu hoch“ noch wie man es behebt."]},
+  {"t": "Erst Fehlerzeitpunkt finden, dann fragen (two_stage)", "b": [
+    "Zeitpunkt richtig in nur 23 % (8B) bzw. 35 % (32B) der Fälle, 17–27 % Ausfälle.",
+    "„Tiefer greifen“ kommt in rund 78 % der Höhenfehler, aber genauso in rund 70 % der Fälle ohne Höhenfehler.",
+    "Ergebnis: hilft nicht, das „tiefer“ kommt vom Prompt, nicht vom Bild."]},
+  {"t": "Fein-getunte Fehler-VLMs (vorläufig, Wiederholung läuft)", "b": [
+    "Getestet: ViFailback-8B (CVPR 2026, ALOHA AgileX), RoboFAC-7B, Cosmos-Reason1-7B, jeweils auch im eigenen Prompt-Format.",
+    "Keines unterscheidet Höhenfehler zuverlässig: RoboFAC (eigenes Format) sagt „tiefer“ bei 74 % der Höhenfehler, aber auch bei 55 % der anderen.",
+    "Qwen3-VL mit Checkliste: 86–100 % „tiefer“, aber 97–100 % auch dort, wo es falsch ist.",
+    "Tabelle unten. Die Werte von ViFailback und dem 8B-detail-Prompt sind wegen der Port-Kollision noch unvollständig."]},
+  {"t": "Basismodell mittrainieren (wie WAM-TTT)", "b": [
+    "WAM-TTT trainiert beim Meta-Training das WAM selbst mit; beim Test bleibt alles eingefroren.",
+    "Umgesetzt als --train_base: 5,09 Mrd. Parameter, Lernrate 1e-5, fp32-Masterkopie → nur auf H200.",
+    "Smoke-Test ok: 40 Schritte, ~5 s pro Schritt, base.safetensors (10 GB) gespeichert.",
+    "In der Eval nutzt nur der Retry die neuen Gewichte; der erste Versuch läuft mit dem Original-Modell, damit der Vergleich gleich bleibt."]},
+  {"t": "Neue Störungen P7d, erster Durchgang (12 Episoden pro Aufgabe)", "b": [
+    "Objektposition ±10 cm: 36 Fehlschläge (~43 %).",
+    "Objektdrehung ±90°: 17 Fehlschläge (~20 %).",
+    "Schwere Objekte: 2, schwacher Greifer: 4 → gestrichen."]}
+ ],
+ "running": [
+  {"s": "P7d auffüllen: Objektposition und -drehung auf 36 Episoden pro Aufgabe", "st": "läuft (28 Jobs)"},
+  {"s": "VLM-Benchmark wiederholen (fehlgeschlagene Anfragen)", "st": "läuft (5 Jobs)"},
+  {"s": "Bestes VLM wählen und für die Analyse einsetzen", "st": "nach dem Benchmark"},
+  {"s": "Detaillierte VLM-Analyse aller Fehlschläge aus P7b, P7c und P7d", "st": "wartet auf P7d"},
+  {"s": "5 Trainings: LoRA und FiLM-memory + Adapter+, jeweils nur Adapter oder mit Basismodell, dazu Fine-Tuning mit Basismodell", "st": "wartet"},
+  {"s": "Eval p8s auf dem abgesenkten Tisch, jeweils mit und ohne Kontext (54 Jobs)", "st": "wartet"}
+ ]
+}

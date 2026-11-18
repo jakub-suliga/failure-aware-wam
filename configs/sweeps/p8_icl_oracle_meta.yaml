@@ -1,0 +1,12 @@
+# P8 upper bound: the same meta-ICL with the simulator oracle instead of the VLM (analysis at training and test time).
+name: p8_icl_oracle_meta
+out: results/sweeps/p8_icl_oracle_meta
+episodes: 30
+per_job: 10
+n_par: 2
+time: "05:00:00"
+tasks: [move_playingcard_away]
+configs: [table_h_m05, table_h_m10]
+methods: [retry_plain, icl_type_adapterplus, icl_type_film_error, icl_type_film_gapcurve, icl_type_adapterplus_noctx]
+method_overrides:
+  icl_type_adapterplus_noctx: {configs: [table_h_m05]}

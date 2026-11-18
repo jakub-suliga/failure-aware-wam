@@ -27,6 +27,19 @@ def _rel_pose(pose, init):
     return np.concatenate([pose[:3] - init[:3], rot.as_quat()])
 
 
+def _abs_pose(rel, init):
+    """The client's add_eef_pose (same quaternion handling): relative -> absolute."""
+    rot = R.from_quat(init[3:7]) * R.from_quat(rel[3:7])
+    return np.concatenate([rel[:3] + init[:3], rot.as_quat()])
+
+
+def to_absolute(rel16, init16):
+    """Inverse of to_relative (hid offsets compensate the expert in the absolute frame)."""
+    l = _abs_pose(rel16[:7], init16[:7])
+    r = _abs_pose(rel16[8:15], init16[8:15])
+    return np.concatenate([l, rel16[7:8], r, rel16[15:16]])
+
+
 def to_relative(abs16, init16):
     """[l xyz quat grip, r xyz quat grip] absolute -> the policy's relative action (same layout)."""
     l = _rel_pose(abs16[:7], init16[:7])
@@ -255,7 +268,7 @@ class Orchestrator:
 def make_context_spec(icl, ep_dir, seed, setting, seed_failures=(), successes=()):
     """ICL config (methods.ICL_DEFAULTS) + the failed episode -> memory spec for fawam.server._prefill."""
     from pathlib import Path
-    seg = "full" if icl["segment"] == "full" else dict(icl["window"])
+    seg = "full" if icl["segment"] == "full" else dict(gaptop=6) if icl["segment"] == "gaptop" else dict(icl["window"])
     fail_item = lambda p: dict(path=str(p), groups=list(icl["groups"]), segment=seg, actions=icl["actions"],
                                role="failure", manip=icl.get("manip"))
     bank = icl["demo_bank"].format(setting=setting or "")
@@ -357,6 +370,12 @@ class LearnFromFailure:
                "--lambda_video", str(c["lambda_video"]), "--lambda_action", str(c["lambda_action"]),
                "--gap_filter", str(c["gap_filter"]), "--pref_beta", str(c["pref_beta"]),
                "--outside", c.get("outside", "none"), "--outside_steps", str(c.get("outside_steps", 100))]
+        if c.get("kind"):
+            cmd += ["--kind", c["kind"]]
+        if c.get("inside_streams"):
+            cmd += ["--inside_streams", *c["inside_streams"]]
+        if c.get("lr"):
+            cmd += ["--lr", str(c["lr"])]
         if c["guard"] and self.successes:
             cmd += ["--guard_episodes", *self.successes]
         if succ:
@@ -411,6 +430,15 @@ class LearnFromFailure:
             info.update(learn_seconds=round(time.time() - t1, 1), accepted=accepted)
         elif c["mode"] == "icl" and c.get("meta_adapter"):
             m.adapter_path = c["meta_adapter"]
+        elif c["mode"] == "hidres":  # M3: residual head reads the failed attempt's real signals (hid_ctx)
+            ctx_ep = str(ep_dir) if c["hid_ctx"] == "own" else None
+            if c["hid_ctx"] == "shuf":
+                root = self.Path(c["hid_shuf_root"])
+                root = root if root.is_absolute() else self.Path(__file__).resolve().parents[1] / root
+                cands = sorted(p for p in root.glob("episodes/fail/*/*") if f"seed{seed}" not in p.name)
+                ctx_ep = str(cands[(int(seed) * 7919) % len(cands)]) if cands else None
+            m.hid_residual = dict(path=c["hid_head"], ctx_ep=ctx_ep, ctx=c["hid_ctx"])
+            info.update(hid_ctx_ep=ctx_ep)
         self.seed_failures.append(str(ep_dir))
         prefill = None
         if c["mode"] in ("icl", "both"):
@@ -433,7 +461,7 @@ class LearnFromFailure:
             prompt, neg = icl_prompt(c["icl"], ana, instruction)
             if neg:
                 m.negative_prompt = neg
-        if c["mode"] == "none":  # plain retry (+ exploration noise): no learning, no context, no text
+        if c["mode"] in ("none", "hidres"):  # plain retry (+ exploration noise) / M3: no memory, no extra text (+ exploration noise): no learning, no context, no text
             prompt, prefill = instruction, None
         info.update(adapter=m.adapter_path, prefill=prefill, prompt=prompt, seconds=round(time.time() - t0, 1))
         self.log.append(info)

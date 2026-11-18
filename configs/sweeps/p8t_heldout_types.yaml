@@ -1,0 +1,19 @@
+# P8t: held-out FAILURE TYPE with MANY training failure types (user 2026-11-17). Adapters meta-trained on 7 failure
+# types with few episodes each (P7b start posture + camera, P7c object position/yaw, clutter, light, background; at most
+# 12 failures per task and type), never a changed table height, never the test task; tested on the lowered table.
+# Compare with p8d_heldout_type (2 types, many episodes): does type diversity make the adapters use the context?
+name: p8t_heldout_types
+out: results/sweeps/p8t_heldout_types
+episodes: 30
+per_job: 10
+n_par: 2
+time: "05:00:00"
+vlm: true
+extra_env: {VLM_MODEL: Qwen/Qwen3-VL-8B-Instruct, HF_HUB_OFFLINE: 1}
+tasks: [move_playingcard_away]
+configs: [table_h_m05, table_h_m10]
+methods: [icl_types_film_memory_plus_adapterplus_VP, icl_types_film_memory_plus_adapterplus_VP_noctx,
+          icl_types_lora_r16_attn_VP, icl_types_lora_r16_attn_VP_noctx,
+          icl_types_adapterplus_VP, icl_types_adapterplus_VP_noctx,
+          icl_types_ttt_wam_VP, icl_types_ttt_wam_VP_noctx,
+          ft_types_adapterplus]

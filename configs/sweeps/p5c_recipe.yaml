@@ -5,7 +5,7 @@ episodes: 30
 per_job: 10
 n_par: 2
 time: "16:00:00"
-tasks: [move_playingcard_away, place_mouse_pad, pick_diverse_bottles, stack_blocks_two]
+tasks: [move_playingcard_away, place_mouse_pad, move_can_pot, handover_block]  # mid success at -5 cm in P0 (TABLE4 had floor/ceiling tasks)
 configs: [table_h_m05, table_h_m10]
 methods: [lff_adapter, lff_adapter_noweight, lff_adapter_norelabel, lff_adapter_instr, lff_adapter_videoonly,
           lff_adapter_actiononly, lff_ttt_filtered, lff_pref, lff_pref_PRI, lff_adapter_explore, lff_adapter_3att]

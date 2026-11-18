@@ -18,7 +18,7 @@ from pathlib import Path
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
-TABLE4 = ["move_playingcard_away", "place_mouse_pad", "pick_diverse_bottles", "stack_blocks_two"]
+TABLE4 = ["move_playingcard_away", "place_mouse_pad", "move_can_pot", "handover_block"]  # mid success at -5 cm in P0
 EXPERT = "results/sweeps/p2_expert_data/base/{cfg}"
 ROLL = "results/sweeps/p0_baseline_table/base/{cfg}"
 ADAPTERS = "artifacts/adapters"
@@ -78,10 +78,15 @@ GRID["failfix_meta"] = (dict(EPISODES=roll("table_h_m025", "table_h_m05", "table
 # Data: P7 (driver pair: failure + expert fix on the same seed; random table height + hard setting, 8 tasks).
 _P7 = " ".join(f"results/sweeps/p7_meta_data/base/{c}" for c in ("table_h_rand", "demo_randomized"))
 _FF_EP, _FF_FIX = _P7, _P7
-_META = ("--p_text 0.5 --p_cross 0.2 --p_success 0.1 --p_noctx 0.15 --val_frac 0.1 --val_every 1000 "
-         "--save_every 2000 --max_frames 20 --steps 12000 --grad_accum 4")
+# First pass: 3000 steps x accum 4 (6-12 h on one GPU) for a fast sign of life; raise --steps for the best variants.
+_META = ("--p_text 0.5 --p_cross 0.2 --p_success 0.1 --p_noctx 0.15 --val_frac 0.1 --val_every 500 "
+         "--save_every 1000 --max_frames 20 --steps 3000 --grad_accum 4")
 TABLE8 = ["move_playingcard_away", "place_mouse_pad", "pick_diverse_bottles", "stack_blocks_two", "place_shoe",
           "move_can_pot", "lift_pot", "handover_block"]
+# The meta-training never sees the task the methods are evaluated on (docs/GOAL.md): it has to learn to USE a
+# failure memory, not the test task.
+TEST_TASK = "move_playingcard_away"
+TRAIN_TASKS = [t for t in TABLE8 if t != TEST_TASK]
 for _name, _extra in {"failfix_obs": "--context_groups obs",
                       "failfix_predobs": "--context_groups pred obs",
                       "failfix_diff": "--context_groups diff obs",
@@ -90,13 +95,17 @@ for _name, _extra in {"failfix_obs": "--context_groups obs",
                       "failfix_predobs_ownonly": "--context_groups pred obs --p_cross 0 --p_success 0 --p_noctx 0",
                       "failfix_predobs_notext": "--context_groups pred obs --p_text 0",
                       "failfix_predobs_small": "--context_groups pred obs --steps 3000",
+                      # only the analysis text (and FiLM-error), no rollout tokens in the context
+                      "failfix_textonly": "--context_groups obs --text_only --p_text 1.0",
+                      # only the 6 latents with the highest prediction error
+                      "failfix_gapkeys": "--context_groups pred obs --context_keyframes 6",
                       }.items():
-    GRID[_name] = (dict(EPISODES=_FF_EP, SUCCESS="false", OUTSIDE="none", TASKS=" ".join(TABLE8),
+    GRID[_name] = (dict(EPISODES=_FF_EP, SUCCESS="false", OUTSIDE="none", TASKS=" ".join(TRAIN_TASKS),
                         EXTRA=f"{_META} {_extra} --fixes {_FF_FIX}"),
                    ["table_h_m05", "table_h_m10"])
-# generalisation to an unseen TASK: meta-trained without stack_blocks_two, tested on it
+# generalisation to an unseen TASK: meta-trained without move_can_pot, tested on it
 GRID["failfix_predobs_holdtask"] = (dict(EPISODES=_FF_EP, SUCCESS="false", OUTSIDE="none",
-                                         TASKS=" ".join(t for t in TABLE8 if t != "stack_blocks_two"),
+                                         TASKS=" ".join(t for t in TRAIN_TASKS if t != "move_can_pot"),
                                          EXTRA=f"{_META} --context_groups pred obs --fixes {_FF_FIX}"),
                                     ["table_h_m05", "table_h_m10"])
 # Adapter TYPES for ICL meta-training (docs/ICL.md, 5b): same data/format (pred+obs memory), only the module varies.
@@ -127,21 +136,107 @@ ADAPTER_TYPES = {
     "lora_plus_prompt": ("combo", "--use_lora --lora_targets attn --prompt_tokens 16"),
     "film_memory":      ("combo", "--film_source memory"),                            # FiLM from the memory
     "film_error":       ("combo", "--film_source error"),                             # FiLM from the failure vector
+    "film_gapcurve":    ("combo", "--film_source error --error_dim 32"),              # + the prediction-error curve
+    "film_text":        ("combo", "--film_source text --p_text 1.0"),                 # FiLM from the analysis text embedding
     "film_memory_plus_adapterplus": ("combo", "--film_source memory --use_adapterplus"),
 }
-_META_T = _META.replace("--steps 12000", "--steps 6000")
+_META_T = _META
 for _t, (_kind, _extra) in ADAPTER_TYPES.items():
-    GRID[f"failfix_type_{_t}"] = (dict(EPISODES=_FF_EP, SUCCESS="false", OUTSIDE="none", TASKS=" ".join(TABLE8),
+    GRID[f"failfix_type_{_t}"] = (dict(EPISODES=_FF_EP, SUCCESS="false", OUTSIDE="none", TASKS=" ".join(TRAIN_TASKS),
                                        KIND=_kind, EXTRA=f"{_META_T} --context_groups pred obs {_extra} "
                                                          f"--fixes {_FF_FIX}"),
                                   ["table_h_m05", "table_h_m10"])
+# Plain fine-tuning baseline (user 2026-11-15): the same Adapter+, data and steps as the meta-training, but never a
+# memory and never an analysis text -- only instruction -> expert solution on the 7 training tasks. Tested on the
+# held-out task as method ft_adapterplus: what fine-tuning on the dataset alone buys.
+GRID["failfix_ft_adapterplus"] = (dict(EPISODES=_FF_EP, SUCCESS="false", OUTSIDE="none", TASKS=" ".join(TRAIN_TASKS),
+                                       KIND="inside", EXTRA=f"{_META_T} --context_groups pred obs --p_noctx 1 --p_text 0 "
+                                                            f"--p_cross 0 --p_success 0 --fixes {_FF_FIX}"),
+                                  ["table_h_m05", "table_h_m10"])
 # demo in context -> success (no failure): the E3 counterpart, for icl_meta_demo
 GRID["democtx_meta"] = (dict(EPISODES=_FF_FIX, SUCCESS="true", OUTSIDE="none", CONTEXT_K="1", DRIVERS="expert_replay",
-                             TASKS=" ".join(TABLE8),
+                             TASKS=" ".join(TRAIN_TASKS),
                              EXTRA=f"--max_frames 20 --steps 12000 --grad_accum 4 --save_every 2000 "
                                    f"--context_pool {_FF_FIX}"),
                         ["table_h_m05", "table_h_m10"])
 ICL_CONFIGS = ["table_h_m05", "table_h_m075", "table_h_m10", "table_h_z00", "demo_randomized"]
+
+
+# ICL with a VLM failure analysis (the main question): the same meta-training, but the correction text and the
+# FiLM-error vector come from Qwen3-VL on the failure (analysis_gap+vlm.json: prediction error + VLM), not the oracle.
+VLM_ANALYSIS = "--analysis_name analysis_gap+vlm.json"
+VLM_TYPES = ["adapterplus", "lora_r16_attn", "adaln", "ia3_adaln", "film_memory", "film_error", "film_gapcurve",
+             "film_text", "film_memory_plus_adapterplus", "prompt_vane", "ttt_wam"]
+for _src in ["failfix_diff", "failfix_window", "failfix_textonly", "failfix_gapkeys"] + \
+        [f"failfix_type_{_t}" for _t in VLM_TYPES]:
+    _env, _cfgs = GRID[_src]
+    GRID[f"{_src}_vlm"] = (dict(_env, EXTRA=f"{_env['EXTRA']} {VLM_ANALYSIS}"), _cfgs)
+# Held-out FAILURE TYPE (user 2026-11-17): meta-trained only on the P7b pairs (start-posture noise dist_robot10 +
+# camera shift dist_cam05) of the 7 training tasks -- no table height at all -- and tested on the lowered table of the
+# test task (p8d_heldout_type). With table-height data the correction was always "grasp lower", so the adapters
+# learned it without reading the context (noctx = ctx); here the data contains several failure types, and the test
+# failure type is not among them. Context = the VLM analysis (gap+vlm), as in P8.
+_P7B = " ".join(f"results/sweeps/p7b_meta_data_dist/base/{c}" for c in ("dist_robot10", "dist_cam05"))
+DIST_TYPES = ["film_memory_plus_adapterplus", "lora_r16_attn", "adapterplus", "ttt_wam"]
+for _t in DIST_TYPES:
+    _kind, _extra = ADAPTER_TYPES[_t]
+    GRID[f"failfix_dist_{_t}_vlm"] = (dict(EPISODES=_P7B, SUCCESS="false", OUTSIDE="none", TASKS=" ".join(TRAIN_TASKS),
+                                           KIND=_kind, EXTRA=f"{_META_T} --context_groups pred obs {_extra} "
+                                                             f"--fixes {_P7B} {VLM_ANALYSIS}"),
+                                      ["table_h_m05", "table_h_m10"])
+# Many failure types, few episodes each (user 2026-11-17): P7b (start posture, camera) + P7c (object position, object
+# yaw, clutter, light, background) = 7 types, every (task, type) cell capped at 12 failures so no type dominates.
+_P7C = _P7B + " " + " ".join(f"results/sweeps/p7c_meta_data_types/base/{c}"
+                             for c in ("dist_objxy", "dist_objyaw", "dist_clutter", "dist_light", "dist_bg"))
+for _t in DIST_TYPES:
+    _kind, _extra = ADAPTER_TYPES[_t]
+    GRID[f"failfix_types_{_t}_vlm"] = (dict(EPISODES=_P7C, SUCCESS="false", OUTSIDE="none", TASKS=" ".join(TRAIN_TASKS),
+                                            KIND=_kind, LIMIT_PER_CELL=12,
+                                            EXTRA=f"{_META_T} --context_groups pred obs {_extra} --fixes {_P7C} "
+                                                  f"{VLM_ANALYSIS}"), ["table_h_m05", "table_h_m10"])
+GRID["failfix_types_ft_adapterplus"] = (dict(EPISODES=_P7C, SUCCESS="false", OUTSIDE="none", TASKS=" ".join(TRAIN_TASKS),
+                                             KIND="inside", LIMIT_PER_CELL=12,
+                                             EXTRA=f"{_META_T} --context_groups pred obs --p_noctx 1 --p_text 0 "
+                                                   f"--p_cross 0 --p_success 0 --fixes {_P7C}"),
+                                        ["table_h_m05", "table_h_m10"])
+GRID["failfix_dist_ft_adapterplus"] = (dict(EPISODES=_P7B, SUCCESS="false", OUTSIDE="none", TASKS=" ".join(TRAIN_TASKS),
+                                            KIND="inside", EXTRA=f"{_META_T} --context_groups pred obs --p_noctx 1 "
+                                                                 f"--p_text 0 --p_cross 0 --p_success 0 --fixes {_P7B}"),
+                                       ["table_h_m05", "table_h_m10"])
+
+# P8s (user 2026-11-18): more failures per type (P7d: object position 10 cm, yaw +-90 deg, heavy objects, weak grippers
+# on top of P7b/P7c), a more detailed VLM analysis with a fix sentence (analysis_gap+vlm_detail.json), and -- as in
+# WAM-TTT -- the base model trained together with the adapter (_base: --train_base, fp32 master weights -> H200 only).
+_P7D = " ".join(f"results/sweeps/p7d_meta_data_strong/base/{c}"
+                for c in ("dist_objxy10", "dist_objyaw90", "dist_heavy", "dist_gripweak"))
+_STRONG = f"{_P7C} {_P7D}"
+VLM_DETAIL = "--analysis_name analysis_gap+vlm_detail.json"
+STRONG_TYPES = ["lora_r16_attn", "film_memory_plus_adapterplus"]
+_BASE = "--train_base --base_lr 1e-5"
+for _t in STRONG_TYPES:
+    _kind, _extra = ADAPTER_TYPES[_t]
+    _env = dict(EPISODES=_STRONG, SUCCESS="false", OUTSIDE="none", TASKS=" ".join(TRAIN_TASKS), KIND=_kind,
+                LIMIT_PER_CELL=12,
+                EXTRA=f"{_META_T} --context_groups pred obs {_extra} --fixes {_STRONG} {VLM_DETAIL}")
+    GRID[f"failfix_strong_{_t}_vlmd"] = (_env, ["table_h_m05", "table_h_m10"])
+    GRID[f"failfix_strong_{_t}_vlmd_base"] = (dict(_env, EXTRA=f"{_env['EXTRA']} {_BASE}", PARTITION="gpu-h200"),
+                                              ["table_h_m05", "table_h_m10"])
+# control: plain fine-tuning of base + Adapter+ on the same data, never a memory or analysis text
+GRID["failfix_strong_ft_base"] = (dict(EPISODES=_STRONG, SUCCESS="false", OUTSIDE="none", TASKS=" ".join(TRAIN_TASKS),
+                                       KIND="inside", LIMIT_PER_CELL=12, PARTITION="gpu-h200",
+                                       EXTRA=f"{_META_T} --context_groups pred obs --p_noctx 1 --p_text 0 --p_cross 0 "
+                                             f"--p_success 0 --fixes {_STRONG} {_BASE}"), ["table_h_m05", "table_h_m10"])
+
+# p11 hid (plan 2026-11-18, minimal path): C1 x M1 on the hidden-offset pairs -- LoRA r16 on the self-attention,
+# memory = imagined + real failed attempt, no text (instruction only, no VLM, no oracle). 30 % of the samples get the
+# failure of ANOTHER seed as memory with the target unchanged (the "shuf" anti-shortcut), 10 % no memory.
+_HID = "results/sweeps/p10_hid_data/base/hid_trans"
+GRID["failfix_hid_lora"] = (dict(EPISODES=_HID, SUCCESS="false", OUTSIDE="none", TASKS=" ".join(TRAIN_TASKS),
+                                 KIND="combo",
+                                 EXTRA="--p_text 0 --p_cross 0.3 --p_success 0 --p_noctx 0.1 --val_frac 0.1 "
+                                       "--val_every 250 --save_every 1000 --max_frames 20 --steps 3000 --grad_accum 4 "
+                                       f"--context_groups pred obs --lora_rank 16 --lora_targets attn --fixes {_HID}"),
+                            ["hid_trans"])
 
 
 def train(a):
@@ -155,15 +250,24 @@ def train(a):
         e = dict(FAWAM_ROOT=str(ROOT), OUT=str(out), **{k: str(v) for k, v in env.items()})
         if "hard" not in name:
             e.setdefault("TASKS", " ".join(TABLE4))
+        if name.startswith("failfix_") and os.environ.get("FAWAM_META_FAST"):
+            # fast first pass (user 2026-11-13: results quickly): at most 1500 steps or 3.2 h, whatever comes first,
+            # so that the job fits a 4.5 h limit and is backfilled instead of waiting a day
+            e["EXTRA"] = f"{e.get('EXTRA', '')} --steps 1500 --max_hours 3.2"
+            e["TIME"] = "04:30:00"
         if name.startswith(("failfix_", "democtx_")):
-            e.setdefault("TIME", "47:00:00")
+            e.setdefault("TIME", "24:00:00")
         out.mkdir(parents=True, exist_ok=True)
         cmd = ["sbatch", f"--job-name=fawam_train_{name}", f"--time={e.get('TIME', a.time)}", f"--output={out}/slurm_%j.out",
                f"--chdir={ROOT}"]
-        if os.environ.get("PARTITION"):
-            cmd.append(f"--partition={os.environ['PARTITION']}")
+        part = e.pop("PARTITION", None) or os.environ.get("PARTITION")  # per-entry (e.g. H200 for --train_base)
+        if part:
+            cmd.append(f"--partition={part}")
         cmd.append(str(ROOT / "cluster" / "train_job.sh"))
-        if a.submit:
+        if a.submit and os.environ.get("FAWAM_QUEUE"):  # cluster/pipeline.py feeds the queue (submit limit)
+            with open(os.environ["FAWAM_QUEUE"], "a") as q:
+                q.write(json.dumps(dict(argv=cmd, env=e, label=f"train_{name}")) + "\n")
+        elif a.submit:
             r = subprocess.run(cmd, capture_output=True, text=True, env={**os.environ, **e})
             print(r.stdout.strip() or r.stderr.strip(), "<-", name)
         else:

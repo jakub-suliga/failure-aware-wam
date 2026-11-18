@@ -81,7 +81,7 @@ class AdapterConfig:
     outside_type: str = "mlp"       # mlp (residual MLP) | channel (channel-wise scale + shift, paper baseline)
     # FiLM / conditional AdaLN: per-block offsets of the modulation table (scale/shift/gate) computed from
     #   memory: the pooled in-context memory tokens at that block | error: a compact failure vector from the analysis
-    film_source: str = "none"       # none | memory | error
+    film_source: str = "none"       # none | memory | error | text (pooled embedding of the prompt = analysis text)
     film_rank: int = 64
     error_dim: int = 16
 
@@ -107,7 +107,7 @@ class AdapterConfig:
 
     @property
     def has_film(self):
-        return self.film_source in ("memory", "error")
+        return self.film_source in ("memory", "error", "text")
 
     @property
     def has_prompt(self):
@@ -295,9 +295,10 @@ class FiLMHead(nn.Module):
 ERROR_TYPES = ["missed_grasp", "misaligned_grasp", "dropped", "misplaced", "unknown"]
 
 
-def error_vector(ana, dim=16):
+def error_vector(ana, dim=32):
     """Compact failure description for FiLM-error: delta_m (3, in dm), arm one-hot (2), failure type one-hot (5),
-    gap statistics (max, mean, onset position), padded to dim."""
+    gap statistics (max, mean, onset position) in [0:16]; [16:32] is the prediction-error curve of the episode
+    (wrist cosine gap per latent, resampled to 16 bins). Adapters read the first cfg.error_dim entries."""
     v = np.zeros(dim, np.float32)
     if not ana or not ana.get("failed"):
         return v
@@ -306,11 +307,14 @@ def error_vector(ana, dim=16):
         v[3 + ("left", "right").index(ana["arm"])] = 1
     ft = ana.get("failure_type", "unknown")
     v[5 + (ERROR_TYPES.index(ft) if ft in ERROR_TYPES else 4)] = 1
-    g = np.array(list((ana.get("gap") or {}).values()), np.float32)
+    gap = ana.get("gap") or {}
+    g = np.array([gap[k] for k in sorted(gap, key=int)], np.float32)
     if len(g):
         v[10], v[11] = g.max(), g.mean()
         lat = ana.get("latent")
         v[12] = (lat / max(len(g), 1)) if lat is not None else 0
+        if dim >= 32:
+            v[16:32] = np.interp(np.linspace(0, len(g) - 1, 16), np.arange(len(g)), g)
     return v
 
 
@@ -413,7 +417,7 @@ class AdapterSet(nn.Module):
                                   for t in cfg.svf_targets}) if cfg.has_svf else nn.ModuleDict()
         self.dense = nn.ModuleDict({k: DenseDelta(i, o) for k, _, i, o in dense_specs(cfg)}) if cfg.has_dense \
             else nn.ModuleDict()
-        cond = cfg.dim if cfg.film_source == "memory" else cfg.error_dim
+        cond = cfg.error_dim if cfg.film_source == "error" else cfg.dim
         self.film = nn.ModuleDict({str(b): FiLMHead(cond, cfg.dim, cfg.film_rank) for b in cfg.block_ids()}) \
             if cfg.has_film else nn.ModuleDict()
 
@@ -516,11 +520,15 @@ def adapted_block_forward(block, block_id, holder, hidden_states, encoder_hidden
     table = block.scale_shift_table
     if aset is not None and ctx.enabled and str(block_id) in aset.adaln:
         table = table + aset.adaln[str(block_id)]
+    film_off = None
     if aset is not None and ctx.enabled and str(block_id) in aset.film:
-        off = _film_offset(hidden_states, aset, ctx, block_id, holder)
+        off = _film_offset(hidden_states, aset, ctx, block_id, holder, encoder_hidden_states)
         if off is not None:
-            table = table + off[:1].to(table.dtype)
+            film_off = off[:1].float()[None]  # (1, 1, 6, dim)
     temb_scale_shift_table = table[None] + temb.float()
+    if film_off is not None:
+        keep = _film_token_mask(ctx, temb_scale_shift_table.shape[1], temb.device)
+        temb_scale_shift_table = temb_scale_shift_table + (film_off if keep is None else film_off * keep)
     shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = \
         rearrange(temb_scale_shift_table, 'b l n c -> b n l c').chunk(6, dim=1)
     shift_msa, scale_msa, gate_msa = shift_msa.squeeze(1), scale_msa.squeeze(1), gate_msa.squeeze(1)
@@ -549,14 +557,35 @@ def adapted_block_forward(block, block_id, holder, hidden_states, encoder_hidden
     return _steer(hidden_states, ctx, block_id)
 
 
-def _film_offset(h, aset, ctx, block_id, holder):
+def _film_token_mask(ctx, n_tokens, device):
+    """(1, L, 1, 1) mask that keeps the FiLM offset off the in-context memory tokens during training. At inference
+    the memory is prefilled into the KV cache without any offset, so training must not modulate it either.
+    None = modulate every token (inference, or training without memory)."""
+    if ctx.segments is None or ctx.ctx_frames <= 0:
+        return None
+    nf = max(ctx.n_frames, 1)
+    keep = torch.ones(n_tokens, device=device)
+    start = 0
+    for n, _ in ctx.segments:
+        keep[start:start + (n // nf) * ctx.ctx_frames] = 0
+        start += n
+    return keep.view(1, -1, 1, 1)
+
+
+def _film_offset(h, aset, ctx, block_id, holder, text=None):
     """FiLM condition for this block. memory: mean of the block-input hidden states of the in-context memory tokens
     (training: clean context frames of the sequence; inference: summed while the server prefills the memory).
     error: the failure vector set by the client/trainer. None -> no offset (no memory / no failure)."""
     head = aset.film[str(block_id)]
+    if aset.cfg.film_source == "text":  # mean over the non-padding text tokens of the conditional prompt
+        if text is None:
+            return None
+        t = text[:1].float()
+        m = (t.abs().sum(-1, keepdim=True) > 0).float()
+        return head((t * m).sum(1) / m.sum(1).clamp(min=1))
     if aset.cfg.film_source == "error":
         e = ctx.film_error
-        return None if e is None else head(e.to(h.device)[None])
+        return None if e is None else head(e.to(h.device)[:aset.cfg.error_dim][None])
     b = str(block_id)
     if ctx.segments is not None:  # training
         if ctx.ctx_frames <= 0:
