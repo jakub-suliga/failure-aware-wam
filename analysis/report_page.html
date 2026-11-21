@@ -76,13 +76,14 @@ video { width: 100%; max-width: 100%; border-radius: 4px; background: #000; disp
 .steps .t { font-weight: 600; font-size: 14px; margin-bottom: 4px } .steps .t::before { content: counter(st) " · "; font-family: var(--mono); color: var(--muted) }
 .steps ul { font-size: 13px }
 .quote { font-size: 13.5px; border-left: 3px solid var(--ctx); padding-left: 10px; color: var(--ink) }
+.jvids{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px;margin-top:10px}.jvids figure{margin:0}.jvids video{width:100%;border-radius:8px;display:block}.jvids figcaption{font-size:13px;margin-top:4px;color:var(--muted,inherit)}
 </style>
 
 <div class="wrap">
 <header>
   <h1>Failure-Aware WAM</h1>
   <div class="sub" id="stamp"></div>
-  <nav><a href="#uebersicht">Stand, Plan &amp; Varianten</a><a href="#log">Probleme &amp; Analysen</a><a href="#training">Training &amp; VLM</a><a href="#paper">Paper</a></nav>
+  <nav><a href="#uebersicht">Stand, Plan &amp; Varianten</a><a href="#log">Probleme &amp; Analysen</a><a href="#training">Training &amp; VLM</a><a href="#paper">Paper</a><a href="#v2">Plan v2 (p20–p22)</a></nav>
 </header>
 
 <div class="view" id="view-uebersicht">
@@ -158,12 +159,37 @@ video { width: 100%; max-width: 100%; border-radius: 4px; background: #000; disp
 <div class="view" id="view-variante" hidden>
 <section id="detail"><div class="cap" id="dnav" style="margin-bottom:10px"></div><h2 id="dname">Detail</h2><div class="detail" id="dbody"></div></section>
 </div>
+<div class="view" id="view-v2" hidden>
+<section id="v2diag">
+  <h2>Diagnose p20</h2>
+  <div class="sub" id="v2stamp"></div>
+  <div class="grid g2">
+    <div class="card"><h3>D2 Basis / D4 perfektes Video (Testaufgabe, 20 Seeds)</h3><div class="tw"><table><thead><tr><th>Einstellung</th><th>Basis scheitert</th><th>tf_replan ok</th></tr></thead><tbody id="v2d2"></tbody></table></div><div class="sub">Schwelle: ≥ 70 % Fehlschläge und ≥ 70 % tf_replan.</div></div>
+    <div class="card"><h3>D3 Experte ab k Chunks vor dem Greifer-Schließen</h3><div class="tw"><table><thead><tr><th>Einstellung</th><th>Fehlversuche</th><th>Experte k=1/2/3</th><th>Policy+tf k=1/2/3</th></tr></thead><tbody id="v2d3"></tbody></table></div></div>
+  </div>
+  <div class="grid g2" style="margin-top:14px"><div class="card"><h3>D1 · D5 · D6 · D7</h3><ul id="v2misc"></ul></div><div class="card"><h3>Einstellungs-Gates</h3><ul id="v2gates"></ul></div></div>
+</section>
+<section id="v2icl">
+  <h2>ICL Stufe 1 p21</h2>
+  <div class="card"><h3>Daten (7 Trainingsaufgaben, Experte ab 1/2/3 Chunks vorher)</h3><ul id="v2data"></ul></div>
+  <div class="tw" style="margin-top:14px"><table class="wraptable"><thead><tr><th>Variante</th><th>Status</th><th>Val-Loss eigen / fremd / ohne</th><th>Negativ-Filter</th><th>Retry ok (Fehlseeds)</th><th>Schaden (Erfolgsseeds)</th><th>fremder Kontext</th><th>Vollauswertung</th></tr></thead><tbody id="v2p21"></tbody></table></div>
+  <div class="sub">Retry = Rücksprung 2 Chunks vor das Greifer-Schließen, Adapter nur im Video-Durchlauf, Kontext + eigene Vergangenheit im KV-Cache. C0 = eigenes Training ohne Kontext.</div>
+</section>
+<section id="v2ttt">
+  <h2>TTT p22</h2>
+  <div class="tw"><table><thead><tr><th>Variante</th><th>Einstellung</th><th>Seeds</th><th>1. Versuch scheitert</th><th>ok nach Retry 1 / 2 / 3</th><th>Lernzeit</th><th>Vollauswertung</th></tr></thead><tbody id="v2p22"></tbody></table></div>
+  <div class="sub">Nur Seeds, deren erster Versuch scheitert. Kontrolle: ttt_retry (gleiche Retries ohne Lernen). Erfolg korrigiert (weggeflogen = Fehlschlag).</div>
+</section>
+</div>
+
 <div class="view" id="view-log" hidden>
 <section id="log">
   <h2>Probleme &amp; Analysen</h2>
   <div class="sub" id="jstamp"></div>
   <h3>Was gerade läuft</h3>
   <div class="tw"><table><thead><tr><th>Schritt</th><th>Status</th></tr></thead><tbody id="jrun"></tbody></table></div>
+  <h3 style="margin-top:18px">Offen &amp; nächste Tests</h3>
+  <div class="tw"><table class="wraptable"><thead><tr><th>Test</th><th>Warum</th><th>Status</th></tr></thead><tbody id="jnext"></tbody></table></div>
   <h3 style="margin-top:18px">Analysen</h3>
   <div class="grid g2" id="jana"></div>
   <h3 style="margin-top:18px">Probleme</h3>
@@ -617,8 +643,8 @@ const BY = Object.fromEntries(CAT.map(e => [slug(e.k), e]));
 const pick = k => { location.hash = "v-" + slug(k); };
 function route() {
   const h = (location.hash || "#uebersicht").slice(1), isV = h.startsWith("v-") && BY[h.slice(2)];
-  const show = isV ? "variante" : ["training", "paper", "log"].includes(h) ? h : "uebersicht";
-  for (const v of ["uebersicht", "variante", "training", "paper", "log"]) document.getElementById("view-" + v).hidden = v != show;
+  const show = isV ? "variante" : ["training", "paper", "log", "v2"].includes(h) ? h : "uebersicht";
+  for (const v of ["uebersicht", "variante", "training", "paper", "log", "v2"]) document.getElementById("view-" + v).hidden = v != show;
   if (isV) { sel = BY[h.slice(2)].k; detail(); window.scrollTo(0, 0); } else rows();
 }
 window.addEventListener("hashchange", route);
@@ -715,7 +741,8 @@ function detail() {
   const J = R.journal || {}, st = x => `<span class="pill ${/erledigt/.test(x) ? "ok" : ""}">${esc(x)}</span>`;
   document.getElementById("jstamp").textContent = J.updated ? `Stand: ${J.updated}` : "";
   document.getElementById("jrun").innerHTML = (J.running || []).map(r => `<tr><td>${esc(r.s)}</td><td>${st(r.st)}</td></tr>`).join("") || `<tr><td colspan="2">–</td></tr>`;
-  document.getElementById("jana").innerHTML = (J.analyses || []).map(a => `<div class="card"><h3>${esc(a.t)}</h3><ul>${a.b.map(x => `<li>${esc(x)}</li>`).join("")}</ul></div>`).join("");
+  document.getElementById("jana").innerHTML = (J.analyses || []).map(a => `<div class="card"><h3>${esc(a.t)}</h3><ul>${a.b.map(x => `<li>${esc(x)}</li>`).join("")}</ul>${(a.v || []).filter(v => v.src).length ? `<div class="jvids">${a.v.filter(v => v.src).map(v => `<figure><video controls muted loop playsinline preload="metadata" src="${v.src}"></video><figcaption>${esc(v.cap)}</figcaption></figure>`).join("")}</div>` : ""}</div>`).join("");
+  document.getElementById("jnext").innerHTML = (J.next || []).map(x => `<tr><td><b>${esc(x.t)}</b></td><td>${esc(x.why)}</td><td>${st(x.st)}</td></tr>`).join("") || `<tr><td colspan="3">–</td></tr>`;
   document.getElementById("jprob").innerHTML = (J.problems || []).map(p => `<tr><td><b>${esc(p.p)}</b></td><td>${esc(p.why)}</td><td>${esc(p.fix)}</td><td>${st(p.status)}</td></tr>`).join("");
   const MN = {"Qwen_Qwen3-VL-8B-Instruct": "Qwen3-VL-8B", "Qwen_Qwen3-VL-32B-Instruct": "Qwen3-VL-32B", "sii-rhos-ai_ViFailback-8B": "ViFailback-8B",
     "MINT-SJTU_RoboFAC-7B": "RoboFAC-7B", "nvidia_Cosmos-Reason1-7B": "Cosmos-Reason1-7B"};
@@ -723,6 +750,25 @@ function detail() {
   const rows = (R.vlm_bench || []).filter(r => PN[r.variant] && MN[r.model]);
   const p = x => x == null ? "–" : Math.round(100 * x) + " %";
   document.getElementById("jvlm").innerHTML = rows.map(r => `<tr><td>${esc(MN[r.model])}</td><td>${esc(PN[r.variant])}</td><td class="num">${r.n}</td><td class="num">${r.errors || "–"}</td><td class="num">${p(r.type)}</td><td class="num">${p(r.lower)}</td><td class="num">${p(r.lower_false)}</td></tr>`).join("") || `<tr><td colspan="7">Noch keine Daten.</td></tr>`;
+})();
+// ---------------------------------------------------------------- plan v2 (p20 diagnosis, p21 ICL, p22 TTT)
+(function () {
+  const V = R.v2 || {}, fr = (k, n) => n ? `${k}/${n} (${Math.round(100 * k / n)} %)` : "–", pr = x => x && x[1] ? fr(x[0], x[1]) : "–";
+  const f3 = x => x == null ? "–" : (+x).toFixed(4), gt = g => !g ? "–" : g.passed ? `<span class="pill ok">bestanden</span>` : `<span class="pill">nicht bestanden</span>`;
+  document.getElementById("v2stamp").textContent = V.error ? "Fehler: " + V.error : `Jobs p20–p22: ${Object.values(V.jobs || {}).reduce((a, x) => a + x.running, 0)} laufen, ${Object.values(V.jobs || {}).reduce((a, x) => a + x.pending, 0)} warten in SLURM, Queue: p20 ${(V.queued || {}).p20 || 0} · p21 ${(V.queued || {}).p21 || 0} · p22 ${(V.queued || {}).p22 || 0}`;
+  document.getElementById("v2d2").innerHTML = Object.entries(V.d2d4 || {}).map(([c, x]) => `<tr><td>${esc(c)}</td><td class="num">${fr(x.base_fail, x.n)}</td><td class="num">${x.n_tf ? fr(x.tf_ok, x.n_tf) : "–"}</td></tr>`).join("") || `<tr><td colspan="3">läuft</td></tr>`;
+  document.getElementById("v2d3").innerHTML = Object.entries(V.d3 || {}).map(([c, x]) => `<tr><td>${esc(c)}</td><td class="num">${x.failed}</td><td class="num">${[1, 2, 3].map(k => pr(x["expert_k" + k])).join(" · ")}</td><td class="num">${[1, 2, 3].map(k => pr(x["tf_k" + k])).join(" · ")}</td></tr>`).join("") || `<tr><td colspan="4">läuft</td></tr>`;
+  const m = [];
+  const d1 = V.d1; m.push(d1 ? `D1 Aktions-Konditionierung: ${d1.conditioned ? "ja (Prognose)" : "nein (Plan)"} · Vorzeichen folgt ±2 cm in ${Math.round(100 * d1.frac_sign_follows)} % · Latent-Änderung ${(+d1.dlat_z2).toFixed(3)} vs. Rauschen ${(+d1.noise_floor).toFixed(3)} (n=${d1.n})` : "D1 läuft");
+  m.push(V.d5 ? `D5 Leak (S-B, erstes Bild): R² ${esc(JSON.stringify(V.d5["first frame"] || V.d5))}` : "D5 wartet auf die S-B-Daten");
+  m.push(V.d6 ? `D6 Orakel-Phasen: ${V.d6.n} Episoden, ${V.d6.n_with_close} mit Greifer-Schließen` : "D6 wartet auf D2/D3/D4");
+  m.push(V.d7 ? `D7 VLM-Phasen (Qwen3-VL-32B): exakt ${Math.round(100 * V.d7.acc_exact)} %, ±1 Frame ${Math.round(100 * V.d7.acc_tol1)} % (n=${V.d7.answered})` : "D7 wartet auf D6");
+  m.push(V.p7 ? `P7: ${esc(V.p7.note)}` : "P7 wartet auf D1");
+  document.getElementById("v2misc").innerHTML = m.map(x => `<li>${x}</li>`).join("");
+  document.getElementById("v2gates").innerHTML = Object.entries(V.settings || {}).map(([S, g]) => `<li>${S == "sa" ? "S-A Tisch ±3–6 cm" : "S-B Versatz y (x) ±3–5 cm"}: ${g ? `${gt(g)} · Basis scheitert ${Math.round(100 * g.base_fail_rate)} % (n=${g.n_base}) · tf_replan ${Math.round(100 * g.tf_replan_rate)} % (n=${g.n_tf})` : "wartet auf D2/D4"}</li>`).join("");
+  document.getElementById("v2data").innerHTML = Object.entries(V.data || {}).map(([S, d]) => `<li>${S == "sa" ? "S-A" : "S-B"}: ${d.attempts} Versuche, ${d.failed} gescheitert · Experte erfolgreich ${Object.entries(d.expert_by_k || {}).map(([k, x]) => `${k}: ${fr(x[0], x[1])}`).join(", ")} · <b>${d.pairs} Paare</b> (${d.pairs_fail} aus Fehlversuchen; Vorzeichen −/+ ${d.by_sign["-1"]}/${d.by_sign["1"]})</li>`).join("");
+  document.getElementById("v2p21").innerHTML = (V.p21 || []).map(r => `<tr><td><b>${esc(r.name.replace("p21_", ""))}</b></td><td>${esc(r.status)}</td><td class="num">${r.val ? `${f3(r.val.val_video_own)} / ${f3(r.val.val_video_foreign)} / ${f3(r.val.val_video_none)} (Schritt ${r.val.step})` : "–"}</td><td>${r.filter ? gt(r.filter) : "–"}</td><td class="num">${pr(r.retry)}</td><td class="num">${pr(r.harm)}</td><td class="num">${pr(r.foreign)}</td><td>${r.full ? gt(r.full) + ` ${Math.round(r.full.diff_pp)} pp` : "–"}</td></tr>`).join("");
+  document.getElementById("v2p22").innerHTML = (V.p22 || []).map(r => `<tr><td>${esc(r.method)}</td><td>${esc(r.config)}</td><td class="num">${r.seeds}</td><td class="num">${r.first_fail}</td><td class="num">${r.first_fail ? r.retry_ok.map(k => Math.round(100 * k / r.first_fail) + " %").join(" / ") + ` (${r.retry_ok[2]}/${r.first_fail})` : "–"}</td><td class="num">${r.learn_s == null ? "–" : Math.round(r.learn_s) + " s"}</td><td>${r.full ? gt(r.full) + ` ${Math.round(r.full.diff_pp)} pp` : "–"}</td></tr>`).join("") || `<tr><td colspan="7">läuft</td></tr>`;
 })();
 stand();
 route();

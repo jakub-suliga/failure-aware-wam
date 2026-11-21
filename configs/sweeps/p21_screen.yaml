@@ -1,0 +1,203 @@
+# p21 ICL stage 1 screening on the TEST task (plan v2 2.7): attempt 1 = base under the hidden parameter (S-A table
+# +-3..6 cm / S-B lateral offset, sign by seed parity -> 20 seeds per sign in 40); failed attempts are rewound to 2
+# chunks before the gripper closed and retried with the variant's adapter + context + own past (fawam client
+# _icl_rewind); base successes get the same retry (harm). Methods are submitted by cluster/pipeline_v2.py only after
+# their negative filter passed (C0 always). Full evaluation: --episodes 54 (27 per sign) with C0 and _foreign.
+name: p21_screen
+out: results/sweeps/p21_screen
+episodes: 40
+per_job: 8
+n_par: 2
+time: 02:30:00
+seed_offset: 0
+tasks:
+- move_playingcard_away
+configs:
+- icl_sa
+- icl_sb
+methods:
+- icl2_sa_A1_C0
+- icl2_sa_A1_C0_foreign
+- icl2_sa_A1_C1
+- icl2_sa_A1_C1_foreign
+- icl2_sa_A1_C2
+- icl2_sa_A1_C2_foreign
+- icl2_sa_A1_C3
+- icl2_sa_A1_C3_foreign
+- icl2_sa_A2_C2
+- icl2_sa_A2_C2_foreign
+- icl2_sa_A3_C2
+- icl2_sa_A3_C2_foreign
+- icl2_sb_A1_C0
+- icl2_sb_A1_C0_foreign
+- icl2_sb_A1_C1
+- icl2_sb_A1_C1_foreign
+- icl2_sb_A1_C2
+- icl2_sb_A1_C2_foreign
+- icl2_sb_A1_C3
+- icl2_sb_A1_C3_foreign
+- icl2_sb_A2_C2
+- icl2_sb_A2_C2_foreign
+- icl2_sb_A3_C2
+- icl2_sb_A3_C2_foreign
+- icl2_sb_A1_C4
+- icl2_sb_A1_C4_foreign
+- icl2_sb_A1_C5
+- icl2_sb_A1_C5_foreign
+- icl2_sb_A1_C6
+- icl2_sb_A1_C6_foreign
+- icl2_sb_A1_C7
+- icl2_sb_A1_C7_foreign
+- icl2_sb_A1_C8
+- icl2_sb_A1_C8_foreign
+- icl2_sb_A1_C2_win50
+- icl2_sb_A1_C2_win50_foreign
+- icl2_sb_A1_C2_w4
+- icl2_sb_A1_C2_w4_foreign
+- icl2_sb_T1_C2
+- icl2_sb_T1_C2_foreign
+- icl2_sb_T2_C2
+- icl2_sb_T2_C2_foreign
+- icl2_sb_T4_C2
+- icl2_sb_T4_C2_foreign
+- icl2_sb_T5_C2
+- icl2_sb_T5_C2_foreign
+method_overrides:
+  icl2_sa_A1_C0:
+    configs:
+    - icl_sa
+  icl2_sa_A1_C0_foreign:
+    configs:
+    - icl_sa
+  icl2_sa_A1_C1:
+    configs:
+    - icl_sa
+  icl2_sa_A1_C1_foreign:
+    configs:
+    - icl_sa
+  icl2_sa_A1_C2:
+    configs:
+    - icl_sa
+  icl2_sa_A1_C2_foreign:
+    configs:
+    - icl_sa
+  icl2_sa_A1_C3:
+    configs:
+    - icl_sa
+  icl2_sa_A1_C3_foreign:
+    configs:
+    - icl_sa
+  icl2_sa_A2_C2:
+    configs:
+    - icl_sa
+  icl2_sa_A2_C2_foreign:
+    configs:
+    - icl_sa
+  icl2_sa_A3_C2:
+    configs:
+    - icl_sa
+  icl2_sa_A3_C2_foreign:
+    configs:
+    - icl_sa
+  icl2_sb_A1_C0:
+    configs:
+    - icl_sb
+  icl2_sb_A1_C0_foreign:
+    configs:
+    - icl_sb
+  icl2_sb_A1_C1:
+    configs:
+    - icl_sb
+  icl2_sb_A1_C1_foreign:
+    configs:
+    - icl_sb
+  icl2_sb_A1_C2:
+    configs:
+    - icl_sb
+  icl2_sb_A1_C2_foreign:
+    configs:
+    - icl_sb
+  icl2_sb_A1_C3:
+    configs:
+    - icl_sb
+  icl2_sb_A1_C3_foreign:
+    configs:
+    - icl_sb
+  icl2_sb_A2_C2:
+    configs:
+    - icl_sb
+  icl2_sb_A2_C2_foreign:
+    configs:
+    - icl_sb
+  icl2_sb_A3_C2:
+    configs:
+    - icl_sb
+  icl2_sb_A3_C2_foreign:
+    configs:
+    - icl_sb
+  icl2_sb_A1_C4:
+    configs:
+    - icl_sb
+  icl2_sb_A1_C4_foreign:
+    configs:
+    - icl_sb
+  icl2_sb_A1_C5:
+    configs:
+    - icl_sb
+  icl2_sb_A1_C5_foreign:
+    configs:
+    - icl_sb
+  icl2_sb_A1_C6:
+    configs:
+    - icl_sb
+  icl2_sb_A1_C6_foreign:
+    configs:
+    - icl_sb
+  icl2_sb_A1_C7:
+    configs:
+    - icl_sb
+  icl2_sb_A1_C7_foreign:
+    configs:
+    - icl_sb
+  icl2_sb_A1_C8:
+    configs:
+    - icl_sb
+  icl2_sb_A1_C8_foreign:
+    configs:
+    - icl_sb
+  icl2_sb_A1_C2_win50:
+    configs:
+    - icl_sb
+  icl2_sb_A1_C2_win50_foreign:
+    configs:
+    - icl_sb
+  icl2_sb_A1_C2_w4:
+    configs:
+    - icl_sb
+  icl2_sb_A1_C2_w4_foreign:
+    configs:
+    - icl_sb
+  icl2_sb_T1_C2:
+    configs:
+    - icl_sb
+  icl2_sb_T1_C2_foreign:
+    configs:
+    - icl_sb
+  icl2_sb_T2_C2:
+    configs:
+    - icl_sb
+  icl2_sb_T2_C2_foreign:
+    configs:
+    - icl_sb
+  icl2_sb_T4_C2:
+    configs:
+    - icl_sb
+  icl2_sb_T4_C2_foreign:
+    configs:
+    - icl_sb
+  icl2_sb_T5_C2:
+    configs:
+    - icl_sb
+  icl2_sb_T5_C2_foreign:
+    configs:
+    - icl_sb

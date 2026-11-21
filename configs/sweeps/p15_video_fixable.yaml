@@ -1,0 +1,14 @@
+# p15 (video plan 2026-11-20, step 0): which failure types can be fixed through the VIDEO alone? Like p13 tf_replan
+# (planner re-run from the current state before every chunk, its frames replace the imagined chunk; only the model's
+# own actions are executed) for each failure type on move_playingcard_away, plus the base model on the same seeds.
+# Criterion: video-fixable if tf_replan solves >= 70 %. Table height is covered by p13 (not repeated).
+# hid: the oracle look-ahead pre-compensates the hidden offset, so the video shows the CORRECT motion.
+name: p15_video_fixable
+out: results/sweeps/p15_video_fixable
+episodes: 27
+per_job: 9
+n_par: 3
+time: "01:30:00"
+tasks: [move_playingcard_away]
+configs: [hid_trans_z, dist_objxy10, dist_objyaw90, dist_cam05, dist_robot10, dist_objsize30]
+methods: [base, tf_replan]

@@ -122,7 +122,7 @@ def cell_episodes(sweep, method, setting):
     for kind in ("success", "fail"):
         d = base / kind / TEST_TASK
         if d.exists():
-            for ep in sorted(d.iterdir()):
+            for ep in sorted(x for x in d.iterdir() if "_snap_" not in x.name):  # plan v2 snap continuations
                 if (ep / "episode.h5").exists():
                     try:
                         out.append((ep, episode_record(ep)))
@@ -390,12 +390,50 @@ def cluster_status():
                 cron=cron, stages=stages, gates=gates)
 
 
+def journal_videos(journal, media):
+    """Analyses in analysis/journal.json may list example episodes: "v": [{"ep": <episode dir>, "cap": ...}].
+    Each becomes media/j_<sweep>_<method>_<setting>_<seed>.mp4 (same 2x2 layout as the samples), "src" is filled in."""
+    names = set()
+    for a in (journal or {}).get("analyses", []):
+        for v in a.get("v", []):
+            if v.get("file"):  # a prebuilt video (e.g. analysis/p15_ownpred/*.mp4), copied as is
+                src = ROOT / v["file"]
+                name = "j_" + "_".join(Path(v["file"]).with_suffix("").parts[-2:]) + ".mp4"
+                if src.exists():
+                    if not (media / name).exists() or (media / name).stat().st_mtime < src.stat().st_mtime:
+                        (media / name).write_bytes(src.read_bytes())
+                    v["src"] = f"media/{name}"
+                    names.add(name)
+                continue
+            ep = ROOT / v["ep"]
+            parts = ep.relative_to(ROOT / "results/sweeps").parts
+            name = "j_" + "_".join([parts[0], parts[1], parts[2].replace("table_h_", ""), ep.name.split("_", 1)[1]]) + ".mp4"
+            try:
+                arm = episode_record(ep).get("arm")
+            except Exception:
+                arm = None
+            if make_video(ep, arm, media / name):
+                v["src"] = f"media/{name}"
+                names.add(name)
+    return names
+
+
 def _json(p):
     """problems / analyses / running work (analysis/journal.json, written by hand) and the VLM benchmark summary"""
     try:
         return json.loads(Path(p).read_text())
     except (OSError, ValueError):
         return None
+
+
+def _v2():
+    """Plan v2 (p20 diagnosis, p21 ICL stage 1, p22 TTT) tables, fawam/gates_v2.summary()."""
+    try:
+        from fawam import gates_v2
+        return json.loads(json.dumps(gates_v2.summary(), default=float))
+    except Exception as e:
+        print(f"v2 summary failed: {e!r}")
+        return dict(error=repr(e))
 
 
 def main():
@@ -450,12 +488,14 @@ def main():
     (out / "attention_todo.txt").write_text("\n".join(todo) + ("\n" if todo else ""))
     for _, s in allsamples:
         s.pop("ep", None)
+    journal = _json(ROOT / "analysis" / "journal.json")
+    used |= journal_videos(journal, media)
     for f in media.glob("*.mp4"):
         if f.name not in used:
             f.unlink()
     data = dict(generated=time.strftime("%Y-%m-%d %H:%M"), test_task=TEST_TASK, variants=variants,
                 training=training_curves(), vlm_vs_oracle=vlm_vs_oracle(), status=cluster_status(),
-                journal=_json(ROOT / "analysis" / "journal.json"), vlm_bench=_json(ROOT / "results/vlm_bench/summary.json"))
+                journal=journal, vlm_bench=_json(ROOT / "results/vlm_bench/summary.json"), v2=_v2())
     (out / "report.json").write_text(json.dumps(data, indent=1))
     (out / "data.js").write_text("window.REPORT = " + json.dumps(data) + ";\n")
     page = ROOT / "analysis" / "report_page.html"

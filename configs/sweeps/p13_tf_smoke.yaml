@@ -1,0 +1,10 @@
+# p13 smoke: teacher forcing with an oracle future (fawam/teacher_force.py) runs? restore exact? 2 episodes, -5 cm.
+name: p13_tf_smoke
+out: results/sweeps/p13_tf_smoke
+episodes: 2
+per_job: 2
+n_par: 2
+time: "00:45:00"
+tasks: [move_playingcard_away]
+configs: [table_h_m05]
+methods: [tf_oracle]

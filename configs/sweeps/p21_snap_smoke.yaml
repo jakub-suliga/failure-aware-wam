@@ -1,0 +1,14 @@
+# smoke for the snap driver (plan v2): test task with expert + tf continuations, one training task (S-B) expert only
+name: p21_snap_smoke
+out: results/_smoke/p21_snap
+driver: snap
+episodes: 2
+per_job: 2
+n_par: 1
+time: "01:00:00"
+tasks: [move_playingcard_away, place_mouse_pad]
+configs: [hid_y_p5, icl_sb]
+methods: [base]
+method_overrides:
+  base: {}
+extra_env: {FAWAM_SNAP_MODES: "expert+tf"}

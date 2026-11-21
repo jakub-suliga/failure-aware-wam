@@ -1,47 +1,119 @@
 {
- "updated": "2026-11-18 21:00",
+ "updated": "2026-11-21 16:10",
  "problems": [
   {
-   "p": "Keine GPU vor dem Ausfall",
-   "why": "Normale GPU-Partitionen voll: Startschätzung für unsere ältesten Jobs 20.11. 01:50, für neue Jobs 23.11.–30.11.; Dev-Knoten hkn0901 nicht verfügbar.",
-   "fix": "Alles eingereiht und Code fertig, damit jede GPU-Minute genutzt wird; andere GPU-Maschine wäre die Alternative.",
-   "status": "offen"
+   "p": "p15 hid_trans_z: 0 Episoden",
+   "why": "fawam/hid_offset.py: TYPES enthielt 'trans_z' nicht → AssertionError beim Start (beide Jobs).",
+   "fix": "TYPES erweitert (trans_z, lat, fixed). p15 hid_trans_z nicht neu eingereicht (Plan v2 ersetzt Schritt 0).",
+   "status": "behoben"
+  },
+  {
+   "p": "9 Jobs von D2/D4 nach 2 min abgebrochen (21.11. 15:24)",
+   "why": "Versions-Race: die Server luden methods.py, während neue Method-Felder ergänzt wurden; der Client schickte die neuen Felder.",
+   "fix": "Neu eingereicht (139153–161); Code-Änderungen ab da atomar (tmp + rename), keine neuen Method-Felder mehr.",
+   "status": "behoben"
+  },
+  {
+   "p": "Snap-Smoke: tf-Fortsetzung lief nicht",
+   "why": "FAWAM_SNAP_MODES='expert,tf' – das Komma zerlegt sbatch --export.",
+   "fix": "Trenner '+', D3-Queue-Einträge umgeschrieben, Nach-Smoke p20_d3_smoke.",
+   "status": "behoben, Smoke läuft"
+  },
+  {
+   "p": "Karte: Greifer schließt schon in Chunk 2",
+   "why": "k = 3 Chunks vor dem Schließen liegt vor dem Episodenstart.",
+   "fix": "Reset-Punkt 0 erlaubt (Vergangenheit leer = volle Experten-Episode); im Test k = 2 → Reset bei Chunk 1.",
+   "status": "behoben"
+  },
+  {
+   "p": "Evals mit VLM-Detail-Text abgebrochen (20.11.)",
+   "why": "Der Prompt wird als Ordnername für Visualisierungen benutzt (wan_va_server._reset); der lange Detail-Text überschritt das 255-Byte-Limit → OSError. Betroffen: alle Kontext-Varianten von p8s (24 Jobs) und 2 von p8c (12 Jobs).",
+   "fix": "Ordnername gekürzt + Hash; fehlende Zellen neu eingereicht 21.11. 06:25.",
+   "status": "behoben, läuft neu"
+  },
+  {
+   "p": "p15: neue Konfigurationen fehlten",
+   "why": "hid_trans_z.yml und dist_objsize30.yml lagen nur in configs/, nicht in RoboTwin/task_config/ (setup.sh kopiert sie).",
+   "fix": "Kopiert, 12 Jobs + Smoke neu eingereicht.",
+   "status": "behoben, läuft neu"
+  },
+  {
+   "p": "LingBot-VA hat keinen getrennten Video-Expert",
+   "why": "Video- und Aktions-Tokens laufen durch dieselben 30 Blöcke (wan_va/modules/model.py: ein self.blocks, nur Embedder, Zeit-Konditionierung und Ausgabe-Kopf sind pro Modus getrennt). Der Plan verlangt 'nur Parameter des Video-Expert trainierbar'.",
+   "fix": "Vorschlag: Adapter (LoRA/FiLM/Cross-Attention), die nur im Video-Durchlauf aktiv sind (action_mode=False). Die geteilten Gewichte bleiben eingefroren, der Aktions-Durchlauf rechnet unverändert, sieht aber die durch den Adapter veränderten Video-K/V im Cache. Entscheidung beim Nutzer.",
+   "status": "offen (Nutzer)"
+  },
+  {
+   "p": "P8c: kleine Kontexte beim ungesehenen Fehlertyp",
+   "why": "Gleiche Daten, gleicher Adapter (LoRA r16) und gleiche VLM-Texte wie p8t, nur der Kontext ist kleiner: (1) echt − vorgestellt im Fenster um den Fehler, (2) dasselbe + echt, (3) vorgestellt + echt im Fenster, (4) 6 Frames mit höchstem Vorhersagefehler, (5) wie 1 mit detailliertem VLM-Text inkl. Fix-Satz, (6) nur der detaillierte VLM-Text.",
+   "fix": "6 Trainings eingereiht 20.11. 10:01 (137739–744); danach Eval p8c_small_ctx automatisch, jede Variante mit und ohne Kontext. Kontrolle mit fremdem Fehlversuch entfällt: bei der Testaufgabe scheitern alle Seeds gleich (zu hoch gegriffen), der fremde Versuch wäre fast derselbe.",
+   "status": "Eval läuft"
+  },
+  {
+   "p": "hid-Trainings nach <1 min abgestürzt (19.11. 22:53 und 20.11. 04:05)",
+   "why": "M3: Das Erfolgs-Flag in den Daten ist ein Bool, train_hid verglich es mit dem Text \"True\" → 0 Trainingspaare. LoRA (C1): Konfiguration „combo“ ohne LoRA-Schalter → 0 trainierbare Parameter.",
+   "fix": "Vergleich korrigiert (580 Paare), LoRA-Konfiguration auf „lora“ gestellt; Pipeline-Stufen zurückgesetzt, neu gestartet 20.11. 09:46 (Jobs 137719, 137720).",
+   "status": "erledigt (behoben, Trainings liefen 20.11.)"
+  },
+  {
+   "p": "hid Leak-Test knapp nicht bestanden",
+   "why": "Der Versatz o ist im ersten Bild schwach ablesbar: R² x 0,105 / y 0,04 / z 0,121 (Ziel < 0,1). Im Fehlerfenster gut ablesbar (z 0,57), das Signal ist also da.",
+   "fix": "Entscheidung 19.11.: Grenze auf 0,15 gelockert und testen. Die Kontrollen ohne Kontext und mit gemischtem Kontext zeigen, ob das Modell o aus dem ersten Bild liest. Wenn ja: Ursache suchen.",
+   "status": "zurückgestellt (hid hängt an Schritt 0)"
+  },
+  {
+   "p": "Oracle-Video springt bei großem Abstand zum Expertenpfad (p13)",
+   "why": "Der aufgezeichnete Expertenpfad wird nur ab dem nächstgelegenen Punkt abgespielt; bei −10 cm liegt der Roboter ~4 cm daneben.",
+   "fix": "tf_replan: Planer läuft vor jedem Chunk ab dem aktuellen Zustand neu. Nebenbei: Snapshot setzt jetzt auch den Python-Greiferwert zurück (fehlte, Einfluss gering).",
+   "status": "erledigt (tf_replan)"
+  },
+  {
+   "p": "hid-Jobs nach 45 s abgestürzt (19.11. 00:22–00:43)",
+   "why": "Alle 41 Jobs (Smoke + Daten) bekamen nachts eine GPU, aber fawam/hid_offset.py patchte Base_Task.setup_demo; das gibt es nur in den Aufgaben-Unterklassen → AttributeError beim Start des Clients.",
+   "fix": "Hook auf Base_Task._init_task_env_ umgestellt (wird von jedem setup_demo mit dem Seed aufgerufen); 6 Smoke- und 35 Daten-Jobs um 08:10 neu eingereiht.",
+   "status": "erledigt"
+  },
+  {
+   "p": "Wartung HoreKa am 23.11.",
+   "why": "Wartung ist am 23.11. (nicht 20.11.). Alles soll vorher durchlaufen.",
+   "fix": "Angehaltene P7d- und p0s-Jobs am 19.11. freigegeben (mit niedrigerer Priorität, damit hid und p14 zuerst laufen).",
+   "status": "Evals laufen; Zeitlimits auf 2:30 / 3 h gesenkt"
   },
   {
    "p": "Daten lehren keinen Kontext-Gebrauch",
    "why": "In allen bisherigen Daten ist der Fehler im aktuellen Bild sichtbar oder die Korrektur immer gleich: Validierungs-Loss mit Kontext ≥ ohne Kontext, der Adapter lernt die Korrektur auswendig.",
    "fix": "Datensatz hid: pro Seed ein unsichtbarer Kalibrier-Offset o, nur aus dem Fehlversuch erkennbar (PLAN_HID.md).",
-   "status": "in Arbeit"
+   "status": "offen: hid hat es nicht gelöst (C2 ohne Effekt)"
   },
   {
    "p": "P7c-Störungen erzeugen kaum Fehlschläge",
    "why": "Licht, Hintergrund, Clutter, Objektposition 5 cm und Drehung ±60° geben nur 1–10 % Fehlschläge (27 insgesamt). Das Basismodell ist darauf schon randomisiert trainiert.",
    "fix": "Das Training mit „7 Typen“ bestand zu 86 % aus P7b-Daten. Neuer Datensatz P7d mit stärkeren Störungen.",
-   "status": "in Arbeit"
+   "status": "erledigt (P7d gesammelt)"
   },
   {
    "p": "Schwere Objekte und schwacher Greifer wirken nicht",
    "why": "Masse ×10–40: 2 Fehlschläge, Greifkraft ×0,15: 4 Fehlschläge (je ~84 Episoden). Die Patches greifen laut Log, aber der Griff in der Simulation bleibt stabil.",
    "fix": "Beide Störungen gestrichen; Objektposition ±10 cm und Drehung ±90° werden auf 36 Episoden pro Aufgabe aufgefüllt.",
-   "status": "in Arbeit"
+   "status": "erledigt (nur Position/Drehung aufgefüllt)"
   },
   {
    "p": "VLM-Text ist fast immer gleich",
    "why": "„The left arm failed to grasp the box“: kein Hinweis, dass der Greifer zu hoch ist, kein Fix. Für das Modell ist der Kontext damit fast konstant.",
    "fix": "Neuer VLM-Modus „detail“ (Phase, wo der Greifer beim Schließen war, was das Objekt tat, ein Fix-Satz). Dazu Test fein-getunter Fehler-VLMs.",
-   "status": "in Arbeit"
+   "status": "Test läuft (Detail-Text in P8c und p8s)"
   },
   {
    "p": "Kontext wird oft nicht genutzt",
    "why": "Mit und ohne Kontext gleich gut: Der Adapter lernt die Korrektur selbst, ohne den Kontext zu lesen.",
    "fix": "Mehr verschiedene Fehlertypen (P7d) und Basismodell mittrainieren (wie WAM-TTT, Option --train_base).",
-   "status": "in Arbeit"
+   "status": "Test läuft (P8c kleine Kontexte, p8s Basis mittrainiert)"
   },
   {
    "p": "VLM-Benchmark: Anfragen an den falschen Server",
    "why": "Mehrere Jobs auf einem Knoten nutzten alle Port 8001, 40–58 von 105 Anfragen bekamen 404. Gültige Antworten sind korrekt (Modellname muss passen).",
    "fix": "Port pro Job (auch im VLM-Analyse-Job), fehlgeschlagene Anfragen werden wiederholt.",
-   "status": "in Arbeit"
+   "status": "erledigt (Port pro Job)"
   },
   {
    "p": "Pipeline tickt nicht automatisch",
@@ -51,9 +123,9 @@
   },
   {
    "p": "Job-Limit 100 pro Account",
-   "why": "21 angehaltene p0s_task_screen-Jobs belegen Plätze.",
+   "why": "Die p0s-Jobs sind inzwischen gelaufen (19 fertig, 2 Zeitlimit).",
    "fix": "Abbrechen, wenn nicht mehr gebraucht.",
-   "status": "offen (Nutzer)"
+   "status": "erledigt"
   },
   {
    "p": "Cosmos-Reason2 nicht ladbar",
@@ -70,13 +142,145 @@
  ],
  "analyses": [
   {
+   "t": "Plan v2: Smoke-Tests 21.11.",
+   "b": [
+    "TTT (hid y +5 cm, 1 Seed): P0, LoRA, P2, P3, P4, Dual-Site laufen bis Retry 3/4 ohne Fehler. Lerner: 50 Schritte ≈ 75 s; Adapter+ nur im Video-Durchlauf 47,9 M Parameter, LoRA r16 (nur Video) 11,8 M.",
+    "P2: Adapter-Stärke pro Chunk = normierter Vorhersagefehler des letzten Versuchs (gemessen 0,0–1,0). P3: im Fehlerfenster 8 Video-Pläne, gewählt der am weitesten von der Realität des Fehlversuchs.",
+    "Snapshot-Treiber: Testaufgabe unter Versatz y +5 cm, Basis scheitert; Experte ab 1 und 2 Chunks vor dem Greifer-Schließen erfolgreich (Schließen in Chunk 2).",
+    "ICL-Datensatz: Kontexte C0–C8 bauen korrekt ([Kontext 7 Frames je Gruppe | eigene Vergangenheit | Experten-Fortsetzung], Loss nur auf der Fortsetzung). Rewind-Retry mit Null-Adapter läuft als Smoke.",
+    "Code-Check im Dev-Job (cluster/dev_check.sh): Kompilieren, Importe, Gates, Datensatz (C0–C8 × Kontext-Modi × Gates × Chunk-Ziehung) ok; TTT-Lerner mit P5-Hinge und Video-LoRA ok; Trainings A3 (126 M Parameter) und T4 (48 M) laufen. Gefunden und behoben: Absturz, wenn unter den Validierungs-Seeds kein Fehlversuch ist."
+   ]
+  },
+  {
+   "t": "Schritt 0 (p15): Welche Fehler behebt das Planer-Video? (4 von 6 Typen fertig)",
+   "b": [
+    "move_playingcard_away, 27 Seeds, Erfolg korrigiert. Basis | Planer-Video: Objektposition ±10 cm 25/27 | 22/27 · Drehung ±90° 27/27 | 25/27 · Kamera 23/27 | 21/27 · Startpose 14/27 | 18/27.",
+    "Auf dieser Aufgabe erzeugen Objektposition, Drehung und Kamera kaum Fehlschläge (0–4 von 27). Damit ist dort nicht messbar, ob das Video sie behebt.",
+    "Startpose: Von 13 Fehlschlägen der Basis löst das Planer-Video 6 (46 %, unter der 70-%-Schwelle).",
+    "Auffällig: Wo die Basis schon gelingt, verliert das Planer-Video 2–4 von 23–27. Das fremde Video stört den Aktionsteil also etwas.",
+    "hid nur z und Objektgröße liefen nicht (Konfigurationsdateien fehlten in RoboTwin/task_config) → behoben, neu eingereicht 21.11. 06:25.",
+    "Vorläufiges Fazit: Außer Tisch erfüllt bisher kein Typ das Kriterium. Für Objektposition, Drehung und Kamera müsste Schritt 0 auf den Trainingsaufgaben laufen, wo sie öfter scheitern; dafür fehlt der Neuplaner für diese Aufgaben."
+   ]
+  },
+  {
+   "t": "P8c kleine Kontexte: kein Kontext-Gebrauch",
+   "b": [
+    "Gelöste Fehlversuche bei −5 cm, mit gegen ohne Kontext (gleicher Adapter): Differenzkarte im Fenster 10/25 gegen 13/23 · + echtes Bild 9/24 gegen 16/27 · vorgestellt + echt im Fenster 10/24 gegen 12/27 · 6 Keyframes 9/27 gegen 12/27. Kein Fisher-Test mit Kontext besser (p 0,69–0,97).",
+    "−10 cm: alle 0–1/30.",
+    "Ohne Kontext lösen diese Adapter bei −5 cm 44–59 %, mehr als die p8t-LoRA ohne Kontext (2/29). Die Gewinne kommen aus dem Adapter selbst, nicht aus dem Fehlversuch.",
+    "Die beiden Varianten mit Detail-Text (Kontext) brachen ab (zu langer Dateiname) → behoben, neu eingereicht. Ohne Kontext: 8/26 und 4/27.",
+    "Fazit: Kleinerer Kontext macht den Fehlversuch nicht nutzbar; das p8t-Ergebnis (11/25 gegen 2/29) wiederholt sich so nicht."
+   ]
+  },
+  {
+   "t": "p8s mehr Fehlschläge (P7b+c+d): erst Kontrollen fertig",
+   "b": [
+    "Ohne Kontext bei −5 cm: LoRA 6/27, LoRA + Basis 1/22, FiLM+Adapter+ 9/29, FiLM+Adapter+ + Basis 3/25; Fine-Tuning mit Basis 3/27. −10 cm 0–1/30.",
+    "Die Varianten mit Kontext brachen am selben Dateinamen-Fehler ab → neu eingereicht 21.11. 06:25."
+   ]
+  },
+  {
+   "t": "Video-Plan, Schritt 0: Wie stellt sich das Basismodell den Griff vor? (−5 cm)",
+   "b": [
+    "6 Seeds bei −5 cm, Basismodell scheitert. Pro Video oben echt, Mitte die eigene Vorstellung des Modells, unten das Planer-Video (p13 tf_replan, gleicher Seed); links Kopfkamera, rechts Handgelenk des greifenden Arms.",
+    "Sichtprüfung an 2 Seeds (10000, 40000): Die Vorstellung zeigt den Griff etwa auf derselben, zu hohen Höhe wie die Realität, aber danach eine angehobene Karte im Greifer. In der Realität bleibt die Karte liegen und das Handgelenk-Bild ist leer.",
+    "Vorläufige Deutung: Das Modell stellt sich die normale Bewegung vor und 'glaubt', dass sie gelingt. Die Vorhersage korrigiert die Höhe nicht. Genau das soll der Video-Plan ändern.",
+    "Einschränkung: Sichtprüfung an Einzelbildern, nicht gemessen. Eine Messung der vorgestellten Greifhöhe kommt mit der Aktions-Sonde (Offline-Gate)."
+   ],
+   "v": [
+    {
+     "file": "analysis/p15_ownpred/seed10000.mp4",
+     "cap": "Seed 10000: echt | Vorstellung | Planer"
+    },
+    {
+     "file": "analysis/p15_ownpred/seed20000.mp4",
+     "cap": "Seed 20000: echt | Vorstellung | Planer"
+    },
+    {
+     "file": "analysis/p15_ownpred/seed30000.mp4",
+     "cap": "Seed 30000: echt | Vorstellung | Planer"
+    },
+    {
+     "file": "analysis/p15_ownpred/seed40000.mp4",
+     "cap": "Seed 40000: echt | Vorstellung | Planer"
+    },
+    {
+     "file": "analysis/p15_ownpred/seed50000.mp4",
+     "cap": "Seed 50000: echt | Vorstellung | Planer"
+    },
+    {
+     "file": "analysis/p15_ownpred/seed60000.mp4",
+     "cap": "Seed 60000: echt | Vorstellung | Planer"
+    }
+   ]
+  },
+  {
+   "t": "hid C2 in der Simulation (p12_hid_c2): kein Effekt",
+   "b": [
+    "3 ungesehene Aufgaben × 30 Seeds, versteckter Versatz. Gelöste Fehlversuche im 2. Versuch: Retry ohne Lernen 2/63 · C2 mit eigenem Fehlversuch 4/65 · C2 ohne Kontext 3/63 · C2 mit fremdem Fehlversuch 3/63.",
+    "Grund: Der Residualkopf verschiebt die Aktion kaum (Median |dv| 0,009, max 0,028 in normierten Einheiten), der Versatz beträgt bis zu 10 cm. Die 9,5 % besserer Loss im Training reichen nicht für eine sichtbare Korrektur.",
+    "LoRA C1 (hid): Validierungs-Loss mit Kontext 0,00754 gegen ohne 0,00752 → Kontext ungenutzt, Gate nicht bestanden, keine Simulation.",
+    "Fazit hid bisher: Kein Mechanismus liest den Versatz aus dem Fehlversuch so, dass sich das Verhalten ändert."
+   ]
+  },
+  {
+   "t": "Teacher Forcing (p13): Wird die Aktion besser, wenn das Video perfekt ist?",
+   "b": [
+    "Test: Basis-LingBot-VA; die vorhergesagte Zukunft wird durch echte Frames ersetzt. Ausgeführt werden nur die Aktionen des Modells.",
+    "Version 2 (tf_replan): Vor jedem Chunk plant der RoboTwin-Planer ab dem aktuellen Zustand neu (greifen / weiterschieben / loslassen) → Snapshot → Planer-Aktionen einen Chunk lang ausführen, Frames aufnehmen → zurücksetzen. Kein Sprung im Video, Neuplanung in 100 % erfolgreich.",
+    "Ergebnis (Erfolg korrigiert): 0 cm 26/27 (Basis 72/72) · −5 cm 27/27 (Basis 1/72) · −10 cm 8/27 (Basis 0/72).",
+    "Abweichung Aktion ↔ Orakel (Median): 0 cm 0,6 cm · −5 cm 1,0 cm · −10 cm 2,1 cm. Vor jeder Neuplanung liegt der Roboter bei −10 cm im Median 2,8 cm neben dem Plan.",
+    "Fazit: Bei −5 cm reicht ein perfektes Video. Bei −10 cm folgt der Aktionsteil dem Video nicht weit genug; das Video allein reicht dort nicht.",
+    "Version 1 (Expertenpfad ab nächstem Punkt): −5 cm 22/24, −10 cm 0/22. Bei −10 cm ungültig, weil das Video zurück auf den Pfad springt.",
+    "Kontrollen: Simulator nach jedem Vorausblick exakt zurückgesetzt (Restfehler 0); Experte allein −5 und −10 cm je 12/12.",
+    "Videos: oben echte Kamera (Kopf | Handgelenk), unten das Orakel-Video, das der Aktionsteil als Vorhersage bekommt."
+   ],
+   "v": [
+    {
+     "ep": "results/sweeps/p13_tf_replan/tf_replan/table_h_m05/episodes/success/move_playingcard_away/ep0000_seed10000",
+     "cap": "−5 cm, perfektes Video: Erfolg"
+    },
+    {
+     "ep": "results/sweeps/p13_tf_replan/tf_replan/table_h_m10/episodes/success/move_playingcard_away/ep0000_seed40000",
+     "cap": "−10 cm, perfektes Video: Erfolg"
+    },
+    {
+     "ep": "results/sweeps/p13_tf_replan/tf_replan/table_h_m10/episodes/fail/move_playingcard_away/ep0000_seed10000",
+     "cap": "−10 cm, perfektes Video: Fehlschlag"
+    }
+   ]
+  },
+  {
+   "t": "Verrauschtes Orakel-Video (p14): Reicht ein nicht perfektes Video?",
+   "b": [
+    "Wie tf_replan, aber die Orakel-Latents werden vor dem Aktionsteil verrauscht: (1−s)·Orakel + s·Rauschen (erstes Bild bleibt sauber). Latents haben etwa Einheitsskala.",
+    "−5 cm: s=0 27/27 · s=0,10 27/27 · s=0,25 26/27 · s=0,50 13/27 · s=0,75 0/27.",
+    "−10 cm: s=0 8/27 · s=0,10 8/27 · s=0,25 5/27 · s=0,50 3/27 · s=0,75 0/27.",
+    "Abweichung Aktion ↔ Orakel bei −5 cm (Median): 1,0 → 1,0 → 1,2 → 2,3 → 5,7 cm.",
+    "Fazit: Leicht gestörte Videos (s ≤ 0,25) helfen genauso wie perfekte; der Einbruch liegt zwischen 0,25 und 0,5.",
+    "Einschränkung: Gauß-Rauschen ist eine andere Art Fehler als eine falsche Vorhersage. Nächster Schritt wäre: eigene Vorhersage des Modells mit dem Orakel mischen."
+   ]
+  },
+  {
+   "t": "Ist der Kontext zu groß? (p8t LoRA, hid M3)",
+   "b": [
+    "p8t LoRA (11/25 mit gegen 2/29 ohne Kontext bei −5 cm) bekam ~7000 Kontext-Tokens: ganzer Fehlversuch, vorgestellt + echt, 3 Kameras, dazu den fast immer gleichen VLM-Satz.",
+    "Ein Kontext-Token bekommt halb so viel Attention wie ein normales (0,53); nur 27 % der Kontext-Attention liegt im Fenster um den Fehler. Ohne Kontext ändert sich die Aktion um 11 %, aber die Greifhöhe nicht nach unten (+1 bzw. +2,6 mm).",
+    "hid M3 (fertig 20.11.): kleinster Kontext am besten. C2 = nur echt − vorgestellt in 7 Frames um den Fehler: Loss −9,5 % gegenüber ohne Kontext (Gate verlangt −10 %), gemischter Kontext schlechter als keiner, z-Korrelation 0,59. C3 (+ Greiferzustand) −5 %, C5 (nur echtes Bild) ±0, C4 (Trajektorie) ±0. Keine Variante hat das Gate formal bestanden.",
+    "Kleine Kontexte beim ungesehenen Fehlertyp wurden nie getestet → P8c (6 Varianten) und hid C2 in der Simulation (als Ausnahme)."
+   ]
+  },
+  {
    "t": "Neuer Plan: versteckte Kalibrier-Offsets (hid)",
    "b": [
     "LingBot-VA gibt EE-Posen relativ zur Startpose aus und bekommt als state nur die eigenen Aktionen: Der geglaubte Rahmen ist automatisch erfüllt.",
     "o pro Seed deterministisch, in beiden Versuchen gleich: trans (z ±10 cm, x/y ±5 cm), gain (0,7–1,3), yaw (±25°), je 20 % o = 0.",
     "Experten-Fix mit kompensierten Zielen, gespeichert als die Aktionen, die die Policy ausgeben müsste.",
     "Mechanismen: M1 LoRA + Kontext, M2 gated Cross-Attention, M3 Residual-Kopf (konstante Geschwindigkeits-Verschiebung = Aktions-Verschiebung bei Rectified Flow).",
-    "Keine Orakel-Varianten (Entscheidung 18.11.); Stufe A = C3 + aux × M1–M3."
+    "Keine Orakel-Varianten (Entscheidung 18.11.); Stufe A = C3 + aux × M1–M3.",
+    "Daten p10: 465 Fehlversuche mit o ≠ 0, 580 (Fehlversuch, Fix)-Paare über 7 Trainingsaufgaben.",
+    "Leak-Test: erstes Bild R² x 0,105 / y 0,04 / z 0,121 (Ziel < 0,1, knapp verfehlt); Fehlerfenster x 0,15 / y 0,20 / z 0,57.",
+    "Kette: Leak-Test → Training (M3 C2–C5 ± aux, LoRA C1) → Trainings-Gate → Simulation nur für bestandene Varianten."
    ]
   },
   {
@@ -149,32 +353,110 @@
  ],
  "running": [
   {
-   "s": "Minimalpfad vor dem Cluster-Ausfall (20.11.): Datensatz hid_trans (p10_hid_data, 90 Seeds × 7 Aufgaben, Paare Fehlversuch + kompensierter Experte)",
-   "st": "wartet auf GPU (35 Jobs)"
+   "s": "Plan v2 eingereicht 21.11. (PLAN_FAWAM_V2): p8c/p8s/hid nichts Neues; neue Sweeps p20_/p21_/p22_",
+   "st": "läuft"
   },
   {
-   "s": "Smoke-Test hid (p10_hid_smoke): Policy-Fehlerrate unter o, Experte mit Kompensation ≥ 90 %, Ausführung = Ziel + o",
-   "st": "wartet auf GPU (6 Jobs)"
+   "s": "p20 D2 Basis (16 Einstellungen × 21 Seeds): Jobs 139120–127, 139153–160",
+   "st": "läuft, Ende ~16:45"
   },
   {
-   "s": "Dev-Runner (4 GPUs, dev-gpu-h100) für Smoke + Daten",
-   "st": "wartet, Knoten hkn0901 nicht verfügbar"
+   "s": "p20 D4 tf_replan (9 Einstellungen): Jobs 139134–141, 139161",
+   "st": "läuft, Ende ~17:30"
   },
   {
-   "s": "Leak-Test (fawam/hid_leak.py): o aus dem ersten Frame R² < 0,1, aus dem Fehlerfenster > 0,5",
-   "st": "wartet auf Daten"
+   "s": "p20 D1 Aktions-Konditionierung (offline, 24 Episoden × 4 Chunks × 5 Varianten)",
+   "st": "Queue Prio −4 (als nächstes), Ende ~19:00"
   },
   {
-   "s": "Training C1×M1 (LoRA r16, ganzer Fehlversuch im Kontext, 30 % fremder Kontext) und M3 (Residual-Kopf, C2–C5 × aux in einem Job) + Trainings-Gate",
-   "st": "Code fertig, wartet auf Daten"
+   "s": "p20 D3 Snapshot-Experte + Policy/tf ab 1/2/3 Chunks (8 Einstellungen, 24 Jobs)",
+   "st": "Queue Prio −2, Ende ~22.11. 02:00"
   },
   {
-   "s": "Eval T1: 3 Held-out-Aufgaben (move_playingcard_away, place_object_scale, move_pillbottle_pad) × ctx / noctx / shuf",
-   "st": "Code fertig, wartet"
+   "s": "p21 Daten S-B (56 Jobs, 7 Aufgaben × 2 Vorzeichen-Varianten × 48 Seeds), danach S-A (56)",
+   "st": "S-B wartet auf GPUs (Ende ~19:30); S-A danach (Ende ~23:30)"
   },
   {
-   "s": "Angehalten bis nach dem Ausfall: P7d-Auffüllen, VLM-Benchmark-Wiederholung, P8s-Kette, p0s-Screening",
-   "st": "angehalten"
+   "s": "p21 Fremdkontext-Bank (Testaufgabe, S-A/S-B, 2 Jobs)",
+   "st": "Queue Prio −2, Ende ~22:00"
+  },
+  {
+   "s": "p22 TTT 16 Varianten × 5 Einstellungen × 20 Seeds (320 Jobs): Kern (Retry, P0, P1, P2) Prio −2; Raster, P3–P6, LoRA, Dual-Site, lff_ttt Prio −1",
+   "st": "Queue; Kern (Retry/P0/P1/P2, 80 Jobs) bis ~22.11. 06:00, Rest (240 Jobs) bis ~22.11. 20:00"
+  },
+  {
+   "s": "Automatische Ketten (cluster/pipeline_v2.py): D2+D4 → Einstellungs-Gate + D6 → D7; Daten+Gate → Trainings (A1×C0–C3, A2, Chunk-Ablation, C4–C8) → Negativ-Filter → Screening → Vollauswertung; p22 → Screening-Gate → Vollauswertung; D1 → P7-Gate",
+   "st": "aktiv (Pipeline-Cron alle 20 min)"
+  },
+  {
+   "s": "Kapazität 21.11. 15:50: ~30 GPU-Jobs laufen gleichzeitig, 68 warten (Priorität = Alter). ~460 Jobs in der Pipeline-Queue ≈ 30 h GPU-Zeit bei 30 GPUs. Keine Wartungsreservierung eingetragen (scontrol show res leer); Jobs, die nicht mehr vor die Wartung passen, warten und starten danach.",
+   "st": "Info"
+  },
+  {
+   "s": "Realistisch vor der Wartung (23.11.): D1–D7, Einstellungs-Gate, S-B- und S-A-Daten, ICL-Kerntrainings A1×C0–C3 (+A2/A3, Ablation) mit Negativ-Filter, Screening der bestandenen Varianten, TTT-Kern + Raster. Unsicher: TTT P3–P6/LoRA/Dual-Site, C4–C8/T1–T5-Trainings, alle Vollauswertungen.",
+   "st": "Schätzung"
+  }
+ ],
+ "next": [
+  {
+   "t": "offen (Nutzer): Einstellungs-Gate",
+   "why": "Erste D2-Zahlen: Tisch +3/+5 cm und Versatz ±3 cm scheitern auf der Testaufgabe kaum (0–1 von 5–11). Das Gate poolt alle D2-Einstellungen einer Einstellungsgruppe; liegt S-A oder S-B unter 70 % Fehlschlägen, werden alle Trainings dieser Gruppe automatisch übersprungen (Regel aus dem Plan). Alternative wäre z. B. S-B nur mit |y| = 5 cm.",
+   "st": "offen (Nutzer)"
+  },
+  {
+   "t": "offen (Nutzer): Lernrate ICL-Training",
+   "why": "Plan sagt 'gleiche Lernrate', nennt keine. Gesetzt: 4,3e-4 (Standard der bisherigen Meta-Trainings), 1500 Schritte, Batch 1, Checkpoint alle 250 Schritte.",
+   "st": "offen (Nutzer)"
+  },
+  {
+   "t": "offen (Nutzer): Reset-Abstand im Test",
+   "why": "Daten nutzen alle drei Abstände (1/2/3 Chunks). Im Test (Screening) fest k = 2, bis D3 vorliegt; D3 entscheidet laut Plan.",
+   "st": "offen (Nutzer)"
+  },
+  {
+   "t": "offen (Nutzer): Negativ-Filter 'fremder Kontext darüber'",
+   "why": "Umgesetzt als: Val-Loss mit eigenem Kontext < C0 UND mit fremdem Kontext > C0 (nicht nur > eigener Kontext).",
+   "st": "offen (Nutzer)"
+  },
+  {
+   "t": "Noch nicht umgesetzt: A4 (VACE-Blöcke), T3 (Gate aus Hilfskopf), T6 (Phasen-Ausrichtung), P7 (Prognose + Auswahl), G2 offline",
+   "why": "A3 (Gated Cross-Attention, Flamingo-artig, nur Video-Strom, jeder 3. Block) und T1/T2/T4/T5 sind umgesetzt und hängen in der Kette. Abweichung T1–T5: Kontext = Fehlerfenster wie C2 (nicht ein Ausschnitt pro Chunk); das Gate nutzt den zeitlich (T1/T2) bzw. per nächstem Nachbarn (T5) ausgerichteten Fehler des letzten Versuchs. A4 braucht räumlich-zeitlich ausgerichteten Kontext (VACE addiert Hinweise tokenweise) – offen. P7 wird vom D1-Gate übersprungen, falls D1 'nicht konditioniert' ergibt.",
+   "st": "offen"
+  },
+  {
+   "t": "P4/P5 (eigener Erfolg als Ziel)",
+   "why": "Nach dem ersten gelungenen Retry wird der Adapter auf dessen echtes Video trainiert und für die restlichen Seeds der Einstellung festgehalten (ohne Exploration/Retry): Übertragung innerhalb der Einstellung. Der Screening-Wert (Retry-Erfolg) ist für P4/P5 daher nur teilweise vergleichbar.",
+   "st": "läuft mit"
+  },
+  {
+   "t": "offen (Nutzer): Cosmos-Reason2-Lizenz und hf auth login",
+   "why": "für spätere VLM-Tests",
+   "st": "offen (Nutzer)"
+  },
+  {
+   "t": "VPP2/RoboDojo",
+   "why": "erst wenn eine TTT-Variante auf RoboTwin funktioniert (Plan 5); laut Nutzer erstmal egal",
+   "st": "zurückgestellt"
+  },
+  {
+   "t": "Architektur-Entscheidung Video-Adapter",
+   "why": "Kein eigener Video-Expert in LingBot-VA; Vorschlag: nur im Video-Durchlauf aktive Adapter.",
+   "st": "offen (Nutzer)"
+  },
+  {
+   "t": "Daten für den Video-Plan (p16)",
+   "why": "Paare Fehlversuch → Experten-Korrekturvideo. Für P7b/c/d gibt es solche Paare schon (Experten-Lauf vom selben Seed mit Latents), neu nötig: Objektgröße, ggf. FAR-Reset, Validierungstyp auf den Held-out-Aufgaben.",
+   "st": "nach Schritt 0"
+  },
+  {
+   "t": "Offline-Gate + Aktions-Sonde (p17)",
+   "why": "Eingefrorener Aktionsteil auf vorhergesagtem Video, Greifposition gegen Experte (G1 ≤ 1,5 cm, G2 −30 % gegen Kontrolle, G3 fremd nicht besser). Sanity auf dem Planer-Video.",
+   "st": "geplant"
+  },
+  {
+   "t": "Stufe 1: A1, A2 (ICL), B1, B2 (TTT) mit Loss V, K1",
+   "why": "Nur Gate auswerten, dann Simulation (p18) für bestandene Varianten.",
+   "st": "geplant"
   }
  ]
 }

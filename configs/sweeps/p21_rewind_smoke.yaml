@@ -1,0 +1,10 @@
+# smoke: p21 rewind retry (client _icl_rewind, server prefill li/chunk segments) with a zero-init adapter
+name: p21_rewind_smoke
+out: results/_smoke/p21_rewind
+episodes: 2
+per_job: 2
+n_par: 1
+time: "01:00:00"
+tasks: [move_playingcard_away]
+configs: [icl_sb]
+methods: [icl2_smoke_C3, icl2_smoke_C5, icl2_smoke_C7, icl2_smoke_C3_foreign]

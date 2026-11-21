@@ -1,0 +1,13 @@
+# p20 D2 (plan v2, 2026-11-21): where does the base model fail on the test task? 20 seeds per setting.
+# Table -5/-3/+3/+5 cm; hidden fixed EE offset y/x +-3/+-5 cm; hidden z gain 0.7/0.85/1.15/1.3.
+# Setting enters ICL/TTT if >= 70 % failures (corrected success, flung = failure). Same seeds as p20_d4_tf.
+name: p20_d2_base
+out: results/sweeps/p20_d2_base
+episodes: 20
+per_job: 21
+n_par: 3
+time: "02:30:00"
+tasks: [move_playingcard_away]
+configs: [table_h_m05, table_h_m03, table_h_p03, table_h_p05, hid_y_p3, hid_y_m3, hid_y_p5, hid_y_m5,
+          hid_x_p3, hid_x_m3, hid_x_p5, hid_x_m5, hid_g070, hid_g085, hid_g115, hid_g130]
+methods: [base]

@@ -1,0 +1,16 @@
+# p21 ICL stage 1 data (plan v2, 2026-11-21), setting S-A (table +-3..6 cm): base attempt under the hidden parameter (drawn from
+# the seed, both signs balanced), snap driver: from 1/2/3 chunks before the gripper closes the planner continues to the
+# end (expert, compensated), video latents recorded. icl_sa_v1 = SAME seeds/scenes with the opposite sign
+# (counter-examples). 7 training tasks only (test task move_playingcard_away never in training).
+name: p21_data_sa
+out: results/sweeps/p21_data_sa
+driver: snap
+episodes: 48
+per_job: 12
+n_par: 3
+time: "02:30:00"
+seed_offset: 20000
+tasks: [place_mouse_pad, pick_diverse_bottles, stack_blocks_two, place_shoe, move_can_pot, lift_pot, handover_block]
+configs: [icl_sa, icl_sa_v1]
+methods: [base]
+extra_env: {FAWAM_SNAP_MODES: "expert"}

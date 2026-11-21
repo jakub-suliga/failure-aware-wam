@@ -16,7 +16,7 @@ source "${FAWAM_ROOT:-${SLURM_SUBMIT_DIR:-$(dirname "${BASH_SOURCE[0]}")/..}}/cl
 # switched off on GPUs with > 120 GB (H200, B200) and never where an adapter learner + replay share the GPU.
 GPU_MIB=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1)
 case "${METHOD:-base}" in
-    *lff_*|*paper_*|*_adapter*) OFFLOAD=${OFFLOAD:-1} ;;
+    *lff_*|*paper_*|*_adapter*|ttt_*) OFFLOAD=${OFFLOAD:-1} ;;
     *) [ "${GPU_MIB:-0}" -gt 120000 ] && OFFLOAD=${OFFLOAD:-0} || OFFLOAD=${OFFLOAD:-1} ;;
 esac
 METHOD=${METHOD:-base}; NUM=${NUM:-10}; SEED0=${SEED0:-0}; N_PAR=${N_PAR:-2}; DRIVER=${DRIVER:-policy}

@@ -349,11 +349,33 @@ class LearnFromFailure:
             m.adapter_path = self.adapter
         return m
 
-    def after_success(self, ep_dir):
+    def after_success(self, ep_dir, attempt=1):
         if self.cfg["persist"] and self.cfg["keep_successes"]:
             self.successes.append(str(ep_dir))
+        # plan v2 P4/P5: the first successful RETRY becomes the target: train the video adapter on its real video,
+        # then keep it (persist) and test later seeds with it, without exploration or retries
+        if self.cfg.get("learn_from_success") and attempt > 1 and self.adapter is None:
+            self.version += 1
+            out = self.dir / f"seed_success_v{self.version}"
+            saved = self.memory, self.successes
+            self.memory, self.successes = [str(ep_dir)], []
+            try:
+                if self._learner(out, extra=self._hinge_args()):
+                    self.adapter = str(out)
+            finally:
+                self.memory, self.successes = saved
+            self.log.append(dict(learned_from_success=str(ep_dir), adapter=self.adapter))
 
-    def _learner(self, out):
+    def _hinge_args(self):
+        if not self.cfg.get("hinge_beta") or not self.seed_failures:
+            return []
+        return ["--hinge_episode", self.seed_failures[-1], "--hinge_beta", str(self.cfg["hinge_beta"])]
+
+    def allow_retry(self):
+        """P4/P5: once an adapter was learned from an own success, later seeds are pure transfer tests."""
+        return not (self.cfg.get("learn_from_success") and self.adapter is not None)
+
+    def _learner(self, out, extra=()):
         import subprocess
         import sys
         root = self.Path(__file__).resolve().parents[1]
@@ -385,6 +407,7 @@ class LearnFromFailure:
         init = (self.adapter if c["init"] == "prev" else None) or (c.get("meta_adapter") if c["mode"] == "both" else None)
         if init:
             cmd += ["--init", init]
+        cmd += list(extra)
         env = {**self.os.environ, "PYTHONPATH": str(root)}
         env.pop("PYTHONWARNINGS", None)
         with open(self.dir / "learner.log", "a") as log:
@@ -452,6 +475,12 @@ class LearnFromFailure:
                 m.intervention = {**INTERVENTION_DEFAULTS, "action": "reset_memory", "max_interventions": 1}
                 if icl["timing"] == "trigger":
                     prefill = None
+        if c.get("gate") == "prev_gap" and m.adapter_path:  # P2: adapter strength from the last attempt's gap
+            m.adapter_gate = dict(ref_ep=str(ep_dir))
+        if c.get("explore"):  # P3/P4/P5: imagine plans unlike what really happened in the failure window
+            m.explore = dict(ref_ep=str(ep_dir), latent=ana.get("latent"), n=int(c.get("explore_n", 8)),
+                             before=4, after=2)
+            info.update(explore_latent=ana.get("latent"))
         if c["retry_action_noise"]:
             m.action_noise = c["retry_action_noise"]
         if c["negative"] and ana.get("negative_prompt"):

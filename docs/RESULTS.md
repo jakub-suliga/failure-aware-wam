@@ -1,26 +1,101 @@
 # Ergebnisse Failure-Aware WAM
 
-Automatisch erzeugt aus dem Report (`fawam/report_md.py`) · Stand der Daten: 2026-11-18 15:54 · Testaufgabe `move_playingcard_away`.
+Automatisch erzeugt aus dem Report (`fawam/report_md.py`) · Stand der Daten: 2026-11-21 16:07 · Testaufgabe `move_playingcard_away`.
 
 Erfolg zählt nur, wenn das Objekt auf dem Tisch bleibt („weggeflogen“ = vom Simulator als Erfolg gewertet, hier Fehlschlag). Brüche: gelöst / versucht. Ziele und Plan: [GOAL.md](GOAL.md), [PLAN.md](PLAN.md), [PLAN_HID.md](PLAN_HID.md); ältere Befunde: [FINDINGS.md](FINDINGS.md).
 
 ## Probleme, Analysen, laufende Arbeit
 
-Stand: 2026-11-18 21:00
+Stand: 2026-11-21 16:10
 
 ### Was gerade läuft
 
 | Schritt | Status |
 |---|---|
-| Minimalpfad vor dem Cluster-Ausfall (20.11.): Datensatz hid_trans (p10_hid_data, 90 Seeds × 7 Aufgaben, Paare Fehlversuch + kompensierter Experte) | wartet auf GPU (35 Jobs) |
-| Smoke-Test hid (p10_hid_smoke): Policy-Fehlerrate unter o, Experte mit Kompensation ≥ 90 %, Ausführung = Ziel + o | wartet auf GPU (6 Jobs) |
-| Dev-Runner (4 GPUs, dev-gpu-h100) für Smoke + Daten | wartet, Knoten hkn0901 nicht verfügbar |
-| Leak-Test (fawam/hid_leak.py): o aus dem ersten Frame R² < 0,1, aus dem Fehlerfenster > 0,5 | wartet auf Daten |
-| Training C1×M1 (LoRA r16, ganzer Fehlversuch im Kontext, 30 % fremder Kontext) und M3 (Residual-Kopf, C2–C5 × aux in einem Job) + Trainings-Gate | Code fertig, wartet auf Daten |
-| Eval T1: 3 Held-out-Aufgaben (move_playingcard_away, place_object_scale, move_pillbottle_pad) × ctx / noctx / shuf | Code fertig, wartet |
-| Angehalten bis nach dem Ausfall: P7d-Auffüllen, VLM-Benchmark-Wiederholung, P8s-Kette, p0s-Screening | angehalten |
+| Plan v2 eingereicht 21.11. (PLAN_FAWAM_V2): p8c/p8s/hid nichts Neues; neue Sweeps p20_/p21_/p22_ | läuft |
+| p20 D2 Basis (16 Einstellungen × 21 Seeds): Jobs 139120–127, 139153–160 | läuft, Ende ~16:45 |
+| p20 D4 tf_replan (9 Einstellungen): Jobs 139134–141, 139161 | läuft, Ende ~17:30 |
+| p20 D1 Aktions-Konditionierung (offline, 24 Episoden × 4 Chunks × 5 Varianten) | Queue Prio −4 (als nächstes), Ende ~19:00 |
+| p20 D3 Snapshot-Experte + Policy/tf ab 1/2/3 Chunks (8 Einstellungen, 24 Jobs) | Queue Prio −2, Ende ~22.11. 02:00 |
+| p21 Daten S-B (56 Jobs, 7 Aufgaben × 2 Vorzeichen-Varianten × 48 Seeds), danach S-A (56) | S-B wartet auf GPUs (Ende ~19:30); S-A danach (Ende ~23:30) |
+| p21 Fremdkontext-Bank (Testaufgabe, S-A/S-B, 2 Jobs) | Queue Prio −2, Ende ~22:00 |
+| p22 TTT 16 Varianten × 5 Einstellungen × 20 Seeds (320 Jobs): Kern (Retry, P0, P1, P2) Prio −2; Raster, P3–P6, LoRA, Dual-Site, lff_ttt Prio −1 | Queue; Kern (Retry/P0/P1/P2, 80 Jobs) bis ~22.11. 06:00, Rest (240 Jobs) bis ~22.11. 20:00 |
+| Automatische Ketten (cluster/pipeline_v2.py): D2+D4 → Einstellungs-Gate + D6 → D7; Daten+Gate → Trainings (A1×C0–C3, A2, Chunk-Ablation, C4–C8) → Negativ-Filter → Screening → Vollauswertung; p22 → Screening-Gate → Vollauswertung; D1 → P7-Gate | aktiv (Pipeline-Cron alle 20 min) |
+| Kapazität 21.11. 15:50: ~30 GPU-Jobs laufen gleichzeitig, 68 warten (Priorität = Alter). ~460 Jobs in der Pipeline-Queue ≈ 30 h GPU-Zeit bei 30 GPUs. Keine Wartungsreservierung eingetragen (scontrol show res leer); Jobs, die nicht mehr vor die Wartung passen, warten und starten danach. | Info |
+| Realistisch vor der Wartung (23.11.): D1–D7, Einstellungs-Gate, S-B- und S-A-Daten, ICL-Kerntrainings A1×C0–C3 (+A2/A3, Ablation) mit Negativ-Filter, Screening der bestandenen Varianten, TTT-Kern + Raster. Unsicher: TTT P3–P6/LoRA/Dual-Site, C4–C8/T1–T5-Trainings, alle Vollauswertungen. | Schätzung |
 
 ### Analysen
+
+**Plan v2: Smoke-Tests 21.11.**
+
+- TTT (hid y +5 cm, 1 Seed): P0, LoRA, P2, P3, P4, Dual-Site laufen bis Retry 3/4 ohne Fehler. Lerner: 50 Schritte ≈ 75 s; Adapter+ nur im Video-Durchlauf 47,9 M Parameter, LoRA r16 (nur Video) 11,8 M.
+- P2: Adapter-Stärke pro Chunk = normierter Vorhersagefehler des letzten Versuchs (gemessen 0,0–1,0). P3: im Fehlerfenster 8 Video-Pläne, gewählt der am weitesten von der Realität des Fehlversuchs.
+- Snapshot-Treiber: Testaufgabe unter Versatz y +5 cm, Basis scheitert; Experte ab 1 und 2 Chunks vor dem Greifer-Schließen erfolgreich (Schließen in Chunk 2).
+- ICL-Datensatz: Kontexte C0–C8 bauen korrekt ([Kontext 7 Frames je Gruppe | eigene Vergangenheit | Experten-Fortsetzung], Loss nur auf der Fortsetzung). Rewind-Retry mit Null-Adapter läuft als Smoke.
+- Code-Check im Dev-Job (cluster/dev_check.sh): Kompilieren, Importe, Gates, Datensatz (C0–C8 × Kontext-Modi × Gates × Chunk-Ziehung) ok; TTT-Lerner mit P5-Hinge und Video-LoRA ok; Trainings A3 (126 M Parameter) und T4 (48 M) laufen. Gefunden und behoben: Absturz, wenn unter den Validierungs-Seeds kein Fehlversuch ist.
+
+**Schritt 0 (p15): Welche Fehler behebt das Planer-Video? (4 von 6 Typen fertig)**
+
+- move_playingcard_away, 27 Seeds, Erfolg korrigiert. Basis | Planer-Video: Objektposition ±10 cm 25/27 | 22/27 · Drehung ±90° 27/27 | 25/27 · Kamera 23/27 | 21/27 · Startpose 14/27 | 18/27.
+- Auf dieser Aufgabe erzeugen Objektposition, Drehung und Kamera kaum Fehlschläge (0–4 von 27). Damit ist dort nicht messbar, ob das Video sie behebt.
+- Startpose: Von 13 Fehlschlägen der Basis löst das Planer-Video 6 (46 %, unter der 70-%-Schwelle).
+- Auffällig: Wo die Basis schon gelingt, verliert das Planer-Video 2–4 von 23–27. Das fremde Video stört den Aktionsteil also etwas.
+- hid nur z und Objektgröße liefen nicht (Konfigurationsdateien fehlten in RoboTwin/task_config) → behoben, neu eingereicht 21.11. 06:25.
+- Vorläufiges Fazit: Außer Tisch erfüllt bisher kein Typ das Kriterium. Für Objektposition, Drehung und Kamera müsste Schritt 0 auf den Trainingsaufgaben laufen, wo sie öfter scheitern; dafür fehlt der Neuplaner für diese Aufgaben.
+
+**P8c kleine Kontexte: kein Kontext-Gebrauch**
+
+- Gelöste Fehlversuche bei −5 cm, mit gegen ohne Kontext (gleicher Adapter): Differenzkarte im Fenster 10/25 gegen 13/23 · + echtes Bild 9/24 gegen 16/27 · vorgestellt + echt im Fenster 10/24 gegen 12/27 · 6 Keyframes 9/27 gegen 12/27. Kein Fisher-Test mit Kontext besser (p 0,69–0,97).
+- −10 cm: alle 0–1/30.
+- Ohne Kontext lösen diese Adapter bei −5 cm 44–59 %, mehr als die p8t-LoRA ohne Kontext (2/29). Die Gewinne kommen aus dem Adapter selbst, nicht aus dem Fehlversuch.
+- Die beiden Varianten mit Detail-Text (Kontext) brachen ab (zu langer Dateiname) → behoben, neu eingereicht. Ohne Kontext: 8/26 und 4/27.
+- Fazit: Kleinerer Kontext macht den Fehlversuch nicht nutzbar; das p8t-Ergebnis (11/25 gegen 2/29) wiederholt sich so nicht.
+
+**p8s mehr Fehlschläge (P7b+c+d): erst Kontrollen fertig**
+
+- Ohne Kontext bei −5 cm: LoRA 6/27, LoRA + Basis 1/22, FiLM+Adapter+ 9/29, FiLM+Adapter+ + Basis 3/25; Fine-Tuning mit Basis 3/27. −10 cm 0–1/30.
+- Die Varianten mit Kontext brachen am selben Dateinamen-Fehler ab → neu eingereicht 21.11. 06:25.
+
+**Video-Plan, Schritt 0: Wie stellt sich das Basismodell den Griff vor? (−5 cm)**
+
+- 6 Seeds bei −5 cm, Basismodell scheitert. Pro Video oben echt, Mitte die eigene Vorstellung des Modells, unten das Planer-Video (p13 tf_replan, gleicher Seed); links Kopfkamera, rechts Handgelenk des greifenden Arms.
+- Sichtprüfung an 2 Seeds (10000, 40000): Die Vorstellung zeigt den Griff etwa auf derselben, zu hohen Höhe wie die Realität, aber danach eine angehobene Karte im Greifer. In der Realität bleibt die Karte liegen und das Handgelenk-Bild ist leer.
+- Vorläufige Deutung: Das Modell stellt sich die normale Bewegung vor und 'glaubt', dass sie gelingt. Die Vorhersage korrigiert die Höhe nicht. Genau das soll der Video-Plan ändern.
+- Einschränkung: Sichtprüfung an Einzelbildern, nicht gemessen. Eine Messung der vorgestellten Greifhöhe kommt mit der Aktions-Sonde (Offline-Gate).
+
+**hid C2 in der Simulation (p12_hid_c2): kein Effekt**
+
+- 3 ungesehene Aufgaben × 30 Seeds, versteckter Versatz. Gelöste Fehlversuche im 2. Versuch: Retry ohne Lernen 2/63 · C2 mit eigenem Fehlversuch 4/65 · C2 ohne Kontext 3/63 · C2 mit fremdem Fehlversuch 3/63.
+- Grund: Der Residualkopf verschiebt die Aktion kaum (Median |dv| 0,009, max 0,028 in normierten Einheiten), der Versatz beträgt bis zu 10 cm. Die 9,5 % besserer Loss im Training reichen nicht für eine sichtbare Korrektur.
+- LoRA C1 (hid): Validierungs-Loss mit Kontext 0,00754 gegen ohne 0,00752 → Kontext ungenutzt, Gate nicht bestanden, keine Simulation.
+- Fazit hid bisher: Kein Mechanismus liest den Versatz aus dem Fehlversuch so, dass sich das Verhalten ändert.
+
+**Teacher Forcing (p13): Wird die Aktion besser, wenn das Video perfekt ist?**
+
+- Test: Basis-LingBot-VA; die vorhergesagte Zukunft wird durch echte Frames ersetzt. Ausgeführt werden nur die Aktionen des Modells.
+- Version 2 (tf_replan): Vor jedem Chunk plant der RoboTwin-Planer ab dem aktuellen Zustand neu (greifen / weiterschieben / loslassen) → Snapshot → Planer-Aktionen einen Chunk lang ausführen, Frames aufnehmen → zurücksetzen. Kein Sprung im Video, Neuplanung in 100 % erfolgreich.
+- Ergebnis (Erfolg korrigiert): 0 cm 26/27 (Basis 72/72) · −5 cm 27/27 (Basis 1/72) · −10 cm 8/27 (Basis 0/72).
+- Abweichung Aktion ↔ Orakel (Median): 0 cm 0,6 cm · −5 cm 1,0 cm · −10 cm 2,1 cm. Vor jeder Neuplanung liegt der Roboter bei −10 cm im Median 2,8 cm neben dem Plan.
+- Fazit: Bei −5 cm reicht ein perfektes Video. Bei −10 cm folgt der Aktionsteil dem Video nicht weit genug; das Video allein reicht dort nicht.
+- Version 1 (Expertenpfad ab nächstem Punkt): −5 cm 22/24, −10 cm 0/22. Bei −10 cm ungültig, weil das Video zurück auf den Pfad springt.
+- Kontrollen: Simulator nach jedem Vorausblick exakt zurückgesetzt (Restfehler 0); Experte allein −5 und −10 cm je 12/12.
+- Videos: oben echte Kamera (Kopf | Handgelenk), unten das Orakel-Video, das der Aktionsteil als Vorhersage bekommt.
+
+**Verrauschtes Orakel-Video (p14): Reicht ein nicht perfektes Video?**
+
+- Wie tf_replan, aber die Orakel-Latents werden vor dem Aktionsteil verrauscht: (1−s)·Orakel + s·Rauschen (erstes Bild bleibt sauber). Latents haben etwa Einheitsskala.
+- −5 cm: s=0 27/27 · s=0,10 27/27 · s=0,25 26/27 · s=0,50 13/27 · s=0,75 0/27.
+- −10 cm: s=0 8/27 · s=0,10 8/27 · s=0,25 5/27 · s=0,50 3/27 · s=0,75 0/27.
+- Abweichung Aktion ↔ Orakel bei −5 cm (Median): 1,0 → 1,0 → 1,2 → 2,3 → 5,7 cm.
+- Fazit: Leicht gestörte Videos (s ≤ 0,25) helfen genauso wie perfekte; der Einbruch liegt zwischen 0,25 und 0,5.
+- Einschränkung: Gauß-Rauschen ist eine andere Art Fehler als eine falsche Vorhersage. Nächster Schritt wäre: eigene Vorhersage des Modells mit dem Orakel mischen.
+
+**Ist der Kontext zu groß? (p8t LoRA, hid M3)**
+
+- p8t LoRA (11/25 mit gegen 2/29 ohne Kontext bei −5 cm) bekam ~7000 Kontext-Tokens: ganzer Fehlversuch, vorgestellt + echt, 3 Kameras, dazu den fast immer gleichen VLM-Satz.
+- Ein Kontext-Token bekommt halb so viel Attention wie ein normales (0,53); nur 27 % der Kontext-Attention liegt im Fenster um den Fehler. Ohne Kontext ändert sich die Aktion um 11 %, aber die Greifhöhe nicht nach unten (+1 bzw. +2,6 mm).
+- hid M3 (fertig 20.11.): kleinster Kontext am besten. C2 = nur echt − vorgestellt in 7 Frames um den Fehler: Loss −9,5 % gegenüber ohne Kontext (Gate verlangt −10 %), gemischter Kontext schlechter als keiner, z-Korrelation 0,59. C3 (+ Greiferzustand) −5 %, C5 (nur echtes Bild) ±0, C4 (Trajektorie) ±0. Keine Variante hat das Gate formal bestanden.
+- Kleine Kontexte beim ungesehenen Fehlertyp wurden nie getestet → P8c (6 Varianten) und hid C2 in der Simulation (als Ausnahme).
 
 **Neuer Plan: versteckte Kalibrier-Offsets (hid)**
 
@@ -29,6 +104,9 @@ Stand: 2026-11-18 21:00
 - Experten-Fix mit kompensierten Zielen, gespeichert als die Aktionen, die die Policy ausgeben müsste.
 - Mechanismen: M1 LoRA + Kontext, M2 gated Cross-Attention, M3 Residual-Kopf (konstante Geschwindigkeits-Verschiebung = Aktions-Verschiebung bei Rectified Flow).
 - Keine Orakel-Varianten (Entscheidung 18.11.); Stufe A = C3 + aux × M1–M3.
+- Daten p10: 465 Fehlversuche mit o ≠ 0, 580 (Fehlversuch, Fix)-Paare über 7 Trainingsaufgaben.
+- Leak-Test: erstes Bild R² x 0,105 / y 0,04 / z 0,121 (Ziel < 0,1, knapp verfehlt); Fehlerfenster x 0,15 / y 0,20 / z 0,57.
+- Kette: Leak-Test → Training (M3 C2–C5 ± aux, LoRA C1) → Trainings-Gate → Simulation nur für bestandene Varianten.
 
 **Ungesehener Fehlertyp, 2 Trainingstypen (p8d)**
 
@@ -85,15 +163,27 @@ Stand: 2026-11-18 21:00
 
 | Problem | Ursache | Maßnahme | Status |
 |---|---|---|---|
-| Keine GPU vor dem Ausfall | Normale GPU-Partitionen voll: Startschätzung für unsere ältesten Jobs 20.11. 01:50, für neue Jobs 23.11.–30.11.; Dev-Knoten hkn0901 nicht verfügbar. | Alles eingereiht und Code fertig, damit jede GPU-Minute genutzt wird; andere GPU-Maschine wäre die Alternative. | offen |
-| Daten lehren keinen Kontext-Gebrauch | In allen bisherigen Daten ist der Fehler im aktuellen Bild sichtbar oder die Korrektur immer gleich: Validierungs-Loss mit Kontext ≥ ohne Kontext, der Adapter lernt die Korrektur auswendig. | Datensatz hid: pro Seed ein unsichtbarer Kalibrier-Offset o, nur aus dem Fehlversuch erkennbar (PLAN_HID.md). | in Arbeit |
-| P7c-Störungen erzeugen kaum Fehlschläge | Licht, Hintergrund, Clutter, Objektposition 5 cm und Drehung ±60° geben nur 1–10 % Fehlschläge (27 insgesamt). Das Basismodell ist darauf schon randomisiert trainiert. | Das Training mit „7 Typen“ bestand zu 86 % aus P7b-Daten. Neuer Datensatz P7d mit stärkeren Störungen. | in Arbeit |
-| Schwere Objekte und schwacher Greifer wirken nicht | Masse ×10–40: 2 Fehlschläge, Greifkraft ×0,15: 4 Fehlschläge (je ~84 Episoden). Die Patches greifen laut Log, aber der Griff in der Simulation bleibt stabil. | Beide Störungen gestrichen; Objektposition ±10 cm und Drehung ±90° werden auf 36 Episoden pro Aufgabe aufgefüllt. | in Arbeit |
-| VLM-Text ist fast immer gleich | „The left arm failed to grasp the box“: kein Hinweis, dass der Greifer zu hoch ist, kein Fix. Für das Modell ist der Kontext damit fast konstant. | Neuer VLM-Modus „detail“ (Phase, wo der Greifer beim Schließen war, was das Objekt tat, ein Fix-Satz). Dazu Test fein-getunter Fehler-VLMs. | in Arbeit |
-| Kontext wird oft nicht genutzt | Mit und ohne Kontext gleich gut: Der Adapter lernt die Korrektur selbst, ohne den Kontext zu lesen. | Mehr verschiedene Fehlertypen (P7d) und Basismodell mittrainieren (wie WAM-TTT, Option --train_base). | in Arbeit |
-| VLM-Benchmark: Anfragen an den falschen Server | Mehrere Jobs auf einem Knoten nutzten alle Port 8001, 40–58 von 105 Anfragen bekamen 404. Gültige Antworten sind korrekt (Modellname muss passen). | Port pro Job (auch im VLM-Analyse-Job), fehlgeschlagene Anfragen werden wiederholt. | in Arbeit |
+| p15 hid_trans_z: 0 Episoden | fawam/hid_offset.py: TYPES enthielt 'trans_z' nicht → AssertionError beim Start (beide Jobs). | TYPES erweitert (trans_z, lat, fixed). p15 hid_trans_z nicht neu eingereicht (Plan v2 ersetzt Schritt 0). | behoben |
+| 9 Jobs von D2/D4 nach 2 min abgebrochen (21.11. 15:24) | Versions-Race: die Server luden methods.py, während neue Method-Felder ergänzt wurden; der Client schickte die neuen Felder. | Neu eingereicht (139153–161); Code-Änderungen ab da atomar (tmp + rename), keine neuen Method-Felder mehr. | behoben |
+| Snap-Smoke: tf-Fortsetzung lief nicht | FAWAM_SNAP_MODES='expert,tf' – das Komma zerlegt sbatch --export. | Trenner '+', D3-Queue-Einträge umgeschrieben, Nach-Smoke p20_d3_smoke. | behoben, Smoke läuft |
+| Karte: Greifer schließt schon in Chunk 2 | k = 3 Chunks vor dem Schließen liegt vor dem Episodenstart. | Reset-Punkt 0 erlaubt (Vergangenheit leer = volle Experten-Episode); im Test k = 2 → Reset bei Chunk 1. | behoben |
+| Evals mit VLM-Detail-Text abgebrochen (20.11.) | Der Prompt wird als Ordnername für Visualisierungen benutzt (wan_va_server._reset); der lange Detail-Text überschritt das 255-Byte-Limit → OSError. Betroffen: alle Kontext-Varianten von p8s (24 Jobs) und 2 von p8c (12 Jobs). | Ordnername gekürzt + Hash; fehlende Zellen neu eingereicht 21.11. 06:25. | behoben, läuft neu |
+| p15: neue Konfigurationen fehlten | hid_trans_z.yml und dist_objsize30.yml lagen nur in configs/, nicht in RoboTwin/task_config/ (setup.sh kopiert sie). | Kopiert, 12 Jobs + Smoke neu eingereicht. | behoben, läuft neu |
+| LingBot-VA hat keinen getrennten Video-Expert | Video- und Aktions-Tokens laufen durch dieselben 30 Blöcke (wan_va/modules/model.py: ein self.blocks, nur Embedder, Zeit-Konditionierung und Ausgabe-Kopf sind pro Modus getrennt). Der Plan verlangt 'nur Parameter des Video-Expert trainierbar'. | Vorschlag: Adapter (LoRA/FiLM/Cross-Attention), die nur im Video-Durchlauf aktiv sind (action_mode=False). Die geteilten Gewichte bleiben eingefroren, der Aktions-Durchlauf rechnet unverändert, sieht aber die durch den Adapter veränderten Video-K/V im Cache. Entscheidung beim Nutzer. | offen (Nutzer) |
+| P8c: kleine Kontexte beim ungesehenen Fehlertyp | Gleiche Daten, gleicher Adapter (LoRA r16) und gleiche VLM-Texte wie p8t, nur der Kontext ist kleiner: (1) echt − vorgestellt im Fenster um den Fehler, (2) dasselbe + echt, (3) vorgestellt + echt im Fenster, (4) 6 Frames mit höchstem Vorhersagefehler, (5) wie 1 mit detailliertem VLM-Text inkl. Fix-Satz, (6) nur der detaillierte VLM-Text. | 6 Trainings eingereiht 20.11. 10:01 (137739–744); danach Eval p8c_small_ctx automatisch, jede Variante mit und ohne Kontext. Kontrolle mit fremdem Fehlversuch entfällt: bei der Testaufgabe scheitern alle Seeds gleich (zu hoch gegriffen), der fremde Versuch wäre fast derselbe. | Eval läuft |
+| hid-Trainings nach <1 min abgestürzt (19.11. 22:53 und 20.11. 04:05) | M3: Das Erfolgs-Flag in den Daten ist ein Bool, train_hid verglich es mit dem Text "True" → 0 Trainingspaare. LoRA (C1): Konfiguration „combo“ ohne LoRA-Schalter → 0 trainierbare Parameter. | Vergleich korrigiert (580 Paare), LoRA-Konfiguration auf „lora“ gestellt; Pipeline-Stufen zurückgesetzt, neu gestartet 20.11. 09:46 (Jobs 137719, 137720). | erledigt (behoben, Trainings liefen 20.11.) |
+| hid Leak-Test knapp nicht bestanden | Der Versatz o ist im ersten Bild schwach ablesbar: R² x 0,105 / y 0,04 / z 0,121 (Ziel < 0,1). Im Fehlerfenster gut ablesbar (z 0,57), das Signal ist also da. | Entscheidung 19.11.: Grenze auf 0,15 gelockert und testen. Die Kontrollen ohne Kontext und mit gemischtem Kontext zeigen, ob das Modell o aus dem ersten Bild liest. Wenn ja: Ursache suchen. | zurückgestellt (hid hängt an Schritt 0) |
+| Oracle-Video springt bei großem Abstand zum Expertenpfad (p13) | Der aufgezeichnete Expertenpfad wird nur ab dem nächstgelegenen Punkt abgespielt; bei −10 cm liegt der Roboter ~4 cm daneben. | tf_replan: Planer läuft vor jedem Chunk ab dem aktuellen Zustand neu. Nebenbei: Snapshot setzt jetzt auch den Python-Greiferwert zurück (fehlte, Einfluss gering). | erledigt (tf_replan) |
+| hid-Jobs nach 45 s abgestürzt (19.11. 00:22–00:43) | Alle 41 Jobs (Smoke + Daten) bekamen nachts eine GPU, aber fawam/hid_offset.py patchte Base_Task.setup_demo; das gibt es nur in den Aufgaben-Unterklassen → AttributeError beim Start des Clients. | Hook auf Base_Task._init_task_env_ umgestellt (wird von jedem setup_demo mit dem Seed aufgerufen); 6 Smoke- und 35 Daten-Jobs um 08:10 neu eingereiht. | erledigt |
+| Wartung HoreKa am 23.11. | Wartung ist am 23.11. (nicht 20.11.). Alles soll vorher durchlaufen. | Angehaltene P7d- und p0s-Jobs am 19.11. freigegeben (mit niedrigerer Priorität, damit hid und p14 zuerst laufen). | Evals laufen; Zeitlimits auf 2:30 / 3 h gesenkt |
+| Daten lehren keinen Kontext-Gebrauch | In allen bisherigen Daten ist der Fehler im aktuellen Bild sichtbar oder die Korrektur immer gleich: Validierungs-Loss mit Kontext ≥ ohne Kontext, der Adapter lernt die Korrektur auswendig. | Datensatz hid: pro Seed ein unsichtbarer Kalibrier-Offset o, nur aus dem Fehlversuch erkennbar (PLAN_HID.md). | offen: hid hat es nicht gelöst (C2 ohne Effekt) |
+| P7c-Störungen erzeugen kaum Fehlschläge | Licht, Hintergrund, Clutter, Objektposition 5 cm und Drehung ±60° geben nur 1–10 % Fehlschläge (27 insgesamt). Das Basismodell ist darauf schon randomisiert trainiert. | Das Training mit „7 Typen“ bestand zu 86 % aus P7b-Daten. Neuer Datensatz P7d mit stärkeren Störungen. | erledigt (P7d gesammelt) |
+| Schwere Objekte und schwacher Greifer wirken nicht | Masse ×10–40: 2 Fehlschläge, Greifkraft ×0,15: 4 Fehlschläge (je ~84 Episoden). Die Patches greifen laut Log, aber der Griff in der Simulation bleibt stabil. | Beide Störungen gestrichen; Objektposition ±10 cm und Drehung ±90° werden auf 36 Episoden pro Aufgabe aufgefüllt. | erledigt (nur Position/Drehung aufgefüllt) |
+| VLM-Text ist fast immer gleich | „The left arm failed to grasp the box“: kein Hinweis, dass der Greifer zu hoch ist, kein Fix. Für das Modell ist der Kontext damit fast konstant. | Neuer VLM-Modus „detail“ (Phase, wo der Greifer beim Schließen war, was das Objekt tat, ein Fix-Satz). Dazu Test fein-getunter Fehler-VLMs. | Test läuft (Detail-Text in P8c und p8s) |
+| Kontext wird oft nicht genutzt | Mit und ohne Kontext gleich gut: Der Adapter lernt die Korrektur selbst, ohne den Kontext zu lesen. | Mehr verschiedene Fehlertypen (P7d) und Basismodell mittrainieren (wie WAM-TTT, Option --train_base). | Test läuft (P8c kleine Kontexte, p8s Basis mittrainiert) |
+| VLM-Benchmark: Anfragen an den falschen Server | Mehrere Jobs auf einem Knoten nutzten alle Port 8001, 40–58 von 105 Anfragen bekamen 404. Gültige Antworten sind korrekt (Modellname muss passen). | Port pro Job (auch im VLM-Analyse-Job), fehlgeschlagene Anfragen werden wiederholt. | erledigt (Port pro Job) |
 | Pipeline tickt nicht automatisch | Die scrontab wurde beim VS-Code-Start deaktiviert (#DISABLED). | scrontab neu installiert, Ticks laufen jetzt auf der Partition cpu (nicht agent, nicht dev-cpu). | erledigt |
-| Job-Limit 100 pro Account | 21 angehaltene p0s_task_screen-Jobs belegen Plätze. | Abbrechen, wenn nicht mehr gebraucht. | offen (Nutzer) |
+| Job-Limit 100 pro Account | Die p0s-Jobs sind inzwischen gelaufen (19 fertig, 2 Zeitlimit). | Abbrechen, wenn nicht mehr gebraucht. | erledigt |
 | Cosmos-Reason2 nicht ladbar | Das Modell ist auf Hugging Face zugangsbeschränkt. | Lizenz auf huggingface.co/nvidia/Cosmos-Reason2-8B akzeptieren und auf dem Cluster „hf auth login“ ausführen. Getestet wird vorerst Cosmos-Reason1-7B. | offen (Nutzer) |
 | Weggeflogene Box zählt als Erfolg | RoboTwin prüft nur |x| > 0,23 m mit offenen Greifern. | Erfolg nur, wenn das Objekt auf Starthöhe ±5 cm und innerhalb von 0,6 m bleibt; Spalte „weggeflogen“. | erledigt |
 
@@ -255,6 +345,22 @@ Stand: 2026-11-18 21:00
 | `icl_types_ttt_wam_VP` | 0/24 (0 %) | 0/30 (0 %) |
 | `icl_types_ttt_wam_VP_noctx` | 9/25 (36 %), 2 weggeflogen | 0/30 (0 %) |
 
+### D · Mehr Fehlschläge (P7d), VLM detail, mit/ohne Basis-Training
+
+`p8s_strong` · gelöste Fehlversuche im zweiten Versuch
+
+| Methode | −5 cm | −10 cm |
+|---|---|---|
+| `ft_strong_base` | 3/27 (11 %), 3 weggeflogen | 0/30 (0 %) |
+| `icl_strong_film_memory_plus_adapterplus_VPD` | 10/27 (37 %), 1 weggeflogen | 1/30 (3 %), 1 weggeflogen |
+| `icl_strong_film_memory_plus_adapterplus_VPD_noctx` | 9/29 (31 %), 5 weggeflogen | 0/30 (0 %), 1 weggeflogen |
+| `icl_strong_film_memory_plus_adapterplus_base_VPD` | 2/29 (7 %), 5 weggeflogen | 0/30 (0 %) |
+| `icl_strong_film_memory_plus_adapterplus_base_VPD_noctx` | 3/25 (12 %), 4 weggeflogen | 0/30 (0 %), 1 weggeflogen |
+| `icl_strong_lora_r16_attn_VPD` | 5/26 (19 %), 5 weggeflogen | 0/30 (0 %) |
+| `icl_strong_lora_r16_attn_VPD_noctx` | 6/27 (22 %), 3 weggeflogen | 1/30 (3 %) |
+| `icl_strong_lora_r16_attn_base_VPD` | 6/25 (24 %), 5 weggeflogen | 1/30 (3 %), 1 weggeflogen |
+| `icl_strong_lora_r16_attn_base_VPD_noctx` | 1/22 (5 %), 5 weggeflogen | 0/30 (0 %) |
+
 ### E · Verwandte Arbeiten nachgebaut
 
 `p9_related` · gelöste Fehlversuche im zweiten Versuch
@@ -280,6 +386,18 @@ Stand: 2026-11-18 21:00
 | `failfix_dist_ttt_wam_vlm` | 1500 | 0.0087 | 0.0053 | nein |
 | `failfix_ft_adapterplus` | 1500 | 0.116 | 0.0021 | nein |
 | `failfix_gapkeys_vlm` | 1500 | 0.003 | 0.0023 | nein |
+| `failfix_hid_lora` | 1500 | 0.0075 | 0.0075 | nein |
+| `failfix_sc_diffobswin` | 1500 | 0.0036 | 0.0034 | nein |
+| `failfix_sc_diffwin` | 1500 | 0.0034 | 0.0029 | nein |
+| `failfix_sc_diffwin_vlmd` | 1500 | 0.0032 | 0.0029 | nein |
+| `failfix_sc_gapkeys` | 1500 | 0.0038 | 0.0032 | nein |
+| `failfix_sc_predobswin` | 1500 | 0.0035 | 0.0031 | nein |
+| `failfix_sc_textonly_vlmd` | 1500 | 0.0027 | 0.0027 | nein |
+| `failfix_strong_film_memory_plus_adapterplus_vlmd` | 1500 | 0.0056 | 0.0054 | nein |
+| `failfix_strong_film_memory_plus_adapterplus_vlmd_base` | 1500 | 0.0087 | 0.0049 | nein |
+| `failfix_strong_ft_base` | 1500 | 0.1415 | 0.0031 | nein |
+| `failfix_strong_lora_r16_attn_vlmd` | 1500 | 0.0043 | 0.004 | nein |
+| `failfix_strong_lora_r16_attn_vlmd_base` | 1500 | 0.0069 | 0.0043 | nein |
 | `failfix_textonly_vlm` | 1500 | 0.002 | 0.002 | nein |
 | `failfix_type_adaln_vlm` | 1500 | 0.0066 | 0.0038 | nein |
 | `failfix_type_adapterplus_vlm` | 1500 | 0.0053 | 0.0036 | nein |
@@ -322,15 +440,15 @@ tiefer = sagt „tiefer greifen“, wo der Greifer zu hoch war · tiefer falsch 
 |---|---|---|---|---|---|---|---|
 | MINT-SJTU_RoboFAC-7B | checklist | 105 | 0 | 37 % | 0 % | 10 % | – |
 | MINT-SJTU_RoboFAC-7B | detail | 105 | 0 | 94 % | 8 % | 17 % | – |
-| MINT-SJTU_RoboFAC-7B | native_robofac | 105 | 4 | 76 % | 74 % | 55 % | – |
+| MINT-SJTU_RoboFAC-7B | native_robofac | 105 | 0 | 74 % | 74 % | 57 % | – |
 | MINT-SJTU_RoboFAC-7B | native_vifailback | 105 | 0 | 11 % | 0 % | 0 % | – |
 | MINT-SJTU_RoboFAC-7B | open | 105 | 0 | 94 % | 6 % | 20 % | – |
 | Qwen_Qwen3-VL-32B-Instruct | checklist | 105 | 0 | 94 % | 100 % | 97 % | – |
 | Qwen_Qwen3-VL-32B-Instruct | dense12 | 105 | 0 | 90 % | 26 % | 17 % | – |
-| Qwen_Qwen3-VL-32B-Instruct | detail | 105 | 44 | 93 % | 90 % | 90 % | – |
+| Qwen_Qwen3-VL-32B-Instruct | detail | 105 | 0 | 92 % | 86 % | 87 % | – |
 | Qwen_Qwen3-VL-32B-Instruct | legacy_cm | 105 | 0 | 68 % | 11 % | 20 % | – |
 | Qwen_Qwen3-VL-32B-Instruct | native_robofac | 105 | 0 | 89 % | 17 % | 33 % | – |
-| Qwen_Qwen3-VL-32B-Instruct | native_vifailback | 105 | 7 | 87 % | 15 % | 17 % | – |
+| Qwen_Qwen3-VL-32B-Instruct | native_vifailback | 105 | 0 | 86 % | 15 % | 17 % | – |
 | Qwen_Qwen3-VL-32B-Instruct | open | 105 | 0 | 93 % | 31 % | 33 % | – |
 | Qwen_Qwen3-VL-32B-Instruct | open_nocurve | 105 | 0 | 93 % | 4 % | 13 % | – |
 | Qwen_Qwen3-VL-32B-Instruct | pred_pairs | 105 | 0 | 92 % | 0 % | 0 % | – |
@@ -342,10 +460,10 @@ tiefer = sagt „tiefer greifen“, wo der Greifer zu hoch war · tiefer falsch 
 | Qwen_Qwen3-VL-32B-Instruct | zoom_pairs_steps | 105 | 0 | 89 % | 3 % | 3 % | – |
 | Qwen_Qwen3-VL-8B-Instruct | checklist | 105 | 0 | 94 % | 86 % | 100 % | – |
 | Qwen_Qwen3-VL-8B-Instruct | dense12 | 105 | 0 | 94 % | 3 % | 0 % | – |
-| Qwen_Qwen3-VL-8B-Instruct | detail | 105 | 58 | 89 % | 17 % | 38 % | – |
+| Qwen_Qwen3-VL-8B-Instruct | detail | 105 | 0 | 94 % | 18 % | 43 % | – |
 | Qwen_Qwen3-VL-8B-Instruct | legacy_cm | 105 | 0 | 82 % | 6 % | 0 % | – |
-| Qwen_Qwen3-VL-8B-Instruct | native_robofac | 105 | 50 | 94 % | 16 % | 20 % | – |
-| Qwen_Qwen3-VL-8B-Instruct | native_vifailback | 105 | 55 | 32 % | 3 % | 15 % | – |
+| Qwen_Qwen3-VL-8B-Instruct | native_robofac | 105 | 0 | 91 % | 10 % | 23 % | – |
+| Qwen_Qwen3-VL-8B-Instruct | native_vifailback | 105 | 0 | 30 % | 6 % | 17 % | – |
 | Qwen_Qwen3-VL-8B-Instruct | open | 105 | 0 | 93 % | 3 % | 0 % | – |
 | Qwen_Qwen3-VL-8B-Instruct | open_nocurve | 105 | 0 | 93 % | 8 % | 0 % | – |
 | Qwen_Qwen3-VL-8B-Instruct | pred_pairs | 105 | 0 | 92 % | 6 % | 0 % | – |
@@ -357,11 +475,11 @@ tiefer = sagt „tiefer greifen“, wo der Greifer zu hoch war · tiefer falsch 
 | Qwen_Qwen3-VL-8B-Instruct | zoom_pairs_steps | 105 | 0 | 70 % | 22 % | 20 % | – |
 | nvidia_Cosmos-Reason1-7B | checklist | 105 | 0 | 94 % | 25 % | 27 % | – |
 | nvidia_Cosmos-Reason1-7B | detail | 105 | 0 | 36 % | 4 % | 7 % | – |
-| nvidia_Cosmos-Reason1-7B | native_robofac | 105 | 6 | 84 % | 4 % | 18 % | – |
+| nvidia_Cosmos-Reason1-7B | native_robofac | 105 | 0 | 85 % | 4 % | 17 % | – |
 | nvidia_Cosmos-Reason1-7B | native_vifailback | 105 | 0 | 18 % | 0 % | 7 % | – |
 | nvidia_Cosmos-Reason1-7B | open | 105 | 0 | 94 % | 0 % | 0 % | – |
-| sii-rhos-ai_ViFailback-8B | checklist | 105 | 53 | 8 % | 10 % | 33 % | – |
-| sii-rhos-ai_ViFailback-8B | detail | 105 | 5 | 42 % | 24 % | 38 % | – |
-| sii-rhos-ai_ViFailback-8B | native_robofac | 105 | 57 | 90 % | 19 % | 27 % | – |
-| sii-rhos-ai_ViFailback-8B | native_vifailback | 105 | 39 | 76 % | 0 % | 0 % | – |
-| sii-rhos-ai_ViFailback-8B | open | 105 | 55 | 22 % | 14 % | 36 % | – |
+| sii-rhos-ai_ViFailback-8B | checklist | 105 | 0 | 7 % | 8 % | 20 % | – |
+| sii-rhos-ai_ViFailback-8B | detail | 105 | 0 | 41 % | 24 % | 37 % | – |
+| sii-rhos-ai_ViFailback-8B | native_robofac | 105 | 0 | 91 % | 18 % | 27 % | – |
+| sii-rhos-ai_ViFailback-8B | native_vifailback | 105 | 0 | 82 % | 0 % | 0 % | – |
+| sii-rhos-ai_ViFailback-8B | open | 105 | 0 | 23 % | 12 % | 37 % | – |

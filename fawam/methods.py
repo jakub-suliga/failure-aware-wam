@@ -33,6 +33,13 @@ class Method:
     num_inference_steps: int = None
     action_num_inference_steps: int = None
     action_noise: float = 0.0          # Gaussian noise (normalized action units) on the executed actions (exploration)
+    # teacher forcing (diagnostic, user request 2026-11-19): "oracle" = the client renders the expert's next chunk
+    # from the CURRENT sim state (look-ahead, then restore) and the server uses those latents instead of the imagined
+    # video, so the action stream sees a perfect prediction of the correct continuation (fawam/teacher_force.py)
+    teacher_force: str = None
+    # p14 (user request 2026-11-19): oracle latents are corrupted before use, flow-matching style
+    # lat = (1 - s) * lat + s * eps (eps ~ N(0, 1), first conditioning frame untouched) -> "slightly imperfect video"
+    teacher_force_noise: float = 0.0
 
     # --- steering (server, A6) ------------------------------------------------------------------------------------
     steer_path: str = None             # fawam.probe steering output (.npz)
@@ -44,6 +51,14 @@ class Method:
     adapter_path: str = None           # fawam.train_adapter output dir
     adapter_use: str = "all"           # all | inside | outside
     hid_residual: dict = None          # M3 (fawam/train_hid.py): {"path": head dir, "ctx_ep": failed episode or None}
+    # plan v2 (2026-11-21) TTT P2: adapter strength per chunk = normalised prediction gap of the previous attempt at the
+    # same chunk index (time-aligned): {"ref_ep": failed episode dir}
+    adapter_gate: dict = None
+    # plan v2 TTT P3: exploration in imagination. Inside the failure window of the previous attempt (latent frames
+    # [latent - before, latent + after] around its gap peak) sample n video plans and keep the one FARTHEST from what
+    # really happened there: {"ref_ep", "latent", "n": 8, "before": 4, "after": 2}
+    explore: dict = None
+    skip_generation: bool = False      # p21 data driver: no denoising at all (expert continuations only need encoding)
 
     # --- in-context (server + client, E) --------------------------------------------------------------------------
     prefill: dict = None               # {"bank": dir, "k": 1, "select": nearest|random|same_task, "gap": 1}
@@ -147,6 +162,10 @@ ICL_DEFAULTS = dict(
 # ---------------------------------------------------------------------------------------------- presets
 PRESETS = {
     "base": {},
+    "tf_oracle": dict(teacher_force="oracle"),
+    "tf_replan": dict(teacher_force="replan"),  # oracle = task planner re-run from the current state before EVERY chunk
+    **{f"tf_replan_n{int(round(_s * 100)):02d}": dict(teacher_force="replan", teacher_force_noise=_s)
+       for _s in (0.1, 0.25, 0.5, 0.75)},
     # A1 imagination guidance
     "ig1.5": dict(imagination_guidance=1.5),
     "ig2": dict(imagination_guidance=2.0),
@@ -474,6 +493,16 @@ for _c in ("C2", "C3", "C4", "C5"):
         for _mode, _suf in (("own", ""), ("none", "_noctx"), ("shuf", "_shuf")):
             PRESETS[f"hidm3_{_c}{_x.replace('.', '')}{_suf}"] = dict(learn=dict(mode="hidres", signals=["gap"],
                                                                                hid_head=_h, hid_ctx=_mode))
+# P8c small contexts (cluster/adapter_grid.py SMALL_CTX); _noctx = same adapter, instruction only, no memory
+_W = dict(segment="window", window=dict(before=4, after=2))
+for _n, _icl, _v in (("diffwin", dict(groups=["diff"], **_W), _VLM), ("diffobswin", dict(groups=["diff", "obs"], **_W), _VLM),
+                     ("predobswin", dict(groups=["pred", "obs"], **_W), _VLM),
+                     ("gapkeys", dict(groups=["pred", "obs"], segment="gaptop"), _VLM),
+                     ("diffwin_vlmd", dict(groups=["diff"], **_W), _VLMD), ("textonly_vlmd", dict(content=[]), _VLMD)):
+    _ad = f"artifacts/adapters/failfix_sc_{_n}"
+    PRESETS[f"icl_sc_{_n}"] = dict(learn=dict(mode="icl", signals=["vlm", "gap"], meta_adapter=_ad, icl=_icl), vlm=_v)
+    PRESETS[f"icl_sc_{_n}_noctx"] = dict(learn=dict(mode="icl", signals=["vlm", "gap"], meta_adapter=_ad,
+                                                    icl=dict(content=[], text="instruction")), vlm=_v)
 PRESETS["icl_meta_diff_VP"] =dict(learn=dict(mode="icl", signals=["vlm", "gap"],
                                               meta_adapter="artifacts/adapters/failfix_diff_vlm",
                                               icl=dict(groups=["diff", "obs"])), vlm=_VLM)
@@ -557,3 +586,54 @@ def resolve(spec=None, root=None) -> Method:
         if m.prefill and m.prefill.get("bank") and not Path(m.prefill["bank"]).is_absolute():
             m.prefill = {**m.prefill, "bank": str(root / m.prefill["bank"])}
     return m
+
+# ===================== plan v2 (2026-11-21), TTT line p22: video-only adaptation on this one scene =====================
+# Adapter only in the video pass (inside_streams video / LoRA lora_streams video), video flow-matching loss on the own
+# failed episode (teacher forcing on the real past), action loss 0, no relabel, no oracle. Up to 3 retries per seed.
+_TTT = dict(mode="adapter", signals=["gap"], relabel=False, gap_beta=0.0, lambda_action=0.0, video_in_window="real",
+            kind="inside", inside_streams=["video"], steps=50, lr=1e-4, init="base", memory="last", max_attempts=4)
+PRESETS["ttt_p0"] = dict(learn=dict(_TTT))                                            # P0 pure prediction error
+for _st in (10, 50, 200):
+    for _lr, _ln in ((1e-4, "1e-4"), (1e-3, "1e-3")):
+        PRESETS[f"ttt_p0_s{_st}_lr{_ln}"] = dict(learn=dict(_TTT, steps=_st, lr=_lr))  # P0 grid (Adapter+)
+PRESETS["ttt_p1"] = dict(learn=dict(_TTT, gap_filter=0.5))                            # P1 loss only above the median gap
+PRESETS["ttt_p2"] = dict(learn=dict(_TTT, gate="prev_gap"))                           # P2 adapter strength = last gap
+PRESETS["ttt_p3"] = dict(learn=dict(mode="none", signals=["gap"], max_attempts=4, explore=True, explore_n=8))
+PRESETS["ttt_p4"] = dict(learn=dict(_TTT, mode="none", explore=True, explore_n=8, learn_from_success=True,
+                                    persist=True))                                    # P4 own success as the target
+PRESETS["ttt_p5"] = dict(learn=dict(_TTT, mode="none", explore=True, explore_n=8, learn_from_success=True,
+                                    persist=True, hinge_beta=1.0))                    # P5 + video hinge vs the failure
+PRESETS["ttt_p6"] = dict(learn=dict(_TTT, init="prev"))                               # P6 keep training across retries
+PRESETS["ttt_p0_lora"] = dict(learn=dict(_TTT, kind="lora"))                          # adapter comparison: LoRA r16
+PRESETS["ttt_p0_dual"] = dict(learn=dict(_TTT, kind=None, outside="sequential", outside_steps=50))  # dual-site
+PRESETS["ttt_retry"] = dict(learn=dict(mode="none", signals=["gap"], max_attempts=4))  # control: retry, no learning
+
+# ===================== plan v2 (2026-11-21), ICL stage 1 p21: rewind retry with a meta-trained video adapter ===========
+# Adapter artifacts/adapters/p21_<setting>_<arch>_<ctx>[_<sampling>] (cluster/p21_train_job.sh); test protocol in the
+# client (_icl_rewind): reset k=2 chunks before the gripper closed, context of the failed attempt + own past in the KV
+# cache. _foreign: context = a failure with the opposite sign of the hidden parameter (bank sweep p21_bank).
+P21_VARIANTS = [(s, a, c, x) for s in ("sa", "sb") for a, c, x in
+                [("A1", c, "") for c in ("C0", "C1", "C2", "C3")] + [("A2", "C2", ""), ("A3", "C2", "")]] + \
+               [("sb", "A1", c, "") for c in ("C4", "C5", "C6", "C7", "C8")] + \
+               [("sb", "A1", "C2", x) for x in ("_win50", "_w4")] + \
+               [("sb", t, "C2", "") for t in ("T1", "T2", "T4", "T5")]
+_P21_EXTRA = {"A3": dict(ctx_mode="separate"), "T1": dict(gate="t1"), "T2": dict(gate="t2"),
+              "T4": dict(ctx_mode="both"), "T5": dict(gate="t5")}
+for _s, _a, _c, _x in P21_VARIANTS:
+    _n = f"p21_{_s}_{_a}_{_c}{_x}"
+    _base = dict(mode="icl_rewind", signals=["gap"], meta_adapter=f"artifacts/adapters/{_n}", ctx=_c, k=2, harm=True,
+                 max_past=8, foreign_bank=[f"results/sweeps/p21_bank/base/icl_{_s}"], **_P21_EXTRA.get(_a, {}))
+    PRESETS[f"icl2_{_s}_{_a}_{_c}{_x}"] = dict(learn=dict(_base))
+    PRESETS[f"icl2_{_s}_{_a}_{_c}{_x}_foreign"] = dict(learn=dict(_base, foreign=True, harm=False))
+# smoke of the p21 rewind protocol: zero-initialised Adapter+ (= base), context C3 / C5 / C7
+for _c in ("C3", "C5", "C7"):
+    PRESETS[f"icl2_smoke_{_c}"] = dict(learn=dict(mode="icl_rewind", signals=["gap"], ctx=_c, k=2, harm=True,
+                                                  max_past=8, meta_adapter="artifacts/adapters/p21_smoke_A1",
+                                                  foreign_bank=["results/sweeps/p21_bank/base/icl_sb"]))
+PRESETS["icl2_smoke_C3_foreign"] = dict(learn=dict(PRESETS["icl2_smoke_C3"]["learn"], foreign=True, harm=False))
+# smoke of A3 / T gates at inference (adapters from the 20-step training smokes)
+for _a, _x in (("A3", dict(ctx_mode="separate")), ("T1", dict(gate="t1")), ("T2", dict(gate="t2")),
+               ("T4", dict(ctx_mode="both")), ("T5", dict(gate="t5")), ("A1", {}), ("A2", {})):
+    PRESETS[f"icl2_smoke_{_a}"] = dict(learn=dict(mode="icl_rewind", signals=["gap"], ctx="C2", k=2, harm=True,
+                                                  max_past=8, meta_adapter=f"artifacts/adapters/p21smoke_{_a}_C2",
+                                                  foreign_bank=["results/sweeps/p21_bank/base/icl_sb"], **_x))

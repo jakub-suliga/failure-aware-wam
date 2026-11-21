@@ -1,0 +1,17 @@
+# P8c (user 2026-11-20): small contexts + VLM text on the held-out failure type, same protocol as p8t_heldout_types.
+# LoRA r16 attn meta-trained on P7b+P7c (7 failure types, never table height, never the test task); memory reduced from
+# ~7000 tokens (p8t: whole failed episode, imagined + real) to a window / keyframes / the error map / text only.
+# Reference p8t LoRA: -5 cm 11/25 with context vs 2/29 without; -10 cm 0/30 both.
+name: p8c_small_ctx
+out: results/sweeps/p8c_small_ctx
+episodes: 30
+per_job: 10
+n_par: 2
+time: "02:30:00"
+vlm: true
+extra_env: {VLM_MODEL: Qwen/Qwen3-VL-8B-Instruct, HF_HUB_OFFLINE: 1}
+tasks: [move_playingcard_away]
+configs: [table_h_m05, table_h_m10]
+methods: [icl_sc_diffwin, icl_sc_diffwin_noctx, icl_sc_diffobswin, icl_sc_diffobswin_noctx,
+          icl_sc_predobswin, icl_sc_predobswin_noctx, icl_sc_gapkeys, icl_sc_gapkeys_noctx,
+          icl_sc_diffwin_vlmd, icl_sc_diffwin_vlmd_noctx, icl_sc_textonly_vlmd, icl_sc_textonly_vlmd_noctx]

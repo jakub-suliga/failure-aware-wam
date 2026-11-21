@@ -60,6 +60,31 @@ def _install_mass_scale(lo, hi):
     print(f"sim_disturb: object mass x U[{lo}, {hi}]")
 
 
+def _install_object_scale(lo, hi):
+    """Every object loaded from a model_data json (create_actor / create_glb / urdf) is scaled by a factor drawn
+    uniformly from [lo, hi] (per object, from the task's seeded np.random). The scale is changed in model_data itself,
+    so collision, visual mesh AND the functional/contact points the expert planner uses stay consistent."""
+    import json as _json
+    import envs.utils.create_actor as ca
+
+    class _ScaledJson:
+        def __getattr__(self, k):
+            return getattr(_json, k)
+
+        @staticmethod
+        def load(f, *a, **k):
+            d = _json.load(f, *a, **k)
+            if isinstance(d, dict) and "scale" in d:
+                s = float(np.random.uniform(lo, hi))
+                sc = d["scale"]
+                d["scale"] = [float(x) * s for x in sc] if isinstance(sc, (list, tuple)) else float(sc) * s
+                d["_fawam_size_factor"] = s
+            return d
+
+    ca.json = _ScaledJson()
+    print(f"sim_disturb: object size x U[{lo}, {hi}]")
+
+
 def _install_gripper_scale(scale):
     from envs.robot.robot import Robot
     orig = Robot.init_joints
@@ -75,8 +100,37 @@ def _install_gripper_scale(scale):
     print(f"sim_disturb: gripper stiffness/damping x {scale}")
 
 
+def _install_table_signed(lo, hi, variant=0):
+    """S-A (plan v2, 2026-11-21): table height offset +-U[lo, hi] per seed; sign + for even seeds, - for odd (balanced),
+    magnitude from a hash of the seed. Stored as env._table_bias (label / analysis only, never a model input)."""
+    import hashlib
+    from envs._base_task import Base_Task
+    orig = Base_Task._init_task_env_
+
+    def init_task_env(self, *a, **k):
+        seed = int(k.get("seed", 0))
+        rng = np.random.default_rng(int(hashlib.sha1(f"table/{seed}{'/v%d' % variant if variant else ''}".encode())
+                                        .hexdigest()[:12], 16))
+        sign = (1.0 if seed % 2 == 0 else -1.0) * (-1.0 if variant % 2 else 1.0)  # variant 1: same scene, other sign
+        bias = sign * float(rng.uniform(lo, hi))
+        k["table_height_bias"] = bias
+        self._table_bias = bias
+        return orig(self, *a, **k)
+
+    Base_Task._init_task_env_ = init_task_env
+    print(f"sim_disturb: table height +-U[{lo}, {hi}] (sign by seed parity)")
+
+
 def install(args):
     extra = False
+    ts = args.get("table_height_signed")
+    if ts:
+        _install_table_signed(float(ts[0]), float(ts[1]), int(args.get("table_signed_variant", 0)))
+        extra = True
+    osz = args.get("object_size_scale")
+    if osz:
+        _install_object_scale(float(osz[0]), float(osz[1]))
+        extra = True
     ms = args.get("object_mass_scale")
     if ms:
         _install_mass_scale(float(ms[0]), float(ms[1]))

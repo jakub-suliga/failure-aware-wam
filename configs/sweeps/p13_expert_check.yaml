@@ -1,0 +1,12 @@
+# p13 control: the oracle's source, the expert replayed through the same take_action('ee') pipeline. Is it a REAL
+# success at the lowered table (object not flung)? Otherwise the oracle future is not a correct continuation.
+name: p13_expert_check
+out: results/sweeps/p13_expert_check
+driver: expert_replay
+episodes: 12
+per_job: 12
+n_par: 3
+time: "01:00:00"
+tasks: [move_playingcard_away]
+configs: [table_h_m05, table_h_m10]
+methods: [base]

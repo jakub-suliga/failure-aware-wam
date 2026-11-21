@@ -1,5 +1,5 @@
 diff --git a/evaluation/robotwin/eval_polict_client_openpi.py b/evaluation/robotwin/eval_polict_client_openpi.py
-index 7ed5265..41be082 100644
+index 7ed5265..0f982d1 100644
 --- a/evaluation/robotwin/eval_polict_client_openpi.py
 +++ b/evaluation/robotwin/eval_polict_client_openpi.py
 @@ -1,12 +1,14 @@
@@ -18,7 +18,15 @@ index 7ed5265..41be082 100644
  if str(robowin_root) not in sys.path:
      sys.path.insert(0, str(robowin_root))
  
-@@ -38,9 +40,17 @@ import numpy as np
+@@ -26,6 +28,7 @@ import yaml
+ from datetime import datetime
+ import importlib
+ import argparse
++import re
+ import pdb
+ from evaluation.robotwin.geometry import euler2quat
+ import numpy as np
+@@ -38,9 +41,17 @@ import numpy as np
  from pathlib import Path
  from scipy.spatial.transform import Rotation as R
  import json
@@ -32,11 +40,11 @@ index 7ed5265..41be082 100644
 +if str(FAWAM_ROOT) not in sys.path:
 +    sys.path.insert(0, str(FAWAM_ROOT))
 +from fawam.methods import resolve as resolve_method
-+from fawam.robotwin_hooks import ExpertTrajectory, LearnFromFailure, Orchestrator, expert_chunk, failure_text
++from fawam.robotwin_hooks import ExpertTrajectory, LearnFromFailure, Orchestrator, expert_chunk, failure_text, to_relative
  from evaluation.robotwin.test_render import Sapien_TEST
  
  def write_json(data: dict, fpath: Path) -> None:
-@@ -260,6 +270,142 @@ def save_comparison_video(real_obs_list, imagined_video, action_history, save_pa
+@@ -260,6 +271,142 @@ def save_comparison_video(real_obs_list, imagined_video, action_history, save_pa
      print(f"Combined video saved to: {save_path}")
  
  
@@ -179,7 +187,7 @@ index 7ed5265..41be082 100644
  def class_decorator(task_name):
      envs_module = importlib.import_module(f"envs.{task_name}")
      try:
-@@ -313,10 +459,16 @@ def main(usr_args):
+@@ -313,10 +460,16 @@ def main(usr_args):
      with open(f"./task_config/{task_config}.yml", "r", encoding="utf-8") as f:
          args = yaml.load(f.read(), Loader=yaml.FullLoader)
  
@@ -196,7 +204,7 @@ index 7ed5265..41be082 100644
  
      embodiment_type = args.get("embodiment")
      embodiment_config_path = os.path.join(CONFIGS_PATH, "_embodiment_config.yml")
-@@ -455,28 +607,42 @@ def eval_policy(task_name,
+@@ -455,28 +608,42 @@ def eval_policy(task_name,
      print(f"\033[34mTask Name: {args['task_name']}\033[0m")
      print(f"\033[34mPolicy Name: {args['policy_name']}\033[0m")
  
@@ -233,7 +241,7 @@ index 7ed5265..41be082 100644
              try:
                  TASK_ENV.setup_demo(now_ep_num=now_id, seed=now_seed, is_test=True, **args)
 -                episode_info = TASK_ENV.play_once()
-+                if driver in ("expert_replay", "pair"):
++                if driver in ("expert_replay", "pair") or method.teacher_force:
 +                    with ExpertTrajectory(TASK_ENV) as expert:
 +                        episode_info = TASK_ENV.play_once()
 +                else:
@@ -241,7 +249,7 @@ index 7ed5265..41be082 100644
                  TASK_ENV.close_env()
              except UnStableError as e:
                  TASK_ENV.close_env()
-@@ -484,12 +650,17 @@ def eval_policy(task_name,
+@@ -484,12 +651,17 @@ def eval_policy(task_name,
                  args["render_freq"] = render_freq
                  continue
              except Exception as e:
@@ -260,7 +268,7 @@ index 7ed5265..41be082 100644
  
          if (not expert_check) or (TASK_ENV.plan_success and TASK_ENV.check_success()):
              succ_seed += 1
-@@ -501,137 +672,70 @@ def eval_policy(task_name,
+@@ -501,137 +673,95 @@ def eval_policy(task_name,
  
          args["render_freq"] = render_freq
  
@@ -389,16 +397,35 @@ index 7ed5265..41be082 100644
 -        if TASK_ENV.eval_video_path is not None:
 -            TASK_ENV._del_eval_video_ffmpeg()
  
++        # plan v2: resumable evals -- a seed whose first attempt is already recorded (job cancelled / re-submitted,
++        # e.g. around the maintenance) is skipped; seeds and episode names are deterministic per job
++        _done = [Path(args['save_root']) / 'episodes' / k / task_name / f"ep{TASK_ENV.test_num:04d}_seed{now_seed}"
++                 for k in ("success", "fail")]
++        if os.environ.get("FAWAM_SKIP_DONE", "1") == "1" and any((d / "meta.json").exists() for d in _done):
++            print(f"\033[90mseed {now_seed}: already recorded, skipped\033[0m")
++            TASK_ENV.suc += int((_done[0] / "meta.json").exists())
++            TASK_ENV.test_num += 1
++            now_id += 1
++            now_seed += 1
++            continue
 +        if lff is not None:
 +            lff.start_seed()
 +        m1 = lff.first_method() if lff is not None else method
 +        phase = lff.phase() if lff is not None else None
-+        run_driver = "policy" if driver == "pair" else driver
++        run_driver = "policy" if driver in ("pair", "snap") else driver
++        rewind = bool(method.learn and method.learn.get("mode") == "icl_rewind")
++        snap_rec = [] if (driver == "snap" or rewind) else None
 +        succ, final_dir, end_info = run_episode(TASK_ENV, args, model, task_name, now_id, now_seed, instruction,
 +                                                video_size, save_visualization, video_guidance_scale,
 +                                                action_guidance_scale, m1, run_driver,
-+                                                None if driver == "pair" else expert, attempt=1,
-+                                                lff_info=dict(phase=phase, adapter=m1.adapter_path) if lff else None)
++                                                None if driver in ("pair", "snap") else expert, attempt=1,
++                                                lff_info=dict(phase=phase, adapter=m1.adapter_path) if lff else None,
++                                                snap_rec=snap_rec)
++        if driver == "snap":
++            _snap_continuations(TASK_ENV, args, model, task_name, now_id, now_seed, instruction, video_size,
++                                video_guidance_scale, action_guidance_scale, snap_rec, final_dir, succ,
++                                end_info["init16"])
++            snap_rec = None
 +        # driver "pair" (meta-training data, docs/ICL.md): a failed policy rollout is followed by the expert replay of
 +        # the SAME seed (= the fix), recorded through the same pipeline; pairs match on (task, task_config, seed)
 +        # hid data: the fix is recorded for every seed (o = 0 seeds: context = success, target = no change)
@@ -424,12 +451,18 @@ index 7ed5265..41be082 100644
 +                                      driver, None, attempt=2, prompt_override=prompt2, prefill_paths=prefill)
 +            TASK_ENV.suc_retry += int(succ2)
 +            print(f"\033[93mRetry: {'Success' if succ2 else 'Fail'}\033[0m")
++        if rewind and driver == "policy":  # p21 ICL stage 1: rewind to k chunks before the close, retry with context
++            ok2 = _icl_rewind(TASK_ENV, args, model, task_name, now_id, now_seed, instruction, video_size,
++                              video_guidance_scale, action_guidance_scale, method, snap_rec, final_dir, succ,
++                              end_info["init16"])
++            TASK_ENV.suc_retry += int(bool(ok2) and not succ)
++            snap_rec = None
 +        # Learn-from-Failure (docs/METHOD.md): analyse the failure, update the model, retry the same seed
-+        if lff is not None and driver == "policy":
++        elif lff is not None and driver == "policy":
 +            attempt, ok, ep_dir = 1, succ, final_dir
 +            if ok:
 +                lff.after_success(ep_dir)
-+            while not ok and attempt < method.learn["max_attempts"]:
++            while not ok and attempt < method.learn["max_attempts"] and lff.allow_retry():
 +                TASK_ENV.close_env()
 +                m2, prompt2, prefill, info = lff.after_failure(ep_dir, instruction, now_seed, attempt)
 +                print(f"\033[93mLfF after attempt {attempt}: {json.dumps(info, default=str)[:400]}\033[0m")
@@ -441,7 +474,7 @@ index 7ed5265..41be082 100644
 +                                            prefill_include_pred=method.learn["include_pred"], lff_info=info)
 +                print(f"\033[93mLfF attempt {attempt}: {'Success' if ok else 'Fail'}\033[0m")
 +                if ok:
-+                    lff.after_success(ep_dir)
++                    lff.after_success(ep_dir, attempt=attempt)
 +            TASK_ENV.suc_retry += int(ok and not succ)
 +            if method.learn.get("every_episode"):
 +                lff.update_only(final_dir, succ, now_seed)
@@ -452,7 +485,7 @@ index 7ed5265..41be082 100644
          now_id += 1
          TASK_ENV.close_env(clear_cache=((succ_seed + 1) % clear_cache_freq == 0))
  
-@@ -647,10 +751,13 @@ def eval_policy(task_name,
+@@ -647,10 +777,13 @@ def eval_policy(task_name,
            "succ_num": float(TASK_ENV.suc),
            "total_num": float(TASK_ENV.test_num),
            "succ_rate": float(TASK_ENV.suc / TASK_ENV.test_num),
@@ -468,18 +501,145 @@ index 7ed5265..41be082 100644
              f"Success rate: \033[96m{TASK_ENV.suc}/{TASK_ENV.test_num}\033[0m => \033[95m{round(TASK_ENV.suc/TASK_ENV.test_num*100, 1)}%\033[0m, current seed: \033[90m{now_seed}\033[0m\n"
          )
          now_seed += 1
-@@ -658,6 +765,197 @@ def eval_policy(task_name,
+@@ -658,6 +791,362 @@ def eval_policy(task_name,
      return now_seed, TASK_ENV.suc
  
  
++def _snap_continuations(TASK_ENV, args, model, task_name, now_id, now_seed, instruction, video_size, vgs, ags,
++                        snap_rec, parent_dir, parent_ok, init16):
++    """plan v2 p20 D3 / p21 data: from the snapshot k chunks before the gripper closes (k = 1: start of the chunk in
++    which the gripper command goes from open to closed), the planner continues to the end. Modes (task config key
++    snap_modes, default "expert"): expert = planner trajectory replayed through the EE interface (compensated under a
++    hidden offset), server only encodes (skip_generation) -> target video for training; tf = the policy acts with the
++    replanned oracle video (tf_replan) from there (D3). Failed attempts: k in snap_ks (default 1,2,3); successful
++    attempts: k = 2 only (irrelevant-context pairs). Summary in <attempt dir>/snap_info.json."""
++    from fawam.teacher_force import replan_poses
++    thr = float(args.get("snap_grip_thr", 0.8))
++    close = None
++    for i in range(1, len(snap_rec)):
++        if min(snap_rec[i - 1]["grip"]) >= thr and min(snap_rec[i]["grip"]) < thr:
++            close = snap_rec[i - 1]["chunk"]
++            break
++    ks = [int(k) for k in str(os.environ.get("FAWAM_SNAP_KS", args.get("snap_ks", "1,2,3"))).split(",")] \
++        if not parent_ok else [2]
++    modes = [m for m in re.split(r"[,+]", str(os.environ.get("FAWAM_SNAP_MODES", args.get("snap_modes", "expert"))))
++             if m]  # "+" separated in sbatch --export (a comma would split the variable)
++    info = dict(close_chunk=close, n_chunks=len(snap_rec) - 1, parent_success=bool(parent_ok), ks=ks, conts=[])
++    by_chunk = {r["chunk"]: r for r in snap_rec if r["snap"] is not None}
++    for k in ks if close is not None else []:
++        r = close - k + 1
++        if r < 0 or r not in by_chunk:  # r = 0: reset at the start, empty past
++            info["conts"].append(dict(k=k, reset_chunk=r, skipped="reset point before the episode start"))
++            continue
++        snap = by_chunk[r]["snap"]
++        snap.restore()
++        poses, phase, ok = replan_poses(TASK_ENV, generic=True)
++        rec = dict(k=k, reset_chunk=r, reset_step=by_chunk[r]["step"], phase=phase, planner_ok=bool(ok))
++        if ok and poses is not None and len(poses) > 1:
++            rel = np.stack([to_relative(pp, init16) for pp in poses[1:]])
++            for mode in modes:
++                meta = dict(parent=str(parent_dir), k=k, reset_chunk=r, close_chunk=close, mode=mode, phase=phase,
++                            parent_success=bool(parent_ok), reset_step=by_chunk[r]["step"])
++                cont = dict(snap=snap, init16=init16, suffix=f"_attempt_snap_{mode}{k}", meta=meta,
++                            expert_rel=rel if mode == "expert" else None, tf_poses=poses if mode == "tf" else None)
++                m = resolve_method(dict(name="snap_cont", skip_generation=True)) if mode == "expert" \
++                    else resolve_method("tf_replan")
++                vp, TASK_ENV.eval_video_path = TASK_ENV.eval_video_path, None
++                try:
++                    ok2, d2, _ = run_episode(TASK_ENV, args, model, task_name, now_id, now_seed, instruction,
++                                             video_size, False, vgs, ags, m,
++                                             "expert_replay" if mode == "expert" else "policy", None, attempt=2,
++                                             cont=cont)
++                    rec[mode] = dict(success=bool(ok2), dir=str(d2))
++                except Exception as e:  # keep the data run alive
++                    traceback.print_exc()
++                    rec[mode] = dict(error=repr(e)[:300])
++                finally:
++                    TASK_ENV.eval_video_path = vp
++                print(f"\033[93msnap k={k} {mode}: {rec[mode]}\033[0m")
++        info["conts"].append(rec)
++    write_json(info, Path(parent_dir) / "snap_info.json")
++
++
++def _icl_rewind(TASK_ENV, args, model, task_name, now_id, now_seed, instruction, video_size, vgs, ags, method,
++                snap_rec, parent_dir, parent_ok, init16):
++    """p21 test protocol (plan v2 2.7): the failed attempt is rewound to the snapshot k chunks before the gripper
++    closed (same reset rule as the training data); the retry starts there with the variant's adapter (video pass
++    only), its context of the failed attempt (or a FOREIGN failure with the opposite sign of the hidden parameter) and
++    the own past up to the reset point in the KV cache. Base successes get the same retry with their own (successful)
++    attempt as context: does the adapter harm where nothing had to be corrected?"""
++    import copy as _copy
++    from fawam import icl_snap
++    c = method.learn
++    if parent_ok and not c.get("harm", True):
++        return None
++    close, L = icl_snap.close_from_h5(parent_dir)
++    by_chunk = {r["chunk"]: r for r in snap_rec if r["snap"] is not None}
++    k = int(c.get("k", 2))
++    r = max(1, close - k + 1)
++    r = max([x for x in by_chunk if x <= r] or [min(by_chunk)])
++    ctx, src, L_src = c.get("ctx", "C2"), parent_dir, L
++    r_src = r
++    if c.get("foreign") and not parent_ok:
++        from fawam.icl_snap import param_of
++        _, _, sign = param_of(dict(hid=getattr(TASK_ENV, "_hid", None), table_bias=getattr(TASK_ENV, "_table_bias", None)))
++        bank = [b if os.path.isabs(b) else os.path.join(FAWAM_ROOT, b) for b in c.get("foreign_bank", [])]
++        f_ep = icl_snap.foreign_failure(bank, sign, task_name, now_seed)
++        if f_ep is not None:
++            src = f_ep
++            c_src, L_src = icl_snap.close_from_h5(f_ep)
++            r_src = max(1, c_src - k + 1)
++    spec = icl_snap.rewind_spec(ctx, src, L_src, parent_dir, r, max_past=int(c.get("max_past", 8)),
++                                ctx_mode=c.get("ctx_mode", "prepend"))
++    prompt = icl_snap.prompt_for(ctx, src, L_src, instruction)
++    m2 = _copy.deepcopy(method)
++    m2.learn = None
++    m2.adapter_path = c.get("meta_adapter")
++    if c.get("gate") in ("t1", "t2", "t5"):  # time-aligned / NN-aligned error of the (context) attempt -> strength
++        m2.adapter_gate = dict(ref_ep=str(src), mode=c["gate"], offset=icl_snap.reset_offset(src, r_src))
++    meta = dict(parent=str(parent_dir), k=k, reset_chunk=r, close_chunk=close, close_latent=L, mode="icl_rewind",
++                ctx=ctx, ctx_src=str(src), foreign=bool(src != parent_dir), harm=bool(parent_ok))
++    cont = dict(snap=by_chunk[r]["snap"], init16=init16, suffix="_attempt2", meta=meta)
++    vp, TASK_ENV.eval_video_path = TASK_ENV.eval_video_path, None
++    try:
++        ok2, d2, _ = run_episode(TASK_ENV, args, model, task_name, now_id, now_seed, instruction, video_size, False,
++                                 vgs, ags, m2, "policy", None, attempt=2, prompt_override=prompt, prefill_paths=spec,
++                                 lff_info=dict(icl_rewind=meta), cont=cont)
++    finally:
++        TASK_ENV.eval_video_path = vp
++    print(f"\033[93mICL rewind retry ({ctx}{', foreign' if meta['foreign'] else ''}{', harm' if parent_ok else ''}, "
++          f"reset chunk {r}): {'Success' if ok2 else 'Fail'}\033[0m")
++    return ok2
++
++
++TF_FRAMES, TF_APF = 2, 16  # LingBot-VA RoboTwin chunk: frame_chunk_size latent frames x action_per_frame actions
++
++
++def _rel_to_ee(ee_action, inint_eef_pose):
++    """16-d relative model action -> absolute EE command for take_action('ee') (normalised quaternions)."""
++    ee_action = add_init_pose(ee_action, inint_eef_pose)
++    return np.concatenate([
++        ee_action[:3],
++        ee_action[3:7] / np.linalg.norm(ee_action[3:7]),
++        ee_action[7:11],
++        ee_action[11:15] / np.linalg.norm(ee_action[11:15]),
++        ee_action[15:16]
++    ])
++
++
 +def run_episode(TASK_ENV, args, model, task_name, now_id, now_seed, instruction, video_size, save_visualization,
 +                video_guidance_scale, action_guidance_scale, method, driver, expert, attempt=1, prompt_override=None,
-+                prefill_paths=None, prefill_include_pred=False, lff_info=None):
-+    """One rollout (policy) or one recorded expert replay; saves the episode dir and returns (success, dir, info)."""
-+    TASK_ENV.setup_demo(now_ep_num=now_id, seed=now_seed, is_test=True, **args)
-+    TASK_ENV.set_instruction(instruction=instruction)  # set language instruction
++                prefill_paths=None, prefill_include_pred=False, lff_info=None, snap_rec=None, cont=None):
++    """One rollout (policy) or one recorded expert replay; saves the episode dir and returns (success, dir, info).
++    plan v2 (p20/p21): snap_rec (list) collects a full sim snapshot at the start of every chunk; cont = continuation
++    from such a snapshot (no new scene): {snap, init16, suffix, expert_rel | tf_poses, meta}."""
++    if cont is None:
++        TASK_ENV.setup_demo(now_ep_num=now_id, seed=now_seed, is_test=True, **args)
++        TASK_ENV.set_instruction(instruction=instruction)  # set language instruction
++    else:
++        cont["snap"].restore()
 +
-+    if TASK_ENV.eval_video_path is not None:
++    if TASK_ENV.eval_video_path is not None and cont is None:
 +        ffmpeg = subprocess.Popen(
 +            ["ffmpeg", "-y", "-loglevel", "error", "-f", "rawvideo", "-pixel_format", "rgb24", "-video_size",
 +             video_size, "-framerate", "10", "-i", "-", "-pix_fmt", "yuv420p", "-vcodec", "libx264", "-crf", "23",
@@ -503,6 +663,8 @@ index 7ed5265..41be082 100644
 +
 +    # Absolute path: the server writes into the same directory from its own working directory
 +    episode_name = f"ep{TASK_ENV.test_num:04d}_seed{now_seed}" + ("" if attempt == 1 else f"_attempt{attempt}")
++    if cont is not None:
++        episode_name = f"ep{TASK_ENV.test_num:04d}_seed{now_seed}{cont['suffix']}"
 +    running_dir = (Path(args['save_root']) / 'episodes' / '_running' / task_name / episode_name).resolve()
 +    if running_dir.exists():
 +        shutil.rmtree(running_dir)
@@ -520,9 +682,29 @@ index 7ed5265..41be082 100644
 +    initial_obs['endpose']['right_endpose'] + \
 +    [initial_obs['endpose']['right_gripper']]
 +    inint_eef_pose = np.array(inint_eef_pose, dtype=np.float64)
++    if cont is not None:  # continuation: actions stay relative to the attempt's own start pose
++        inint_eef_pose = np.asarray(cont["init16"], dtype=np.float64)
 +    initial_formatted_obs = format_obs(initial_obs, prompt)
 +    recorder.add_frame(initial_formatted_obs, TASK_ENV.take_action_cnt)
++    oracle = None
++    if expert is not None and method.teacher_force and driver == "policy":
++        # teacher forcing (fawam/teacher_force.py): the expert only supplies the oracle future, the policy acts
++        from fawam.teacher_force import OracleFuture
++        oracle = OracleFuture(TASK_ENV, expert, expert.relative_actions(inint_eef_pose),
++                              lambda a: _rel_to_ee(a, inint_eef_pose), init16=inint_eef_pose,
++                              replan_thr=0.0 if method.teacher_force == "replan" else None)
++        expert = None
++    if cont is not None and cont.get("tf_poses") is not None and method.teacher_force:
++        from fawam.teacher_force import OracleFuture
++
++        class _Poses:
++            poses = list(cont["tf_poses"])
++        _rel = np.stack([to_relative(pp, inint_eef_pose) for pp in cont["tf_poses"][1:]])
++        oracle = OracleFuture(TASK_ENV, _Poses, _rel, lambda a: _rel_to_ee(a, inint_eef_pose), init16=inint_eef_pose,
++                              replan_thr=0.0)
 +    expert_actions = expert.relative_actions(inint_eef_pose) if expert is not None else None
++    if cont is not None and cont.get("expert_rel") is not None:
++        expert_actions = np.asarray(cont["expert_rel"])
 +    if expert_actions is not None and getattr(TASK_ENV, "_hid", None):
 +        # hid: the expert's true targets -> the believed actions that land there under the hidden offset
 +        from fawam.hid_offset import compensate as _hid_compensate
@@ -532,12 +714,24 @@ index 7ed5265..41be082 100644
 +    last_obs = initial_formatted_obs
 +    first_obs = None
 +    while TASK_ENV.take_action_cnt < TASK_ENV.step_lim:
++        if snap_rec is not None:
++            from fawam.teacher_force import SimSnapshot
++            snap_rec.append(dict(chunk=len(recorder.plans), step=int(TASK_ENV.take_action_cnt), snap=SimSnapshot(TASK_ENV),
++                                 grip=(float(TASK_ENV.robot.get_left_gripper_val()),
++                                       float(TASK_ENV.robot.get_right_gripper_val()))))
 +        if first:
 +            observation = TASK_ENV.get_obs()
 +            first_obs = format_obs(observation, prompt)
 +
-+        ret = model.infer(dict(obs=first_obs, prompt=prompt, save_visualization=save_visualization, video_guidance_scale=video_guidance_scale, action_guidance_scale=action_guidance_scale))
++        oracle_obs = None
++        if oracle is not None:
++            oracle_obs = oracle.lookahead(TF_FRAMES, TF_APF, first, TF_APF if first else TF_FRAMES * TF_APF,
++                                          format_obs, prompt)
++        ret = model.infer(dict(obs=first_obs, prompt=prompt, save_visualization=save_visualization, video_guidance_scale=video_guidance_scale, action_guidance_scale=action_guidance_scale, oracle_obs=oracle_obs))
 +        action = ret['action']
++        if oracle is not None:
++            assert action.shape[1:] == (TF_FRAMES, TF_APF), action.shape
++            oracle.record_policy(action)
 +        frame_st_id = ret.get('frame_st_id')
 +        if expert_actions is not None:
 +            recorder.model_proposals.append(np.asarray(action, dtype=np.float32))
@@ -562,14 +756,7 @@ index 7ed5265..41be082 100644
 +                        ee_action[13:14]
 +                    ])
 +                elif action.shape[0] == 16:
-+                    ee_action =  add_init_pose(ee_action, inint_eef_pose)
-+                    ee_action = np.concatenate([
-+                        ee_action[:3],
-+                        ee_action[3:7] / np.linalg.norm(ee_action[3:7]),
-+                        ee_action[7:11],
-+                        ee_action[11:15] / np.linalg.norm(ee_action[11:15]),
-+                        ee_action[15:16]
-+                    ])
++                    ee_action = _rel_to_ee(ee_action, inint_eef_pose)
 +                else:
 +                    raise NotImplementedError
 +                step_before = TASK_ENV.take_action_cnt
@@ -602,7 +789,16 @@ index 7ed5265..41be082 100644
 +            if orchestrator.after_chunk(reply, TASK_ENV, frames).get("first"):
 +                first = True
 +
-+    end_info = dict(failure_text=failure_text(TASK_ENV, [], instruction) if (not succ and method.text_memory) else None)
++    if oracle is not None:
++        with open(running_dir / "teacher_force.json", "w") as fh:
++            json.dump(oracle.log, fh)
++
++    end_info = dict(failure_text=failure_text(TASK_ENV, [], instruction) if (not succ and method.text_memory) else None,
++                    init16=inint_eef_pose)
++    if snap_rec is not None:  # state after the last chunk (to detect a close in the final chunk)
++        snap_rec.append(dict(chunk=len(recorder.plans), step=int(TASK_ENV.take_action_cnt), snap=None,
++                             grip=(float(TASK_ENV.robot.get_left_gripper_val()),
++                                   float(TASK_ENV.robot.get_right_gripper_val()))))
 +
 +    # Server writes /model into episode.h5 and pred_<camera>.mp4; the client adds frames, actions, sim, meta
 +    try:
@@ -639,6 +835,8 @@ index 7ed5265..41be082 100644
 +        "prefill_paths": prefill_paths if isinstance(prefill_paths, dict) else (prefill_paths or []),
 +        "lff": lff_info or {},
 +        "hid": getattr(TASK_ENV, "_hid", None),  # hidden offset: training label / analysis only, never an input
++        "table_bias": getattr(TASK_ENV, "_table_bias", None),  # S-A table offset (label only)
++        "snap": (cont or {}).get("meta"),
 +    }
 +    with h5py.File(running_dir / 'episode.h5', 'a') as h5:
 +        recorder.save(running_dir, h5)
@@ -658,7 +856,7 @@ index 7ed5265..41be082 100644
 +    final_dir.parent.mkdir(parents=True, exist_ok=True)
 +    shutil.move(str(running_dir), str(final_dir))
 +    print(f"Episode data saved to: {final_dir}")
-+    if TASK_ENV.eval_video_path is not None:
++    if TASK_ENV.eval_video_path is not None and cont is None:
 +        TASK_ENV._del_eval_video_ffmpeg()
 +    return succ, final_dir, end_info
 +
@@ -695,7 +893,7 @@ index 25b45e5..bfe15b8 100644
              key = key_pool[:, valid]
              value = value_pool[:, valid]
 diff --git a/wan_va/wan_va_server.py b/wan_va/wan_va_server.py
-index 4c95ace..30f7e87 100644
+index 4c95ace..7c3672d 100644
 --- a/wan_va/wan_va_server.py
 +++ b/wan_va/wan_va_server.py
 @@ -1,5 +1,6 @@
@@ -786,8 +984,17 @@ index 4c95ace..30f7e87 100644
          logger.info('Reset.')
          self.use_cfg = (self.job_config.guidance_scale > 1) or (self.job_config.action_guidance_scale > 1)
          #### Reset all parameters
-@@ -438,6 +487,8 @@ class VA_Server:
-         self.exp_name = f"{prompt}_{time.strftime('%Y%m%d_%H%M%S')}" if prompt else "default"
+@@ -435,9 +484,16 @@ class VA_Server:
+                 dtype=self.dtype,
+             )
+ 
+-        self.exp_name = f"{prompt}_{time.strftime('%Y%m%d_%H%M%S')}" if prompt else "default"
++        # fawam: long prompts (VLM detail text) exceeded the 255-byte file name limit -> cut + hash (2026-11-21)
++        if prompt:
++            import hashlib
++            _p = prompt.replace("/", "_")
++            _p = _p if len(_p) <= 120 else _p[:100] + "_" + hashlib.sha1(_p.encode()).hexdigest()[:10]
++        self.exp_name = f"{_p}_{time.strftime('%Y%m%d_%H%M%S')}" if prompt else "default"
          self.exp_save_root = os.path.join(self.save_root, 'real', self.exp_name)
          os.makedirs(self.exp_save_root, exist_ok=True)
 +        # Per-episode record of predicted and observed latents, written by _finalize_episode
@@ -795,7 +1002,7 @@ index 4c95ace..30f7e87 100644
          torch.cuda.empty_cache()
  
      def _infer(self, obs, frame_st_id=0):
-@@ -446,11 +497,15 @@ class VA_Server:
+@@ -446,11 +502,15 @@ class VA_Server:
              init_latent = self._encode_obs(obs)
              self.init_latent = init_latent
  
@@ -811,7 +1018,7 @@ index 4c95ace..30f7e87 100644
                                device=self.device,
                                dtype=self.dtype)
          actions = torch.randn(1,
-@@ -458,8 +513,11 @@ class VA_Server:
+@@ -458,8 +518,11 @@ class VA_Server:
                                frame_chunk_size,
                                self.action_per_frame,
                                1,
@@ -823,7 +1030,7 @@ index 4c95ace..30f7e87 100644
  
          video_inference_step = self.job_config.num_inference_steps
          action_inference_step = self.job_config.action_num_inference_steps
-@@ -499,11 +557,15 @@ class VA_Server:
+@@ -499,11 +562,15 @@ class VA_Server:
                      None,
                      frame_st_id=frame_st_id)
  
@@ -844,7 +1051,7 @@ index 4c95ace..30f7e87 100644
  
                  if not last_step or video_step != -1:
                      video_noise_pred = data_seq_to_patch(
-@@ -514,6 +576,12 @@ class VA_Server:
+@@ -514,6 +581,12 @@ class VA_Server:
                          video_noise_pred = video_noise_pred[1:] + self.job_config.guidance_scale * (video_noise_pred[:1] - video_noise_pred[1:])
                      else:
                          video_noise_pred = video_noise_pred[:1]
@@ -857,7 +1064,7 @@ index 4c95ace..30f7e87 100644
                      latents = self.scheduler.step(video_noise_pred,
                                                    t,
                                                    latents,
-@@ -562,8 +630,13 @@ class VA_Server:
+@@ -562,8 +635,13 @@ class VA_Server:
  
          actions[:, ~self.action_mask] *= 0
  
@@ -873,7 +1080,7 @@ index 4c95ace..30f7e87 100644
  
          actions = self.postprocess_action(actions)
          torch.cuda.empty_cache()
-@@ -572,12 +645,15 @@ class VA_Server:
+@@ -572,12 +650,15 @@ class VA_Server:
      def _compute_kv_cache(self, obs):
          ### optional async save obs for debug
          self.transformer.clear_pred_cache(self.cache_name)
@@ -890,7 +1097,7 @@ index 4c95ace..30f7e87 100644
  
          action_model_input = self.preprocess_action(obs['state'])
          action_model_input = action_model_input.to(latent_model_input)
-@@ -591,10 +667,13 @@ class VA_Server:
+@@ -591,10 +672,13 @@ class VA_Server:
          with (
                  torch.no_grad(),
          ):
@@ -908,7 +1115,7 @@ index 4c95ace..30f7e87 100644
  
              self.transformer(self._repeat_input_for_cfg(input_dict['action_res_lst']),
                               update_cache=2,
-@@ -609,9 +688,17 @@ class VA_Server:
+@@ -609,9 +693,17 @@ class VA_Server:
          prompt = obs.get('prompt', None)
          compute_kv_cache = obs.get('compute_kv_cache', False)
  
@@ -927,7 +1134,7 @@ index 4c95ace..30f7e87 100644
              return dict()
          elif compute_kv_cache:
              logger.info(
-@@ -620,9 +707,131 @@ class VA_Server:
+@@ -620,9 +712,131 @@ class VA_Server:
              return dict()
          else:
              logger.info(f"################# Infer One Chunk #################")
@@ -1062,7 +1269,7 @@ index 4c95ace..30f7e87 100644
      def decode_one_video(self, latents, output_type):
          latents = latents.to(self.vae.dtype)
          latents_mean = (
-@@ -680,6 +889,10 @@ def run(args):
+@@ -680,6 +894,10 @@ def run(args):
      port = config.port if args.port is None else args.port
      if args.save_root is not None:
          config.save_root = args.save_root
@@ -1073,7 +1280,7 @@ index 4c95ace..30f7e87 100644
      rank = int(os.getenv("RANK", 0))
      local_rank = int(os.environ.get('LOCAL_RANK', 0))
      world_size = int(os.environ.get("WORLD_SIZE", 1))
-@@ -715,6 +928,17 @@ def main():
+@@ -715,6 +933,17 @@ def main():
          default=None,
          help='(start) port'
      )

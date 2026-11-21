@@ -282,7 +282,8 @@ class EpisodeDataset(torch.utils.data.Dataset):
                     context_frames=torch.tensor(ctx_frames), weight_video=torch.from_numpy(tgt["weight_video"][0]),
                     weight_action=torch.from_numpy(tgt["weight_action"][0]),
                     actions_neg=torch.from_numpy(tgt["actions_neg"]), window_mask=torch.from_numpy(tgt["window_mask"][0]),
-                    relabeled=torch.tensor(bool(ep["relabeled"])))
+                    relabeled=torch.tensor(bool(ep["relabeled"])),
+                    latent_index=torch.from_numpy(tgt["latent_index"][0]) if not ctx_frames else torch.zeros(0))
 
 
 class FailFixDataset(EpisodeDataset):

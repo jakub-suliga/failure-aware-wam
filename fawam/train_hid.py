@@ -53,7 +53,7 @@ def pairs(roots, tasks=None):
                     continue
                 if a.get("driver") == "policy" and str(a.get("attempt")) == "1":
                     att[key] = h5p.parent
-                elif a.get("driver") == "expert_replay" and a.get("success") == "True":
+                elif a.get("driver") == "expert_replay" and bool(a.get("success")):
                     fix[key] = h5p.parent
     out = []
     for k in sorted(att):

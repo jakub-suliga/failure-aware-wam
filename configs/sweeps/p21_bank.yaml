@@ -1,0 +1,12 @@
+# p21 foreign-context bank: base failures on the test task under S-A / S-B (other seeds than the screening), from which
+# the _foreign control draws a failure with the OPPOSITE sign of the hidden parameter.
+name: p21_bank
+out: results/sweeps/p21_bank
+episodes: 20
+per_job: 21
+n_par: 3
+time: "02:30:00"
+seed_offset: 50000
+tasks: [move_playingcard_away]
+configs: [icl_sa, icl_sb]
+methods: [base]

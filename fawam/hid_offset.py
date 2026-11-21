@@ -20,20 +20,39 @@ import hashlib
 import numpy as np
 import transforms3d as t3d
 
-TYPES = ("trans", "gain", "yaw")
+TYPES = ("trans", "gain", "yaw", "trans_z", "lat", "fixed")
 
 
-def draw(seed, kind, p_zero=0.2):
-    """Deterministic in (seed, kind): the same offset for every attempt on this seed."""
+def draw(seed, kind, p_zero=0.2, fixed=None, variant=0):
+    """Deterministic in (seed, kind): the same offset for every attempt on this seed.
+    p20/p21 (plan v2, 2026-11-21): kind "fixed" -> `fixed` = dict(type=trans|gain, o=[...]) for every seed (D2 grid);
+    kind "lat" (S-B) -> lateral offset y = s * U[3, 5] cm with s = +1 for even seeds, -1 for odd (both signs
+    balanced), plus x = s_x * U[3, 5] cm on half of the seeds (s_x again balanced), z = 0; never zero."""
+    if kind == "fixed":
+        return dict(type=fixed["type"], o=[float(x) for x in fixed["o"]])
+    if kind == "lat":
+        # variant 1 (p21 counter-examples): SAME scene (seed), opposite sign, independent magnitude
+        h = int(hashlib.sha1(f"hid/lat/{int(seed)}{'/v%d' % variant if variant else ''}".encode()).hexdigest()[:12], 16)
+        rng = np.random.default_rng(h)
+        s = (1.0 if int(seed) % 2 == 0 else -1.0) * (-1.0 if variant % 2 else 1.0)
+        y = s * rng.uniform(0.03, 0.05)
+        x = 0.0
+        if rng.random() < 0.5:
+            x = (1.0 if rng.random() < 0.5 else -1.0) * rng.uniform(0.03, 0.05)
+        return dict(type="trans", o=[float(x), float(y), 0.0])
     h = int(hashlib.sha1(f"hid/{kind}/{int(seed)}".encode()).hexdigest()[:12], 16)
     rng = np.random.default_rng(h)
     if rng.random() < p_zero:
-        return dict(type=kind, o=[0.0, 0.0, 0.0] if kind == "trans" else [1.0] if kind == "gain" else [0.0])
+        return dict(type=kind, o=[0.0, 0.0, 0.0] if kind in ("trans", "trans_z") else [1.0] if kind == "gain" else [0.0])
     while True:
         if kind == "trans":
             o = [rng.uniform(-0.05, 0.05), rng.uniform(-0.05, 0.05), rng.uniform(-0.10, 0.10)]
             if np.linalg.norm(o) >= 0.01:
                 return dict(type=kind, o=[float(x) for x in o])
+        elif kind == "trans_z":  # p15 (2026-11-20): height-only offset, the hid analogue of the table-height failure
+            z = rng.uniform(-0.10, 0.10)
+            if abs(z) >= 0.01:
+                return dict(type="trans", o=[0.0, 0.0, float(z)])
         elif kind == "gain":
             g = rng.uniform(0.7, 1.3)
             if abs(g - 1) >= 0.03:
@@ -85,20 +104,22 @@ def compensate(env, rel_actions, init16):
 
 
 def install(args):
-    """Patch RoboTwin: draw o in setup_demo (from the seed), add it to every EE action in take_action."""
+    """Patch RoboTwin: draw o in _init_task_env_ (from the seed), add it to every EE action in take_action.
+    (setup_demo is defined per task subclass; every one calls Base_Task._init_task_env_(**kwargs) with the seed.)"""
     kind = args.get("hid_offset")
     if not kind:
         return False
     assert kind in TYPES, kind
     p_zero = float(args.get("hid_p_zero", 0.2))
+    fixed = dict(type=args.get("hid_type", "trans"), o=list(args.get("hid_o", [0, 0, 0]))) if kind == "fixed" else None
     from envs._base_task import Base_Task
     from fawam.robotwin_hooks import ExpertTrajectory
 
-    orig_setup, orig_take = Base_Task.setup_demo, Base_Task.take_action
+    orig_setup, orig_take = Base_Task._init_task_env_, Base_Task.take_action
 
-    def setup_demo(self, *a, **k):
+    def init_task_env(self, *a, **k):
         out = orig_setup(self, *a, **k)
-        self._hid = draw(k.get("seed", 0), kind, p_zero)
+        self._hid = draw(k.get("seed", 0), kind, p_zero, fixed, int(args.get("hid_variant", 0)))
         self._hid_init = None  # start pose, taken at the first action (after the robot settled)
         return out
 
@@ -110,6 +131,6 @@ def install(args):
             action = apply(action, h, self._hid_init)
         return orig_take(self, action, action_type=action_type)
 
-    Base_Task.setup_demo, Base_Task.take_action = setup_demo, take_action
+    Base_Task._init_task_env_, Base_Task.take_action = init_task_env, take_action
     print(f"hid_offset: {kind}, p_zero={p_zero}")
     return True

@@ -1,0 +1,10 @@
+# smoke: p21 rewind retry with the 20-step smoke adapters (A1, A2, A3 cross-attention, T1/T2/T4/T5 gates)
+name: p21_rewind_smoke2
+out: results/_smoke/p21_rewind2
+episodes: 1
+per_job: 1
+n_par: 1
+time: "00:50:00"
+tasks: [move_playingcard_away]
+configs: [icl_sb]
+methods: [icl2_smoke_A1, icl2_smoke_A2, icl2_smoke_A3, icl2_smoke_T1, icl2_smoke_T2, icl2_smoke_T4, icl2_smoke_T5]

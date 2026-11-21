@@ -1,0 +1,14 @@
+# p20 D3 (plan v2): does the expert rescue from shortly before the failure? Same seeds as D2. Failed base attempts:
+# snapshots 1/2/3 chunks before the gripper closes; from each, (expert) the planner trajectory replayed to the end and
+# (tf) the policy with the replanned oracle video (tf_replan) to the end. Success rate per distance -> reset distance.
+name: p20_d3_snap
+out: results/sweeps/p20_d3_snap
+driver: snap
+episodes: 20
+per_job: 9
+n_par: 3
+time: "03:00:00"
+tasks: [move_playingcard_away]
+configs: [table_h_m05, table_h_p05, hid_y_p5, hid_y_m5, hid_x_p5, hid_x_m5, hid_g070, hid_g130]
+methods: [base]
+extra_env: {FAWAM_SNAP_MODES: "expert+tf"}

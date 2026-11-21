@@ -9,7 +9,7 @@ out: results/sweeps/p8s_strong
 episodes: 30
 per_job: 10
 n_par: 2
-time: "05:00:00"
+time: "03:00:00"
 vlm: true
 extra_env: {VLM_MODEL: Qwen/Qwen3-VL-8B-Instruct, HF_HUB_OFFLINE: 1}
 tasks: [move_playingcard_away]

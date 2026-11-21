@@ -224,15 +224,17 @@ ADAPTERS = ROOT / "artifacts" / "adapters"
 # one job) and C1xM1 (failfix_hid_lora) -> training gate -> p12_hid_eval only for configurations that passed.
 HID_ROOT = ROOT / "results/sweeps/p10_hid_data/base/hid_trans"
 HID_M3 = ROOT / "artifacts/hid_m3"
+HID_LEAK_MAX = 0.15
 
 
 def hid_leak_ok():
-    """Leak test passed: o is not readable from the first frame (R² < 0.1 for every component)."""
+    """Leak test passed: o is (almost) not readable from the first frame. Limit relaxed 0.1 -> 0.15 on user decision
+    2026-11-19 (measured x 0.105, z 0.121); the noctx/shuf controls catch a model that reads o from the first frame."""
     p = HID_ROOT / "leak_test.json"
     if not p.exists():
         return False
     first = json.loads(p.read_text()).get("first frame") or {}
-    return bool(first) and max(first.values()) < 0.1
+    return bool(first) and max(first.values()) < HID_LEAK_MAX
 
 
 def hid_m3_passed():
@@ -269,6 +271,8 @@ def hid_eval():
 # without the base model trained -> p8s_strong. The first P7d pass (12 episodes per cell) was submitted by hand.
 P7BCD_ROOTS = P7BC_ROOTS + " " + " ".join(str(ROOT / "results/sweeps/p7d_meta_data_strong/base" / c) for c in
                                           ("dist_objxy10", "dist_objyaw90", "dist_heavy", "dist_gripweak"))
+SC_TRAIN = [f"failfix_sc_{n}" for n in ("diffwin", "diffobswin", "predobswin", "gapkeys", "diffwin_vlmd",
+                                          "textonly_vlmd")]
 STRONG_TRAIN = [f"failfix_strong_{t}_vlmd{b}" for t in ("lora_r16_attn", "film_memory_plus_adapterplus")
                 for b in ("", "_base")] + ["failfix_strong_ft_base"]
 STRONG_METHODS = {**{f"failfix_strong_{t}_vlmd{b}": [f"icl_strong_{t}{b}_VPD", f"icl_strong_{t}{b}_VPD_noctx"]
@@ -311,6 +315,12 @@ def trainings_idle(jobs, names):
 
 
 def stages(jobs):
+    """v1 stages + plan v2 stages (cluster/pipeline_v2.py)."""
+    import pipeline_v2
+    return _stages_v1(jobs) + pipeline_v2.stages(jobs)
+
+
+def _stages_v1(jobs):
     """(name, ready, action). Each action runs once; sweeps are re-emitted once for unfinished cells."""
     p7_done = idle(jobs, "p7_meta_data") and gate("p7_submitted")
     p7_oracle = p7_done and sacct_state("fawam_p7_analysis") == "COMPLETED"
@@ -404,6 +414,18 @@ def stages(jobs):
             any((ADAPTERS / n / "adapter.pt").exists() for n in STRONG_TRAIN),
          lambda: sweep("p8s_strong", "--methods", *[m for n in STRONG_TRAIN if (ADAPTERS / n / "adapter.pt").exists()
                                                     for m in STRONG_METHODS[n]], prio=0, env=VLM_ENV)),
+        # P8c small contexts (user 2026-11-20): 6 LoRA adapters -> p8c_small_ctx (ctx + noctx each)
+        ("sc_train", lambda: True, lambda: train(SC_TRAIN, prio=0, env=FAST_ENV)),
+        ("sc_eval", lambda: _stage_done("sc_train") and trainings_idle(jobs, SC_TRAIN) and vlm_live and
+            any((ADAPTERS / n / "adapter.pt").exists() for n in SC_TRAIN),
+         lambda: sweep("p8c_small_ctx", "--methods", *[m for n in SC_TRAIN if (ADAPTERS / n / "adapter.pt").exists()
+                                                      for m in (n.replace("failfix_sc_", "icl_sc_"),
+                                                                n.replace("failfix_sc_", "icl_sc_") + "_noctx")],
+                       prio=0, env=VLM_ENV)),
+        # hid C2 as a gate exception (user 2026-11-20): full eval once the smoke run finished cleanly
+        ("hid_c2_eval", lambda: sacct_state("fawam_p12_hid_c2_smoke") == "COMPLETED" and
+            any((ROOT / "results/sweeps/p12_hid_c2_smoke").glob("*/*/episodes/*/*/*/episode.h5")),
+         lambda: sweep("p12_hid_c2", prio=0)),
         ("hid_leak", lambda: any(HID_ROOT.glob("episodes/*/*/*/episode.h5")) and idle(jobs, "p10_hid_data"),
          lambda: cpu_job("hid_leak", f"$PY_RT -m fawam.hid_leak {HID_ROOT} && $PY_RT -m fawam.demo_bank build "
                                      f"{HID_ROOT} --out {ROOT}/artifacts/fail_bank/hid_trans_eval --success false "
@@ -457,7 +479,10 @@ def _stage_done(name):
 
 SWEEP_OF = {"lff": ["p5a_signals"], "lff_vlm": ["p5b_vlm"], "dual": ["p5f_paper"], "icl_free": ["p6a_icl_content"],
             "p8": ["p8_icl_vlm_meta"], "p8_oracle": ["p8_icl_oracle_meta"], "icl_free_vlm": ["p6v_icl_free_vlm"],
-            "related": ["p9_related"], "ft_eval": ["p8f_finetune"], "generalize": ["p10_generalize"]}
+            "related": ["p9_related"], "ft_eval": ["p8f_finetune"], "generalize": ["p10_generalize"],
+            # plan v2: one re-emission per sweep once it is idle (re-queues cells that are short of episodes)
+            "v2_data": ["p21_data_sa", "p21_data_sb"], "v2_bank": ["p21_bank"], "v2_d3": ["p20_d3_snap"],
+            "v2_d2d4": ["p20_d2_base", "p20_d4_tf"], "v2_ttt": ["p22_ttt"]}
 
 
 def run_stages(jobs):

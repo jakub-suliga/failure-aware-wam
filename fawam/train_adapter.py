@@ -115,16 +115,49 @@ def load_frozen_transformer(model_path, device):
 def train_inside(a):
     device = torch.device("cuda")
     cfg = VA_CONFIGS["robotwin_train"]
-    eps = find_episodes(a.episodes, success=a.success, tasks=a.tasks, settings=a.settings, limit=a.limit,
-                        seed=a.seed, drivers=a.drivers, limit_per_task=a.limit_per_task,
-                        limit_per_cell=a.limit_per_cell)
+    snap = None
+    if getattr(a, "snap_roots", None):  # p21 (plan v2): [context | own past | expert continuation] pairs
+        from fawam import icl_snap
+        from fawam.text_cache import encode as _encode_texts
+        pairs = icl_snap.collect_pairs(a.snap_roots)
+        if a.tasks:
+            pairs = [q for q in pairs if q["task"] in a.tasks]
+        tr_p, va_p = icl_snap.split_by_seed(pairs, a.val_frac, a.seed)
+        print(f"p21: {len(pairs)} pairs ({len(tr_p)} train / {len(va_p)} val), ctx {a.icl_ctx}, sampling {a.sampling}")
+        print(json.dumps(icl_snap.summary(pairs)))
+        tc = TextCache(a.text_cache)
+        mk = lambda ps, sd: icl_snap.SnapPairDataset(ps, ActionNorm(cfg, a.action_clip), tc, ctx=a.icl_ctx,
+                                                     sampling=a.sampling, p_irrelevant=a.p_irrelevant, seed=sd,
+                                                     cfg_prob=a.cfg_prob, target_frames=a.snap_target_frames,
+                                                     max_past=a.snap_max_past, ctx_mode=a.ctx_mode, gate=a.gate
+                                                     if a.gate in ("t1", "t2", "t5") else None)
+        ds = mk(tr_p, a.seed)
+        # validation needs failed attempts (own / foreign context); without any: no validation instead of a crash
+        snap = mk(va_p, 999) if any(not q["parent_success"] for q in va_p) else None
+        if va_p and snap is None:
+            print("p21: no failed attempt among the validation seeds -> no validation")
+        if snap is not None:
+            snap.p_irr, snap.cfg_prob = 0.0, 0.0
+        texts = ds.all_texts() | (snap.all_texts() if snap is not None else set())
+        todo = tc.missing(texts)
+        if todo:
+            print(f"encoding {len(todo)} new prompts")
+            _encode_texts(todo, a.model_path, a.text_cache)
+            torch.cuda.empty_cache()
+        eps, val_ds = [q["cont"] for q in pairs], None
+    else:
+        eps = find_episodes(a.episodes, success=a.success, tasks=a.tasks, settings=a.settings, limit=a.limit,
+                            seed=a.seed, drivers=a.drivers, limit_per_task=a.limit_per_task,
+                            limit_per_cell=a.limit_per_cell)
     if not eps:
         raise SystemExit("no episodes found")
     ctx_pool = find_episodes(a.context_pool, success=True, tasks=a.tasks) if a.context_pool else None
     print(f"{len(eps)} training episodes")
     load_kw = dict(relabel=a.relabel, gap_beta=a.gap_beta, video_in_window=a.video_in_window,
                    gap_filter=a.gap_filter)
-    if a.fixes:  # meta-ICL from failures: eps are the failed attempts, fixes the successes on the same seeds
+    if snap is not None or getattr(a, "snap_roots", None):
+        pass
+    elif a.fixes:  # meta-ICL from failures: eps are the failed attempts, fixes the successes on the same seeds
         fixes = find_episodes(a.fixes, success=True, tasks=a.tasks)
         ds = FailFixDataset(eps, fixes, ActionNorm(cfg, a.action_clip), TextCache(a.text_cache), include_pred=a.include_pred,
                             p_text=a.p_text, max_frames=a.max_frames, seed=a.seed, cfg_prob=a.cfg_prob,
@@ -151,6 +184,12 @@ def train_inside(a):
         n_rel = sum(it["relabeled"] for it in ds.items)
         if a.relabel:
             print(f"{n_rel} of {len(ds.items)} episodes relabeled with their failure analysis")
+    start_step = 0
+    if getattr(a, "snap_roots", None) and (Path(a.out) / "resume.json").exists() and \
+            (Path(a.out) / "adapter.pt").exists():  # resume after a cancelled / timed-out job
+        start_step = int(json.loads((Path(a.out) / "resume.json").read_text())["step"])
+        a.init = a.out
+        print(f"resuming {a.out} at step {start_step}")
     tf = load_frozen_transformer(a.model_path, device)
     if a.init:
         aset = fa.AdapterSet.load(a.init, device=device)
@@ -158,13 +197,15 @@ def train_inside(a):
         acfg = fa.AdapterConfig(kind=a.kind, inside_streams=a.inside_streams, bottleneck=a.bottleneck,
                                 lora_rank=a.lora_rank, lora_alpha=a.lora_alpha or float(a.lora_rank),
                                 blocks=a.blocks, sites=a.sites, lora_targets=a.lora_targets,
+                                lora_streams=(list(a.inside_streams) if a.kind == 'lora' and set(a.inside_streams) != {'video', 'action'} else None),
                                 adapter_learn_scale=not a.no_adapter_scale, use_adapterplus=a.use_adapterplus,
                                 use_lora=a.use_lora, ia3=a.ia3, adaln=a.adaln, adapter_norm=not a.no_adapter_norm,
                                 prompt_tokens=a.prompt_tokens, prompt_bank=a.prompt_bank, prompt_topk=a.prompt_topk,
                                 ttt_dim=a.ttt_dim, ttt_eta=a.ttt_eta, ttt_streams=a.ttt_streams,
                                 svf_blocks=a.svf_blocks, svf_targets=a.svf_targets, dense_blocks=a.dense_blocks,
                                 dense_targets=a.dense_targets, outside_type=a.outside_type,
-                                film_source=a.film_source, film_rank=a.film_rank, error_dim=a.error_dim)
+                                film_source=a.film_source, film_rank=a.film_rank, error_dim=a.error_dim,
+                                xattn_every=a.xattn_every, gate=a.gate, adapter_up_init=a.adapter_up_init)
         aset = fa.AdapterSet(acfg).to(device)
     fa.attach(tf, aset)
     params = aset.inside_parameters()
@@ -185,8 +226,20 @@ def train_inside(a):
     out.mkdir(parents=True, exist_ok=True)
     log = open(out / "train_inside.jsonl", "a")
     rng = np.random.default_rng(a.seed)
+    hinge = None
+    if getattr(a, "hinge_episode", None) and a.hinge_beta:
+        import h5py as _h5
+        from fawam.latent_data import canvas as _canvas
+        hp = Path(a.hinge_episode)
+        with _h5.File(hp / "episode.h5", "r") as f:
+            hl, hli = torch.from_numpy(_canvas(f, "obs").astype(np.float32)), f["model/obs/latent_index"][()]
+        ana_h = json.loads((hp / "analysis.json").read_text()) if (hp / "analysis.json").exists() else {}
+        Lh = ana_h.get("latent")
+        if Lh is not None:
+            hinge = dict(lat=hl, idx={int(k): i for i, k in enumerate(hli)}, lo=int(Lh) - 4, hi=int(Lh) + 2)
+            print(f"hinge: failure window latents [{int(Lh) - 4}, {int(Lh) + 2}] of {hp.name}, beta {a.hinge_beta}")
     t0 = time.time()
-    for step in range(1, a.steps + 1):
+    for step in range(start_step + 1, a.steps + 1):
         s = ds[int(rng.integers(len(ds)))]
         lat = s["latents"][None].to(device)
         act = s["actions"][None].to(device)
@@ -198,18 +251,36 @@ def train_inside(a):
         ld["text_emb"] = s["text_emb"][None].to(device, torch.bfloat16)
         ad["text_emb"] = ld["text_emb"]
         ad["actions_mask"] = am
-        window = 128 if ctx else int(rng.integers(4, 65))
+        window = 128 if (ctx or getattr(a, "snap_roots", None)) else int(rng.integers(4, 65))
         input_dict = dict(latent_dict=ld, action_dict=ad, chunk_size=int(rng.integers(1, 5)), window_size=window)
         fw, fwa = s["weight_video"].clone().float(), s["weight_action"].clone().float()
         if ctx:  # in-context frames are conditioning only
             fw[:ctx] = 0
             fwa[:ctx] = 0
         tf._fawam.ctx.ctx_frames = ctx  # TTT branches: the first ctx frames are the in-context memory
+        sample_context(tf, aset, s, device, lat)  # plan v2 A3 / T gates
         tf._fawam.ctx.film_error = s["error_vec"].to(device) if bool(s.get("has_error", False)) else None
         pred = tf(input_dict, train_mode=True)
         lv, la = flow_losses(input_dict, pred, patch, sched_v, sched_a, fw, fwa)
         loss = a.lambda_video * lv + a.lambda_action * la
         lp = torch.zeros((), device=device)
+        lh = torch.zeros((), device=device)
+        if hinge is not None and len(s.get("latent_index", [])):
+            # plan v2 P5: push the predicted clean latent away from the failed attempt inside its failure window, at
+            # least as far as the real (successful) video is from it: relu(margin - ||x0_hat - x_fail||^2)
+            li_s = s["latent_index"].numpy()
+            pairs = [(i, hinge["idx"][int(k)]) for i, k in enumerate(li_s) if int(k) in hinge["idx"] and
+                     hinge["lo"] <= int(k) <= hinge["hi"] and i > 0]
+            if pairs:
+                lp_v = data_seq_to_patch(patch, pred[0], lat.shape[2], lat.shape[3], lat.shape[4], batch_size=1)
+                sig = (ld["timesteps"][0].float() / sched_v.num_train_timesteps).to(device)
+                x0 = ld["noisy_latents"].float() - sig[None, None, :, None, None] * lp_v.float()
+                ii = torch.tensor([i for i, _ in pairs], device=device)
+                fl = hinge["lat"][:, [j for _, j in pairs]].to(device)  # C, n, H, W
+                d_pred = (x0[0][:, ii] - fl).pow(2).mean()
+                d_true = (lat[0][:, ii].float() - fl).pow(2).mean()
+                lh = torch.relu(d_true - d_pred)
+                loss = loss + a.hinge_beta * lh
         if a.pref_beta and bool(s.get("relabeled", False)) and s["window_mask"].sum() > 0:
             # FAR-style failure-contrastive preference (Diffusion-DPO form): relabeled actions preferred over the
             # executed failed ones on the failure window, relative to the frozen base model.
@@ -238,13 +309,23 @@ def train_inside(a):
             opt.zero_grad(set_to_none=True)
             if base is not None:
                 base.step(lr_scale=min(1.0, (step // a.grad_accum) / max(1, a.base_warmup)))
+        if snap is not None and a.val_every and (step % a.val_every == 0 or step == a.steps):
+            vs = validate_snap(tf, snap, a, sched_v, sched_a, patch, device)
+            rec_v = dict(step=step, **{f"val_video_{k}": v for k, v in vs.items()})
+            print(json.dumps(rec_v), flush=True)
+            log.write(json.dumps(rec_v) + "\n")
+            log.flush()
+        if a.save_every and step % a.save_every == 0 and getattr(a, "snap_roots", None):
+            aset.save(out)  # resumable: the latest state is always the adapter itself (+ step marker)
+            (out / "resume.json").write_text(json.dumps(dict(step=step)))
         if val_ds is not None and a.val_every and step % a.val_every == 0:
             vl = validate(tf, val_ds, a, sched_v, sched_a, patch, device)
             print(json.dumps(dict(step=step, val_action=vl[1], val_video=vl[0], val_action_noctx=vl[2])), flush=True)
             log.write(json.dumps(dict(step=step, val_action=vl[1], val_video=vl[0], val_action_noctx=vl[2])) + "\n")
             log.flush()
         if step % a.log_every == 0 or step == 1:
-            rec = dict(step=step, loss=float(loss), video=float(lv), action=float(la), pref=float(lp), grad_norm=float(gn),
+            rec = dict(step=step, loss=float(loss), video=float(lv), action=float(la), pref=float(lp), hinge=float(lh),
+                       grad_norm=float(gn),
                        frames=int(lat.shape[2]), ctx=ctx, s=round(time.time() - t0, 1))
             print(json.dumps(rec), flush=True)
             log.write(json.dumps(rec) + "\n")
@@ -266,6 +347,69 @@ def train_inside(a):
     (out / "train_args_inside.json").write_text(json.dumps({**vars(a), "episodes_used": [str(e) for e in eps]},
                                                            indent=2, default=str))
     print(f"saved {out}")
+
+
+def sample_context(tf, aset, s, device, lat):
+    """plan v2: per-sample inputs of A3 (cross-attention context tokens), T4 (pooled context) and T1/T2/T5 (per-frame
+    adapter strength from the aligned error of the last attempt; context / past frames: 1)."""
+    h = tf._fawam.ctx
+    h.xattn_ctx = h.ctx_pool = h.adapter_scale = None
+    if aset is None:
+        return
+    if "ctx_latents" in s and (len(aset.xattn) or len(aset.t4)):
+        tok = fa.embed_context(tf, aset, s["ctx_latents"][None].to(device))
+        if len(aset.xattn):
+            h.xattn_ctx = tok
+        if len(aset.t4):
+            h.ctx_pool = tok.mean(1)
+    g = getattr(aset.cfg, "gate", None)
+    if g in ("t1", "t2", "t5") and "gate_err" in s:
+        e = s["gate_err"].to(device).float()
+        if g == "t1":
+            sf = (e > float(s["gate_thr"])).float()
+        else:
+            sf = torch.sigmoid(aset.gate_ab[0] * e + aset.gate_ab[1])
+        sf = torch.where(e < 0, torch.ones_like(sf), sf)
+        tpf = (lat.shape[3] // 2) * (lat.shape[4] // 2)
+        v = sf.repeat_interleave(tpf)
+        h.adapter_scale = torch.cat([v, v])  # noisy + clean video segments; actions / padding -> 1 (no adapter)
+
+
+@torch.no_grad()
+def validate_snap(tf, ds, a, sched_v, sched_a, patch, device, n=32):
+    """p21 negative filter inputs: video flow loss on held-out seeds with the own context, with a foreign context
+    (opposite sign of the hidden parameter, same task/setting) and without any context. Identical windows, noise and
+    timesteps across modes and across adapters (seeded per sample)."""
+    out = {}
+    for mode in ("own", "foreign", "none"):
+        ds.mode = mode
+        tot = 0.0
+        for i in range(n):
+            ds.rng.seed(5000 + i)
+            smp = ds[i]
+            torch.manual_seed(5000 + i)
+            lat, act = smp["latents"][None].to(device), smp["actions"][None].to(device)
+            am = smp["actions_mask"][None].to(device)
+            ctx = int(smp["context_frames"])
+            Fr = lat.shape[2]
+            # the same timesteps / noise for the TARGET frames (at the end) whatever the context length
+            tid_all = sample_timestep_id(batch_size=96, num_train_timesteps=sched_v.num_train_timesteps)
+            noise_all = torch.randn((1, lat.shape[1], 96) + tuple(lat.shape[3:]), device=device, dtype=lat.dtype)
+            ld = add_noise(lat, sched_v, device, patch, clean_frames=ctx, frame_gap=a.icl_gap if ctx else 0,
+                           tid=tid_all[-Fr:], noise=noise_all[:, :, -Fr:])
+            ad = add_noise(act, sched_a, device, patch, action_mask=am, action_mode=True, clean_frames=ctx,
+                           frame_gap=a.icl_gap if ctx else 0)
+            ld["text_emb"] = smp["text_emb"][None].to(device, torch.bfloat16)
+            ad["text_emb"], ad["actions_mask"] = ld["text_emb"], am
+            inp = dict(latent_dict=ld, action_dict=ad, chunk_size=2, window_size=128)
+            fw = smp["weight_video"].float()
+            tf._fawam.ctx.ctx_frames = ctx
+            sample_context(tf, tf._fawam.adapters, smp, device, lat)
+            lv, _ = flow_losses(inp, tf(inp, train_mode=True), patch, sched_v, sched_a, fw, fw)
+            tot += float(lv)
+        out[mode] = tot / n
+    ds.mode = "own"
+    return out
 
 
 @torch.no_grad()
@@ -421,6 +565,18 @@ def main():
     ap.add_argument("--lora_rank", type=int, default=16)
     ap.add_argument("--steps", type=int, default=400)
     ap.add_argument("--lr", type=float, default=4.343e-4)
+    ap.add_argument("--ctx_mode", default="prepend", choices=["prepend", "separate", "both"])
+    ap.add_argument("--gate", default=None, choices=[None, "t1", "t2", "t4", "t5"])
+    ap.add_argument("--xattn_every", type=int, default=0)
+    ap.add_argument("--adapter_up_init", default="zero", choices=["zero", "normal"])
+    ap.add_argument("--snap_roots", nargs="*", help="p21: snap-driver sweep roots ([context | past | target] pairs)")
+    ap.add_argument("--icl_ctx", default="C2", help="p21 context variant C0..C8 (fawam/icl_snap.py)")
+    ap.add_argument("--sampling", default="uniform", choices=["uniform", "win50", "w4"])
+    ap.add_argument("--p_irrelevant", type=float, default=0.1)
+    ap.add_argument("--snap_target_frames", type=int, default=12)
+    ap.add_argument("--snap_max_past", type=int, default=8)
+    ap.add_argument("--hinge_episode", help="plan v2 P5: failed episode whose failure window the video is pushed from")
+    ap.add_argument("--hinge_beta", type=float, default=0.0)
     ap.add_argument("--train_base", action="store_true",
                     help="also train the base transformer (fp32 master weights on the GPU: needs an H200)")
     ap.add_argument("--base_lr", type=float, default=1e-5)

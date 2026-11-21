@@ -1,0 +1,14 @@
+# p13b: like p13_tf_oracle, but the task planner is re-run from the CURRENT state before every chunk (method tf_replan) -> the oracle video never jumps.
+# p13: teacher forcing with an oracle future (user question 2026-11-19: "better video prediction => better actions?").
+# Base LingBot-VA, but each imagined chunk is replaced by the real frames of the expert's continuation rendered from the
+# CURRENT sim state (fawam/teacher_force.py). Held-out task, lowered table; z00 = sanity (base 72/72).
+# Same seeds as p0_baseline_table (base, corrected: z00 72/72, m05 1/72, m10 0/72).
+name: p13_tf_replan
+out: results/sweeps/p13_tf_replan
+episodes: 24
+per_job: 8
+n_par: 3
+time: "02:00:00"
+tasks: [move_playingcard_away]
+configs: [table_h_m05, table_h_m10, table_h_z00]
+methods: [tf_replan]

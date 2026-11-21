@@ -38,10 +38,12 @@ def main(root):
     for h5p in sorted(Path(root).glob("*/episodes/*/*/*/episode.h5")):
         with h5py.File(h5p, "r") as f:
             a = dict(f.attrs)
+            if "success" not in a:  # still being written
+                continue
             hid = json.loads(a.get("hid", "null") or "null")
             cfg = a.get("task_config")
             r = rows[cfg]
-            succ = a["success"] == "True"
+            succ = str(a["success"]) == "True"
             if a["driver"] == "expert_replay":
                 r["fix"].append(succ)
             else:

@@ -1,0 +1,10 @@
+# smoke for p22 (1 seed per method, hid_y_p5 where the base should fail)
+name: p22_ttt_smoke
+out: results/_smoke/p22_ttt
+episodes: 1
+per_job: 1
+n_par: 1
+time: "01:00:00"
+tasks: [move_playingcard_away]
+configs: [hid_y_p5]
+methods: [ttt_p0, ttt_p0_lora, ttt_p2, ttt_p3, ttt_p4, ttt_p0_dual]

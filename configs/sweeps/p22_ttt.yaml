@@ -1,0 +1,15 @@
+# p22 TTT line (plan v2, 2026-11-21): can a video-only adapter trained ONLY on this scene's own episodes fix the error?
+# No pre-training, no collected data. Up to 3 retries per seed (max_attempts 4). Adapter only in the video pass.
+# Only seeds whose first attempt fails are evaluated. Control: ttt_retry (same retries, no learning); lff_ttt_filtered
+# = the earlier lff_ttt (4/27 at -5 cm). Settings: table -5 cm (plan error), gain 0.7 / 1.3 (dynamics), y +-5 cm.
+name: p22_ttt
+out: results/sweeps/p22_ttt
+episodes: 20
+per_job: 6
+n_par: 2
+time: "03:00:00"
+seed_offset: 0
+tasks: [move_playingcard_away]
+configs: [table_h_m05, hid_g070, hid_g130, hid_y_p5, hid_y_m5]
+methods: [ttt_retry, ttt_p0, ttt_p0_s10_lr1e-4, ttt_p0_s200_lr1e-4, ttt_p0_s10_lr1e-3, ttt_p0_s50_lr1e-3,
+          ttt_p0_s200_lr1e-3, ttt_p1, ttt_p2, ttt_p6, ttt_p0_lora, ttt_p0_dual, ttt_p3, ttt_p4, ttt_p5, lff_ttt_filtered]

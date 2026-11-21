@@ -261,6 +261,7 @@ class FawamServer(VA_Server):
                 self.base_swap = BaseSwapper(self.transformer)
             self.base_swap.use(m.adapter_path if aset is not None and m.adapter_use in ("all", "inside") else None)
         self._set_hid_residual(m)
+        self._load_ref(m)
         self.use_inside = aset is not None and m.adapter_use in ("all", "inside")
         self.holder.ctx.enabled = self.use_inside
         self.use_outside = aset is not None and aset.outside is not None and m.adapter_use in ("all", "outside")
@@ -305,6 +306,85 @@ class FawamServer(VA_Server):
         self._hid_hook = self.transformer.action_proj_out.register_forward_hook(
             lambda mod, inp, out: out + dv.to(out.dtype).view(*([1] * (out.dim() - 1)), -1))
 
+    def _load_ref(self, m):
+        """plan v2 P2/P3: per-chunk gap curve and observed latents of the previous (failed) attempt."""
+        self._ref = None
+        spec = m.adapter_gate or m.explore
+        if not spec or not spec.get("ref_ep"):
+            return
+        ep = Path(spec["ref_ep"])
+        ep = ep / "episode.h5" if ep.is_dir() else ep
+        ref = {}
+        with h5py.File(ep, "r") as f:
+            if "fawam/gap_frame_st_id" in f:
+                g = np.stack([f[f"fawam/gap/{c}"][()] for c in CAMS if f"fawam/gap/{c}" in f])
+                g = np.nanmax(np.where(np.isfinite(g), g, np.nan), axis=0) if g.size else np.zeros(0)
+                g = np.where(np.isfinite(g), g, np.nanmedian(g) if np.isfinite(g).any() else 0.0)
+                lo, hi = (float(g.min()), float(g.max())) if len(g) else (0.0, 1.0)
+                ref["gate"] = (g - lo) / (hi - lo + 1e-8)
+            if "model/obs" in f:
+                ref["obs"] = canvas_from_h5(f, "obs")[0].float()  # C, F, 24, 20
+                ref["obs_li"] = f["model/obs/latent_index"][()]
+                if "model/pred" in f:  # plan v2 T1/T2/T5: normalised |obs - pred| per latent frame
+                    pr = canvas_from_h5(f, "pred")[0].float()
+                    pidx = {int(k): i for i, k in enumerate(f["model/pred/latent_index"][()])}
+                    e = np.zeros(int(ref["obs_li"].max()) + 1, np.float32)
+                    for r, k in enumerate(ref["obs_li"]):
+                        if int(k) in pidx and int(k) > 0:
+                            e[int(k)] = float((ref["obs"][:, r] - pr[:, pidx[int(k)]]).pow(2).mean().sqrt())
+                    ref["err"] = e / (e.max() + 1e-8)
+                    ref["err_med"] = float(np.median(ref["err"][1:])) if len(e) > 1 else 0.5
+        self._ref = ref
+        logger.info(f"reference attempt {ep.parent.name}: {len(ref.get('gate', []))} chunk gaps, "
+                    f"{0 if 'obs_li' not in ref else len(ref['obs_li'])} obs latents")
+
+    def _chunk_gate(self):
+        """Adapter strength for the coming chunk (P2): normalised gap of the reference attempt, same chunk index.
+        plan v2 p21 modes t1 (hard: aligned error above the attempt's median), t2 (sigmoid(a e + b), learned a, b),
+        t5 (t2 with e of the reference frame nearest to the last observed frame); offset = reference latent index of
+        the retry's frame 0."""
+        g = self.method.adapter_gate
+        mode = (g or {}).get("mode")
+        if mode in ("t1", "t2", "t5") and self._ref and "err" in self._ref:
+            e, fcs = self._ref["err"], self.job_config.frame_chunk_size
+            if mode == "t5":
+                q = self.episode_log['obs'][-1]['latents'][:, -1].float() if self.episode_log['obs'] else \
+                    self.init_latent[0, :, 0].float().cpu()
+                P = self._ref["obs"].permute(1, 0, 2, 3).reshape(self._ref["obs"].shape[1], -1)
+                sims = F.cosine_similarity(P, q.reshape(1, -1).cpu(), dim=1)
+                li = int(self._ref["obs_li"][min(int(sims.argmax()) + 1, len(self._ref["obs_li"]) - 1)])
+                ev = float(e[min(li, len(e) - 1)])
+            else:
+                rel = [self.frame_st_id - self.ep_frame0 + i for i in range(fcs)]
+                ev = float(np.mean([e[min(int(g.get("offset", 0)) + r, len(e) - 1)] for r in rel]))
+            if mode == "t1":
+                sc = float(ev > self._ref["err_med"])
+            else:
+                ab = self.holder.adapters.gate_ab if self.holder.adapters is not None else None
+                sc = float(torch.sigmoid(ab[0] * ev + ab[1])) if ab is not None else 1.0
+            self.holder.ctx.adapter_scale = sc
+            self.episode_log["events"].append(dict(kind="adapter_gate", mode=mode, err=ev, scale=sc,
+                                                   frame=int(self.frame_st_id), t=time.time()))
+            return
+        if not (self.method.adapter_gate and self._ref and len(self._ref.get("gate", []))):
+            self.holder.ctx.adapter_scale = None
+            return
+        g = self._ref["gate"]
+        k = min(len(self.episode_log['pred']), len(g) - 1)
+        self.holder.ctx.adapter_scale = float(g[k])
+        self.episode_log["events"].append(dict(kind="adapter_gate", chunk=int(k), scale=float(g[k]),
+                                               frame=int(self.frame_st_id), t=time.time()))
+
+    def _explore_frames(self, frame_st_id):
+        """P3: latent indices of this chunk that lie in the reference failure window (empty = no exploration)."""
+        ex = self.method.explore
+        if not ex or not self._ref or "obs_li" not in self._ref or ex.get("latent") is None:
+            return []
+        L = int(ex["latent"])
+        lo, hi = L - int(ex.get("before", 4)), L + int(ex.get("after", 2))
+        rel = [frame_st_id - self.ep_frame0 + i for i in range(self.job_config.frame_chunk_size)]
+        return [r for r in rel if lo <= r <= hi and r in set(int(x) for x in self._ref["obs_li"])]
+
     def _encode_negative(self, text):
         if not self.use_cfg:
             return
@@ -313,6 +393,7 @@ class FawamServer(VA_Server):
     def _reset(self, prompt=None, seed=None, method=None, task=None):
         self._apply_method(method)
         self.holder.ctx.film_error = None
+        self.holder.ctx.xattn_ctx = self.holder.ctx.ctx_pool = self.holder.ctx.adapter_scale = None
         super()._reset(prompt=prompt, seed=seed)
         if self.method.negative_prompt:
             self._encode_negative(self.method.negative_prompt)
@@ -465,7 +546,7 @@ class FawamServer(VA_Server):
     def _manipulate(self, lat, rows, manip):
         """Content manipulation of a memory segment (docs/ICL.md 6a): if the model really reads the content, these
         should hurt. lat (1, C, F, 24, 20) on the CPU; only `rows` are written to the cache."""
-        if not manip or manip == "no_actions":
+        if not manip or manip in ("no_actions", "grip_only"):
             return lat
         lat = lat.clone()
         g = torch.Generator().manual_seed(1234)
@@ -490,6 +571,16 @@ class FawamServer(VA_Server):
     def _segment_rows(self, li, item, ana):
         """Rows of an episode to write: all, or a window around the analysed failure ({"before": b, "after": a})."""
         seg = item.get("segment", "full")
+        if isinstance(seg, dict) and ("li" in seg or "chunk_lt" in seg):  # p21: explicit latent / chunk range
+            if "li" in seg:
+                rows = np.where((li >= int(seg["li"][0])) & (li <= int(seg["li"][1])))[0]
+            else:
+                rows = np.where(item["_chunk_of"] < int(seg["chunk_lt"]))[0]
+            if seg.get("min_li") is not None:
+                rows = rows[li[rows] >= int(seg["min_li"])]
+            if seg.get("last"):
+                rows = rows[-int(seg["last"]):]
+            return rows
         if isinstance(seg, dict) and seg.get("gaptop") and ana and ana.get("gap"):  # highest prediction error
             top = sorted(ana["gap"], key=ana["gap"].get, reverse=True)[:int(seg["gaptop"])]
             return np.where(np.isin(li, [int(k) for k in top]))[0]
@@ -499,7 +590,7 @@ class FawamServer(VA_Server):
         L = int(ana["latent"])
         return np.where((li >= L - b) & (li <= L + a))[0]
 
-    def _prefill(self, spec):
+    def _prefill(self, spec, collect_only=False):
         """In-context memory (docs/ICL.md): write recorded episodes into the KV cache before the episode (or, after a
         context reset, before the next chunk). Per item:
           groups   which latents: obs (what happened), pred (what the model imagined), diff (obs - pred: where the
@@ -510,6 +601,8 @@ class FawamServer(VA_Server):
         occupies the same frame ids the coming episode will use = phase-aligned memory), attn_scale (keys of the
         context tokens scaled: >1 makes the model attend to the memory more)."""
         from fawam.latent_data import relabel_planned
+        if not collect_only and any(it.get("xattn") or it.get("pool") for it in spec.get("items", [])):
+            self._prefill(spec, collect_only=True)  # A3 / T4: context tokens first (T4 gates the cache writes too)
         items = self._context_items(spec)
         gap = int(spec.get("gap", 1))
         aligned = spec.get("position", "sequential") == "aligned"
@@ -522,6 +615,8 @@ class FawamServer(VA_Server):
             self.holder.ctx.film_error = torch.tensor(spec["error_vec"], dtype=torch.float32, device=self.device)
         self.holder.ctx.ttt_accumulate = True  # TTT fast-weight branches learn from the memory while it is written
         self._prefilling = True
+        self.holder.ctx.adapter_scale = None  # the context / past are written with the adapter fully on
+        xa_parts = []
         for it in items:
             ep = Path(it["path"])
             ep = ep / "episode.h5" if ep.is_dir() else ep
@@ -536,19 +631,32 @@ class FawamServer(VA_Server):
                     li = f[f"model/{src}/latent_index"][()]
                     chunk_of = f[f"model/{src}/chunk_id"][()]
                     planned = f["actions/planned"][()]
-                    if group == "diff":
+                    if group in ("diff", "diffmag"):
                         pl = f["model/pred/latent_index"][()]
                         pidx = {int(k): i for i, k in enumerate(pl)}
                         pred = canvas_from_h5(f, "pred")
                         keep = np.array([int(k) in pidx for k in li])
                         lat = lat[:, :, keep] - pred[:, :, [pidx[int(k)] for k in li[keep]]]
                         li, chunk_of = li[keep], chunk_of[keep]
+                        if group == "diffmag":  # p21 C4: scalar error per frame only (no direction)
+                            mag = lat.pow(2).mean(dim=(1, 3, 4)).sqrt()  # 1, F
+                            lat = mag[:, None, :, None, None].expand_as(lat).contiguous()
                 if it.get("actions") == "corrected":
                     planned = relabel_planned(planned, chunk_of, li, ana)
+                it["_chunk_of"] = chunk_of
                 rows = self._segment_rows(li, it, ana)
                 if len(rows) == 0:
                     continue
                 lat = self._manipulate(lat, rows, it.get("manip"))
+                if collect_only:
+                    if it.get("xattn") or it.get("pool"):
+                        xa_parts.append(lat[:, :, rows].float())
+                    continue
+                if it.get("xattn") or it.get("pool"):  # plan v2 A3 / T4: context tokens for the cross-attention
+                    if it.get("xattn"):
+                        self.episode_log["prefill"].append(dict(path=str(ep), group=group, xattn=True,
+                                                                frames=[int(li[rows[0]]), int(li[rows[-1]])]))
+                        continue
                 lat = lat.to(self.device, self.dtype)
                 li0, li1 = int(li[rows[0]]), int(li[rows[-1]])
                 seg0 = start if aligned else base
@@ -557,6 +665,10 @@ class FawamServer(VA_Server):
                     first_row = np.where(chunk_of == c)[0][0]
                     lat_c = lat[:, :, crow]
                     act = planned[c][:, crow - first_row]
+                    if it.get("manip") == "grip_only":  # p21 C5: only the gripper channels of the executed actions
+                        keep = np.zeros_like(act)
+                        keep[[7, 15]] = act[[7, 15]]
+                        act = keep
                     act_c = self.preprocess_action(act).to(lat_c)
                     if it.get("manip") == "no_actions":
                         act_c = torch.zeros_like(act_c)
@@ -578,11 +690,19 @@ class FawamServer(VA_Server):
                     self._tf(self._repeat_input_for_cfg(input_dict['action_res_lst']), 2, True, fst, len(crow))
                     self._call_mem = None
                 if not aligned:
-                    base += li1 - li0 + 1 + gap
+                    base += li1 - li0 + 1 + int(it.get("gap", gap))
                 self.episode_log["prefill"].append(dict(path=str(ep), group=group, actions=it.get("actions", "executed"),
                                                         frames=[li0, li1], role=it.get("role")))
         self.holder.ctx.ttt_accumulate = False
         self._prefilling = False
+        if collect_only:
+            if xa_parts and self.holder.adapters is not None:
+                a = self.holder.adapters
+                tok = fa.embed_context(self.transformer, a, torch.cat(xa_parts, dim=2).to(self.device))
+                self.holder.ctx.xattn_ctx = tok if len(a.xattn) else None
+                self.holder.ctx.ctx_pool = tok.mean(1) if len(a.t4) else None
+                logger.info(f"context for cross-attention / gate: {tok.shape[1]} tokens")
+            return
         a = self.holder.adapters
         if a is not None and len(a.ttt) and self.holder.ttt_stats:  # how far the memory moved the fast weights
             upd = {}
@@ -702,6 +822,17 @@ class FawamServer(VA_Server):
         self.init_ready = False  # consumed: the next first chunk (after a context reset) encodes again
         init_latent = self.init_latent
 
+        self._chunk_gate()
+        if m.skip_generation:  # p21 continuation driver: the client replays expert actions, only encoding matters
+            if first:
+                self.init_latent = init_latent
+            z = torch.zeros(1, cfg.action_dim, fcs, self.action_per_frame, 1, device=self.device, dtype=self.dtype)
+            self.episode_log['cand'].append(dict(frame_st_id=frame_st_id, chosen=0, scores=[0.0]))
+            zl = torch.zeros(48, fcs, self.latent_height, self.latent_width)  # placeholder: no imagination
+            self.episode_log['pred'].append(dict(frame_st_id=frame_st_id, wall_time=time.time(),
+                                                 noise_seed=0, latents=zl, denoise=[], hidden=None))
+            return self.postprocess_action(z), None
+        explore_rel = self._explore_frames(frame_st_id)
         noise_seed = (self.episode_log['seed'] * 10007 + len(self.episode_log['pred'])) % 2**31
         generator = torch.Generator(device=self.device).manual_seed(noise_seed)
         shape_v = (1, 48, fcs, self.latent_height, self.latent_width)
@@ -709,7 +840,8 @@ class FawamServer(VA_Server):
         actions = torch.randn(1, cfg.action_dim, fcs, self.action_per_frame, 1, generator=generator,
                               device=self.device, dtype=self.dtype)
         cands = [latents]
-        for k in range(1, max(1, m.num_candidates)):
+        n_cand = int(m.explore.get("n", 8)) if explore_rel else m.num_candidates
+        for k in range(1, max(1, n_cand)):
             g = torch.Generator(device=self.device).manual_seed((noise_seed + 7919 * k) % 2**31)
             cands.append(torch.randn(*shape_v, generator=g, device=self.device, dtype=self.dtype))
 
@@ -719,14 +851,42 @@ class FawamServer(VA_Server):
         action_timesteps = F.pad(self.action_scheduler.timesteps, (0, 1), mode='constant', value=0)
         latent_cond = init_latent[:, :, 0:1].to(self.dtype) if first else None
 
+        oracle_obs = obs.get("oracle_obs") if m.teacher_force else None
         with torch.no_grad():
             self._mem_video = self._mem_video_infl = self._mem_video_brk = None
             mem_now = self._memory_mask() if (m.measure_memory and m.memory_imagination) else None
             noise0 = cands[0].clone() if mem_now is not None else None
-            results = [self._denoise_video(c, timesteps, latent_cond, frame_st_id, first, probe=(ci == 0))
-                       for ci, c in enumerate(cands)]
-            idx, scores = self._score_candidates([r[0] for r in results], latent_cond, frame_st_id, noise_seed)
-            latents, denoise_records = results[idx]
+            if oracle_obs:
+                # teacher forcing (fawam/teacher_force.py): the real frames of the oracle continuation replace the
+                # imagined chunk; no video denoising
+                latents = self._oracle_latents(oracle_obs, latent_cond, first)
+                if m.teacher_force_noise:
+                    s_n = float(m.teacher_force_noise)
+                    g_n = torch.Generator(device=self.device).manual_seed((noise_seed + 4243) % 2**31)
+                    eps = torch.randn(latents.shape, generator=g_n, device=self.device, dtype=torch.float32)
+                    noisy = ((1 - s_n) * latents.float() + s_n * eps).to(self.dtype)
+                    k0 = 1 if first else 0  # the observed conditioning frame stays clean
+                    latents[:, :, k0:] = noisy[:, :, k0:]
+                denoise_records, idx, scores = [], 0, [0.0]
+            else:
+                results = [self._denoise_video(c, timesteps, latent_cond, frame_st_id, first, probe=(ci == 0))
+                           for ci, c in enumerate(cands)]
+                if explore_rel and len(results) > 1:  # P3: the plan farthest from what really happened there
+                    ref = self._ref
+                    li = {int(x): i for i, x in enumerate(ref["obs_li"])}
+                    cols = [frame_st_id - self.ep_frame0 + i for i in range(fcs)]
+                    pairs = [(i, li[c]) for i, c in enumerate(cols) if c in explore_rel]
+                    scores = []
+                    for r in results:
+                        lat = r[0][0].float().cpu()  # C, F, H, W
+                        d = sum(float((lat[:, i] - ref["obs"][:, j]).pow(2).mean()) for i, j in pairs)
+                        scores.append(d)
+                    idx = int(np.argmax(scores))
+                    self.episode_log["events"].append(dict(kind="explore", frames=explore_rel, chosen=idx,
+                                                           scores=scores, frame=int(frame_st_id), t=time.time()))
+                else:
+                    idx, scores = self._score_candidates([r[0] for r in results], latent_cond, frame_st_id, noise_seed)
+                latents, denoise_records = results[idx]
             if self.use_outside:
                 with torch.autocast("cuda", enabled=False):
                     latents = self.holder.adapters.outside(latents.float()).to(self.dtype)
@@ -822,6 +982,23 @@ class FawamServer(VA_Server):
         actions = self.postprocess_action(actions)
         torch.cuda.empty_cache()
         return actions, latents
+
+    def _oracle_latents(self, frames, latent_cond, first):
+        """Encode oracle frames exactly as a later real observation would be encoded (same streaming VAE state),
+        without advancing the encoder: its causal cache is saved and restored around the call."""
+        vaes = [v for v in (self.streaming_vae, getattr(self, "streaming_vae_half", None)) if v is not None]
+        saved = [[c.clone() if torch.is_tensor(c) else c for c in v.feat_cache] for v in vaes]
+        try:
+            lat = self._encode_obs(dict(obs=list(frames))).to(self.dtype)
+        finally:
+            for v, c in zip(vaes, saved):
+                v.feat_cache = c
+        fcs = self.job_config.frame_chunk_size
+        want = fcs - 1 if first else fcs
+        assert lat.shape[2] == want, f"oracle: {len(frames)} frames -> {lat.shape[2]} latent frames, want {want}"
+        if first:
+            lat = torch.cat([latent_cond.to(self.dtype), lat], dim=2)
+        return lat
 
     def _compute_kv_cache(self, obs):
         self.transformer.clear_pred_cache(self.cache_name)

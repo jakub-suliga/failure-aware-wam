@@ -57,6 +57,7 @@ class AdapterConfig:
     patch: int = 2
     ffn_dim: int = 14336
     lora_targets: list = field(default_factory=lambda: ["attn"])
+    lora_streams: list = None  # None = both streams; ["video"] = LoRA only in the video pass (plan v2: action frozen)
     adapter_learn_scale: bool = True
     use_adapterplus: bool = False  # combo
     use_lora: bool = False         # combo
@@ -81,6 +82,17 @@ class AdapterConfig:
     outside_type: str = "mlp"       # mlp (residual MLP) | channel (channel-wise scale + shift, paper baseline)
     # FiLM / conditional AdaLN: per-block offsets of the modulation table (scale/shift/gate) computed from
     #   memory: the pooled in-context memory tokens at that block | error: a compact failure vector from the analysis
+    # plan v2 p21 A3: Flamingo-style gated cross-attention from the VIDEO tokens to the context tokens (patch-embedded
+    # context latents + learned frame embedding) in every xattn_every-th block; tanh gates initialised at 0
+    xattn_every: int = 0
+    xattn_inner: int = 512
+    xattn_heads: int = 8
+    xattn_ff: int = 1024
+    # plan v2 p21 T1/T2/T4/T5: adapter strength per frame/chunk. t1 = hard switch (aligned error of the last attempt
+    # above its episode median), t2/t5 = sigmoid(a * e + b) with learned a, b (t2 time-aligned e, t5 e of the nearest
+    # neighbour frame in latent space), t4 = per-layer tanh(alpha_l + w_l . pooled context), 0-initialised
+    gate: str = None
+    adapter_up_init: str = "zero"   # "normal": non-zero Adapter+ output (needed under a 0-initialised gate, t4)
     film_source: str = "none"       # none | memory | error | text (pooled embedding of the prompt = analysis text)
     film_rank: int = 64
     error_dim: int = 16
@@ -132,20 +144,49 @@ class AdapterConfig:
 # ------------------------------------------------------------------------------------------------ modules
 
 class AdapterPlus(nn.Module):
-    """h + c * W_up GELU(W_down LN(h)) (Steitz & Roth 2024), zero-initialised W_up."""
+    """h + c * W_up GELU(W_down LN(h)) (Steitz & Roth 2024), zero-initialised W_up (up_init "normal": small random)."""
 
-    def __init__(self, dim, bottleneck, learn_scale=True, norm=True):
+    def __init__(self, dim, bottleneck, learn_scale=True, norm=True, up_init="zero"):
         super().__init__()
         self.norm = nn.LayerNorm(dim) if norm else nn.Identity()
         self.down = nn.Linear(dim, bottleneck)
         self.up = nn.Linear(bottleneck, dim)
         self.scale = nn.Parameter(torch.ones(dim), requires_grad=learn_scale)
-        nn.init.zeros_(self.up.weight)
+        if up_init == "normal":
+            nn.init.normal_(self.up.weight, std=1e-3)
+        else:
+            nn.init.zeros_(self.up.weight)
         nn.init.zeros_(self.up.bias)
 
     def forward(self, h):
         x = h.float()
         return (x + self.scale * self.up(F.gelu(self.down(self.norm(x))))).type_as(h)
+
+
+class GatedXAttn(nn.Module):
+    """Flamingo gated cross-attention + dense block: x + tanh(g_a) * XAttn(LN(x), ctx); x + tanh(g_f) * FF(LN(x))."""
+
+    def __init__(self, dim, inner=512, heads=8, ff=1024):
+        super().__init__()
+        self.heads = heads
+        self.ln_q, self.ln_f = nn.LayerNorm(dim), nn.LayerNorm(dim)
+        self.q, self.kv, self.o = nn.Linear(dim, inner), nn.Linear(dim, 2 * inner), nn.Linear(inner, dim)
+        self.ff = nn.Sequential(nn.Linear(dim, ff), nn.GELU(), nn.Linear(ff, dim))
+        self.g_attn, self.g_ff = nn.Parameter(torch.zeros(1)), nn.Parameter(torch.zeros(1))
+
+    def forward(self, h, ctx):
+        x = h.float()
+        B, N, _ = x.shape
+        q = self.q(self.ln_q(x)).view(B, N, self.heads, -1).transpose(1, 2)
+        k, v = self.kv(ctx.float()).chunk(2, dim=-1)
+        M = k.shape[1]
+        k = k.view(1, M, self.heads, -1).transpose(1, 2).expand(B, -1, -1, -1)
+        v = v.view(1, M, self.heads, -1).transpose(1, 2).expand(B, -1, -1, -1)
+        a = F.scaled_dot_product_attention(q, k, v).transpose(1, 2).reshape(B, N, -1)
+        x = x + torch.tanh(self.g_attn) * self.o(a)
+        x = x + torch.tanh(self.g_ff) * self.ff(self.ln_f(x))
+        return x.type_as(h)
+
 
 
 class ExternalResidual(nn.Module):
@@ -398,7 +439,8 @@ class AdapterSet(nn.Module):
             for stream in cfg.inside_streams:
                 self.inside[stream] = nn.ModuleDict({
                     str(b): nn.ModuleDict({s: AdapterPlus(cfg.dim, cfg.bottleneck, cfg.adapter_learn_scale,
-                                                          cfg.adapter_norm) for s in cfg.sites})
+                                                          cfg.adapter_norm, getattr(cfg, "adapter_up_init", "zero"))
+                                           for s in cfg.sites})
                     for b in cfg.block_ids()})
         self.outside = (ChannelScale(cfg.latent_channels) if cfg.outside_type == "channel" else
                         ExternalResidual(cfg.latent_channels, cfg.patch, cfg.outside_hidden)) if cfg.has_outside else None
@@ -417,6 +459,18 @@ class AdapterSet(nn.Module):
                                   for t in cfg.svf_targets}) if cfg.has_svf else nn.ModuleDict()
         self.dense = nn.ModuleDict({k: DenseDelta(i, o) for k, _, i, o in dense_specs(cfg)}) if cfg.has_dense \
             else nn.ModuleDict()
+        # plan v2 A3 / T gates
+        xe = getattr(cfg, "xattn_every", 0)
+        self.xattn = nn.ModuleDict({str(b): GatedXAttn(cfg.dim, cfg.xattn_inner, cfg.xattn_heads, cfg.xattn_ff)
+                                    for b in range(0, cfg.num_blocks, xe)}) if xe else nn.ModuleDict()
+        gate = getattr(cfg, "gate", None)
+        self.ctx_pos = nn.Parameter(torch.zeros(64, cfg.dim)) if (xe or gate == "t4") else None
+        self.gate_ab = nn.Parameter(torch.tensor([4.0, -2.0])) if gate in ("t2", "t5") else None
+        self.t4 = nn.ModuleDict({str(b): nn.Linear(cfg.dim, 1) for b in cfg.block_ids()}) if gate == "t4" \
+            else nn.ModuleDict()
+        for lin in self.t4.values():
+            nn.init.zeros_(lin.weight)
+            nn.init.zeros_(lin.bias)
         cond = cfg.error_dim if cfg.film_source == "error" else cfg.dim
         self.film = nn.ModuleDict({str(b): FiLMHead(cond, cfg.dim, cfg.film_rank) for b in cfg.block_ids()}) \
             if cfg.has_film else nn.ModuleDict()
@@ -479,6 +533,9 @@ class AdapterContext:
         self.ttt_accumulate = False  # server prefill: TTT branches / FiLM collect memory statistics
         self.film_error = None  # FiLM-error condition (error_dim,) tensor
         self.ctx_frames = 0  # training: in-context frames at the start of the sequence (TTT memory)
+        self.adapter_scale = None  # plan v2 P2/T1/T2: strength of the adapter residual (None = 1); float or tensor
+        self.xattn_ctx = None      # plan v2 A3: (1, M, dim) context tokens for the gated cross-attention
+        self.ctx_pool = None       # plan v2 T4: (dim,) pooled context tokens
         self.n_frames = 1
 
 
@@ -494,13 +551,72 @@ def _apply_segments(h, segments, fn_for_stream):
     return torch.cat(outs, dim=1)
 
 
+def _gate_value(aset, ctx, block_id, n_tokens, device):
+    """Adapter strength: ctx.adapter_scale (float, or a per-token tensor in training) times the T4 layer gate."""
+    sc = ctx.adapter_scale
+    if len(aset.t4) and ctx.ctx_pool is not None and str(block_id) in aset.t4:
+        g = torch.tanh(aset.t4[str(block_id)](ctx.ctx_pool.float()))[0]
+        sc = g if sc is None else sc * g
+    elif len(aset.t4):  # T4 without context: gate closed
+        sc = torch.zeros((), device=device) if sc is None else sc * 0
+    if torch.is_tensor(sc) and sc.dim() == 1 and sc.numel() > 1:
+        if sc.numel() < n_tokens:
+            sc = F.pad(sc, (0, n_tokens - sc.numel()), value=1.0)
+        sc = sc[None, :n_tokens, None]
+    return sc
+
+
 def _site(h, aset, ctx, block_id, site):
     if aset is None or not ctx.enabled:
         return h
     if ctx.segments is None:
         mod = aset.get(ctx.stream, block_id, site)
-        return h if mod is None else mod(h)
-    return _apply_segments(h, ctx.segments, lambda s: aset.get(s, block_id, site))
+        out = h if mod is None else mod(h)
+    else:
+        out = _apply_segments(h, ctx.segments, lambda s: aset.get(s, block_id, site))
+    if out is h or (ctx.adapter_scale is None and not len(aset.t4)):
+        return out
+    sc = _gate_value(aset, ctx, block_id, h.shape[1], h.device)
+    return (h.float() + (out.float() - h.float()) * sc).type_as(h)
+
+
+def _xattn(h, aset, ctx, block_id):
+    """A3: gated cross-attention of the video tokens to the context tokens (video pass only)."""
+    if aset is None or not ctx.enabled or str(block_id) not in aset.xattn or ctx.xattn_ctx is None:
+        return h
+    mod = aset.xattn[str(block_id)]
+    if ctx.segments is None:
+        return mod(h, ctx.xattn_ctx) if ctx.stream == "video" else h
+    return _apply_segments(h, ctx.segments, lambda s: (lambda x: mod(x, ctx.xattn_ctx)) if s == "video" else None)
+
+
+def embed_context(transformer, aset, lat):
+    """Context latents (1, C, F, H, W) -> (1, F * H/2 * W/2, dim) tokens: the frozen patch embedding + a learned
+    per-frame embedding (A3 keys/values, T4 pooled context)."""
+    p = transformer.patch_size
+    with torch.no_grad():
+        tok = transformer.patch_embedding_mlp(rearrange(lat.to(torch.bfloat16), "b c (f p1) (h p2) (w p3) -> b (f h w) (c p1 p2 p3)",
+                                                        p1=p[0], p2=p[1], p3=p[2])).float()
+    Fr = lat.shape[2]
+    per = tok.shape[1] // Fr
+    if aset.ctx_pos is not None:
+        tok = tok + aset.ctx_pos[:Fr].repeat_interleave(per, dim=0)[None]
+    return tok
+
+
+def stream_token_mask(ctx, n_tokens, streams, device):
+    """(n_tokens,) float mask: 1 where the token belongs to one of `streams` (None = all), for hooks on linears."""
+    if streams is None:
+        return None
+    if ctx.segments is None:
+        return None if ctx.stream in streams else torch.zeros(n_tokens, device=device)
+    m = torch.zeros(n_tokens, device=device)
+    start = 0
+    for n, st in ctx.segments:
+        if st in streams:
+            m[start:start + n] = 1
+        start += n
+    return m
 
 
 def _steer(h, ctx, block_id):
@@ -539,6 +655,7 @@ def adapted_block_forward(block, block_id, holder, hidden_states, encoder_hidden
                               update_cache=update_cache, cache_name=cache_name)
     hidden_states = (hidden_states.float() + attn_output * gate_msa).type_as(hidden_states)
     hidden_states = _site(hidden_states, aset, ctx, block_id, "attn")
+    hidden_states = _xattn(hidden_states, aset, ctx, block_id)
     if aset is not None and ctx.enabled:
         if str(block_id) in aset.prompt:
             hidden_states = aset.prompt[str(block_id)](hidden_states)
@@ -706,7 +823,16 @@ def add_lora(transformer, aset):
             a = holder.adapters
             if a is None or not holder.ctx.enabled or key not in a.lora:
                 return out
-            return out + a.lora[key](inp[0]).to(out.dtype)
+            m = stream_token_mask(holder.ctx, out.shape[1], a.cfg.lora_streams, out.device) \
+                if (a.cfg.lora_streams is not None and out.dim() == 3) else None
+            if m is not None and not bool(m.any()):
+                return out
+            d = a.lora[key](inp[0])
+            if holder.ctx.adapter_scale is not None:
+                d = d * holder.ctx.adapter_scale
+            if m is not None:
+                d = d * m[None, :, None]
+            return out + d.to(out.dtype)
 
         lin.register_forward_hook(hook)
         hooked.add(key)

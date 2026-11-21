@@ -1,0 +1,12 @@
+# smoke: snap driver with the tf continuation (D3)
+name: p20_d3_smoke
+out: results/_smoke/p20_d3
+driver: snap
+episodes: 1
+per_job: 1
+n_par: 1
+time: "01:00:00"
+tasks: [move_playingcard_away]
+configs: [hid_y_p5]
+methods: [base]
+extra_env: {FAWAM_SNAP_MODES: "expert+tf"}

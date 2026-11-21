@@ -232,11 +232,28 @@ GRID["failfix_strong_ft_base"] = (dict(EPISODES=_STRONG, SUCCESS="false", OUTSID
 # failure of ANOTHER seed as memory with the target unchanged (the "shuf" anti-shortcut), 10 % no memory.
 _HID = "results/sweeps/p10_hid_data/base/hid_trans"
 GRID["failfix_hid_lora"] = (dict(EPISODES=_HID, SUCCESS="false", OUTSIDE="none", TASKS=" ".join(TRAIN_TASKS),
-                                 KIND="combo",
+                                 KIND="lora",  # was "combo" without --use_lora -> 0 trainable params (fixed 2026-11-20)
                                  EXTRA="--p_text 0 --p_cross 0.3 --p_success 0 --p_noctx 0.1 --val_frac 0.1 "
                                        "--val_every 250 --save_every 1000 --max_frames 20 --steps 3000 --grad_accum 4 "
                                        f"--context_groups pred obs --lora_rank 16 --lora_targets attn --fixes {_HID}"),
                             ["hid_trans"])
+
+# P8c (user 2026-11-20 "test small contexts, with the VLM"): the p8t LoRA (11/25 with vs 2/29 without context) read
+# ~7000 context tokens (whole failed episode, imagined + real, 3 cameras). hid M3 showed the smallest, most targeted
+# context (real - imagined around the failure) works best. Same data / adapter / text as p8t, smaller memories:
+SMALL_CTX = {
+    "diffwin":       ("--context_groups diff --context_window", VLM_ANALYSIS),           # only where imagination was wrong
+    "diffobswin":    ("--context_groups diff obs --context_window", VLM_ANALYSIS),       # + what really happened
+    "predobswin":    ("--context_groups pred obs --context_window", VLM_ANALYSIS),       # p8t format, window only
+    "gapkeys":       ("--context_groups pred obs --context_keyframes 6", VLM_ANALYSIS),  # 6 highest-error latents
+    "diffwin_vlmd":  ("--context_groups diff --context_window", VLM_DETAIL),             # + detailed VLM text (fix)
+    "textonly_vlmd": ("--context_groups obs --text_only --p_text 1.0", VLM_DETAIL),      # detailed VLM text only
+}
+for _n, (_ctx, _ana) in SMALL_CTX.items():
+    GRID[f"failfix_sc_{_n}"] = (dict(EPISODES=_P7C, SUCCESS="false", OUTSIDE="none", TASKS=" ".join(TRAIN_TASKS),
+                                     KIND="lora", LIMIT_PER_CELL=12,
+                                     EXTRA=f"{_META_T} {_ctx} --lora_rank 16 --lora_targets attn --fixes {_P7C} {_ana}"),
+                                ["table_h_m05", "table_h_m10"])
 
 
 def train(a):

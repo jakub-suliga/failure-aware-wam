@@ -1,0 +1,13 @@
+# p14: "does a slightly imperfect video still help?" (user request 2026-11-19, follow-up to p13_tf_replan).
+# Like tf_replan (planner oracle from the current state before every chunk), but the oracle latents are corrupted
+# before the action stream sees them: lat = (1-s)*lat + s*eps. s = 0.10/0.25/0.50/0.75 (methods tf_replan_nXX).
+# Reference: tf_replan m05 27/27, m10 8/27; base m05 1/72, m10 0/72 (corrected success).
+name: p14_tf_noise_smoke
+out: results/sweeps/p14_tf_noise_smoke
+episodes: 2
+per_job: 2
+n_par: 2
+time: "00:45:00"
+tasks: [move_playingcard_away]
+configs: [table_h_m05]
+methods: [tf_replan_n50]

@@ -1,0 +1,12 @@
+# p20 D4 (plan v2): is a perfect video enough in the new settings? tf_replan (planner re-run from the current state
+# before every chunk, its frames replace the imagined chunk; the policy's own actions are executed). Setting enters
+# the video path only if tf_replan >= 70 %. table -5 cm is known (p13: 27/27); m03 and x+-5 added for the S-A/S-B gate.
+name: p20_d4_tf
+out: results/sweeps/p20_d4_tf
+episodes: 20
+per_job: 21
+n_par: 3
+time: "03:00:00"
+tasks: [move_playingcard_away]
+configs: [table_h_p03, table_h_p05, table_h_m03, hid_y_p5, hid_y_m5, hid_x_p5, hid_x_m5, hid_g070, hid_g130]
+methods: [tf_replan]
